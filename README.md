@@ -2,6 +2,8 @@
 
 Adds a Roam-style **Linked References** section to the bottom of each record/page, plus Tana-style **Property References** grouped by the property name ("[Property] in...").
 
+Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://github.com/thymerapp/thymer-plugin-sdk).
+
 ## Screenshot
 
 ![Backreferences footer screenshot](screenshot-2026-02-20_16-48-44.png)
