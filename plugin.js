@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.2.0';
+    this._version = '0.2.2';
     this._pluginName = 'Backlinks';
 
     this._panelStates = new Map();
@@ -9,6 +9,9 @@ class Plugin extends AppPlugin {
 
     this._storageKeyCollapsed = 'thymer_backlinks_collapsed_v1';
     this._collapsed = this.loadCollapsedSetting();
+
+    this._storageKeyPropGroupCollapsed = 'thymer_backlinks_prop_group_collapsed_v1';
+    this._propGroupCollapsed = this.loadPropGroupCollapsedSetting();
 
     this._defaultMaxResults = 200;
     this._refreshDebounceMs = 350;
@@ -224,7 +227,7 @@ class Plugin extends AppPlugin {
 
     const title = document.createElement('div');
     title.className = 'tlr-title';
-    title.textContent = 'Linked References';
+    title.textContent = 'Backreferences';
 
     const count = document.createElement('div');
     count.className = 'tlr-count';
@@ -282,6 +285,20 @@ class Plugin extends AppPlugin {
         const btn = s.rootEl.querySelector?.('[data-action="toggle"]') || null;
         if (btn) btn.textContent = this._collapsed ? '+' : '-';
       }
+      return;
+    }
+
+    if (action === 'toggle-prop-group') {
+      const propName = (actionEl.dataset.propName || '').trim();
+      if (!propName) return;
+
+      const groupEl = actionEl.closest?.('.tlr-prop-group') || null;
+      const isCollapsed = groupEl ? groupEl.classList.contains('tlr-prop-collapsed') : this.isPropGroupCollapsed(propName);
+      const nextCollapsed = !isCollapsed;
+
+      this.setPropGroupCollapsed(propName, nextCollapsed);
+      if (groupEl) groupEl.classList.toggle('tlr-prop-collapsed', nextCollapsed);
+      actionEl.setAttribute?.('aria-expanded', nextCollapsed ? 'false' : 'true');
       return;
     }
 
@@ -376,6 +393,50 @@ class Plugin extends AppPlugin {
     } catch (e) {
       // ignore
     }
+  }
+
+  loadPropGroupCollapsedSetting() {
+    try {
+      const v = localStorage.getItem(this._storageKeyPropGroupCollapsed);
+      if (!v) return new Set();
+      const parsed = JSON.parse(v);
+      if (!Array.isArray(parsed)) return new Set();
+
+      const out = new Set();
+      for (const x of parsed) {
+        if (typeof x !== 'string') continue;
+        const t = x.trim();
+        if (t) out.add(t);
+      }
+      return out;
+    } catch (e) {
+      // ignore
+    }
+    return new Set();
+  }
+
+  savePropGroupCollapsedSetting() {
+    try {
+      const arr = Array.from(this._propGroupCollapsed || []);
+      localStorage.setItem(this._storageKeyPropGroupCollapsed, JSON.stringify(arr));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  isPropGroupCollapsed(propName) {
+    const name = (propName || '').trim();
+    if (!name) return false;
+    return this._propGroupCollapsed?.has?.(name) === true;
+  }
+
+  setPropGroupCollapsed(propName, collapsed) {
+    const name = (propName || '').trim();
+    if (!name) return;
+    if (!this._propGroupCollapsed) this._propGroupCollapsed = new Set();
+    if (collapsed === true) this._propGroupCollapsed.add(name);
+    else this._propGroupCollapsed.delete(name);
+    this.savePropGroupCollapsedSetting();
   }
 
   // ---------- Refresh orchestration ----------
@@ -528,14 +589,15 @@ class Plugin extends AppPlugin {
 
   // ---------- Grouping + rendering ----------
 
-  async getPropertyBacklinkGroups(targetRecord, targetGuid, { showSelf }) {
-    if (!targetRecord || !targetGuid) return [];
-    if (typeof targetRecord.getBackReferenceRecords !== 'function') return [];
+  async getPropertyBacklinkGroups(_targetRecord, targetGuid, { showSelf }) {
+    if (!targetGuid) return [];
 
-    const backrefs = await targetRecord.getBackReferenceRecords();
+    // NOTE: Thymer's built-in backlinks/backrefs do not include record-link properties,
+    // so we scan all records' properties to find record-link fields pointing at targetGuid.
+    const allRecords = this.data.getAllRecords?.() || [];
     const byProp = new Map();
 
-    for (const src of backrefs || []) {
+    for (const src of allRecords || []) {
       const srcGuid = src?.guid || null;
       if (!srcGuid) continue;
       if (!showSelf && srcGuid === targetGuid) continue;
@@ -585,21 +647,86 @@ class Plugin extends AppPlugin {
   propertyReferencesGuid(prop, targetGuid) {
     if (!prop || !targetGuid) return false;
 
-    try {
-      const v = prop.choice?.();
-      if (typeof v === 'string' && v === targetGuid) return true;
-    } catch (e) {
-      // ignore
+    const values = this.getPropertyCandidateValues(prop);
+    for (const v of values) {
+      if (v === targetGuid) return true;
     }
-
-    try {
-      const v = prop.text?.();
-      if (typeof v === 'string' && v === targetGuid) return true;
-    } catch (e) {
-      // ignore
-    }
-
     return false;
+  }
+
+  getPropertyCandidateValues(prop) {
+    const out = [];
+    const seen = new Set();
+
+    const push = (v) => {
+      if (typeof v !== 'string') return;
+      const t = v.trim();
+      if (!t) return;
+      if (seen.has(t)) return;
+      seen.add(t);
+      out.push(t);
+    };
+
+    // Most record-link properties currently expose their referenced record GUID via .text().
+    // We also look at .choice() as a fallback for older/quirky configs.
+    let raw = [];
+    try {
+      raw.push(prop.text?.());
+    } catch (e) {
+      // ignore
+    }
+    try {
+      raw.push(prop.choice?.());
+    } catch (e) {
+      // ignore
+    }
+
+    for (const r of raw) {
+      for (const v of this.expandPossibleListString(r)) {
+        push(v);
+      }
+    }
+
+    return out;
+  }
+
+  expandPossibleListString(v) {
+    if (typeof v !== 'string') return [];
+    const t = v.trim();
+    if (!t) return [];
+
+    // Some properties may serialize multi-values as JSON.
+    if (t.startsWith('[') && t.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(t);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .filter((x) => typeof x === 'string')
+            .map((x) => x.trim())
+            .filter(Boolean);
+        }
+      } catch (e) {
+        // fall through
+      }
+    }
+
+    // Or as a comma-separated list.
+    if (t.includes(',')) {
+      return t
+        .split(',')
+        .map((x) => x.trim())
+        .filter(Boolean);
+    }
+
+    // Or as multi-line text.
+    if (t.includes('\n')) {
+      return t
+        .split(/\r?\n/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+    }
+
+    return [t];
   }
 
   groupBacklinkLines(lines, targetGuid, { showSelf }) {
@@ -687,34 +814,19 @@ class Plugin extends AppPlugin {
     if (linkedRefCount > 0) parts.push(`${linkedRefCount} line ref${linkedRefCount === 1 ? '' : 's'}`);
     state.countEl.textContent = parts.join(' | ');
 
-    const hasContent = props.length > 0 || linked.length > 0;
-    const hasErrors = Boolean(propertyError) || Boolean(linkedError);
-
-    if (!hasContent && !hasErrors) {
-      const empty = document.createElement('div');
-      empty.className = 'tlr-empty';
-      empty.textContent = 'No linked references.';
-      body.appendChild(empty);
-      return;
+    this.appendSectionTitle(body, 'Property References');
+    if (propertyError) {
+      this.appendError(body, propertyError);
+    } else if (props.length === 0) {
+      this.appendEmpty(body, 'No property references.');
+    } else {
+      this.appendPropertyReferenceGroups(body, props);
     }
 
-    const showLinkedSectionHeader = props.length > 0 || Boolean(propertyError);
-
-    if (props.length > 0 || propertyError) {
-      this.appendSectionTitle(body, 'Property References');
-      if (propertyError) {
-        this.appendError(body, propertyError);
-      } else {
-        this.appendPropertyReferenceGroups(body, props);
-      }
-    }
-
-    if (showLinkedSectionHeader) {
-      const divider = document.createElement('div');
-      divider.className = 'tlr-divider';
-      body.appendChild(divider);
-      this.appendSectionTitle(body, 'Linked References');
-    }
+    const divider = document.createElement('div');
+    divider.className = 'tlr-divider';
+    body.appendChild(divider);
+    this.appendSectionTitle(body, 'Linked References');
 
     if (linkedError) {
       this.appendError(body, linkedError);
@@ -740,6 +852,14 @@ class Plugin extends AppPlugin {
     container.appendChild(el);
   }
 
+  appendEmpty(container, message) {
+    if (!container) return;
+    const el = document.createElement('div');
+    el.className = 'tlr-empty';
+    el.textContent = message || '';
+    container.appendChild(el);
+  }
+
   appendPropertyReferenceGroups(container, groups) {
     if (!container) return;
 
@@ -747,11 +867,23 @@ class Plugin extends AppPlugin {
       const propName = (g?.propertyName || '').trim();
       if (!propName) continue;
 
+      const isCollapsed = this.isPropGroupCollapsed(propName);
+
       const groupEl = document.createElement('div');
       groupEl.className = 'tlr-prop-group';
 
-      const header = document.createElement('div');
+      if (isCollapsed) groupEl.classList.add('tlr-prop-collapsed');
+
+      const header = document.createElement('button');
+      header.type = 'button';
       header.className = 'tlr-prop-header';
+      header.dataset.action = 'toggle-prop-group';
+      header.dataset.propName = propName;
+      header.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+
+      const caret = document.createElement('span');
+      caret.className = 'tlr-prop-caret';
+      caret.setAttribute('aria-hidden', 'true');
 
       const title = document.createElement('div');
       title.className = 'tlr-prop-title';
@@ -761,6 +893,7 @@ class Plugin extends AppPlugin {
       meta.className = 'tlr-prop-meta';
       meta.textContent = `${g?.records?.length || 0}`;
 
+      header.appendChild(caret);
       header.appendChild(title);
       header.appendChild(meta);
 
@@ -1089,12 +1222,39 @@ class Plugin extends AppPlugin {
       .tlr-prop-header {
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        justify-content: flex-start;
         gap: 10px;
+        width: 100%;
         padding: 6px 8px;
         border-radius: 10px;
         border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
         background: var(--bg-panel, transparent);
+        cursor: pointer;
+        text-align: left;
+      }
+
+      .tlr-prop-header:hover {
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+      }
+
+      .tlr-prop-caret {
+        width: 0;
+        height: 0;
+        border-top: 5px solid transparent;
+        border-bottom: 5px solid transparent;
+        border-left: 6px solid var(--text-muted, rgba(0, 0, 0, 0.6));
+        opacity: 0.85;
+        transform: rotate(90deg);
+        transition: transform 140ms ease;
+        flex: 0 0 auto;
+      }
+
+      .tlr-prop-collapsed .tlr-prop-caret {
+        transform: rotate(0deg);
+      }
+
+      .tlr-prop-collapsed .tlr-prop-records {
+        display: none;
       }
 
       .tlr-prop-title {
@@ -1102,11 +1262,14 @@ class Plugin extends AppPlugin {
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        flex: 1 1 auto;
+        min-width: 0;
       }
 
       .tlr-prop-meta {
         color: var(--text-muted, rgba(0, 0, 0, 0.6));
         font-size: 12px;
+        margin-left: auto;
         flex: 0 0 auto;
       }
 

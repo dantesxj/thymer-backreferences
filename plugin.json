@@ -1,6 +1,6 @@
 {
   "ver": 1,
-  "version": "0.2.0",
+  "version": "0.2.2",
   "name": "Backlinks",
   "icon": "ti-link",
   "description": "Linked + property references footer for every page",

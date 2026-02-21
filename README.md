@@ -5,7 +5,7 @@ Adds a Roam-style **Linked References** section to the bottom of each record/pag
 How it works:
 
 - Uses the Thymer search index via `data.searchByQuery()` with `@linkto = "<recordGuid>"`.
-- Uses `record.getBackReferenceRecords()` to find records that reference the current record.
+- Scans `data.getAllRecords()` and inspects record-link properties to find property references to the current record.
 - Renders property-based references grouped by property name, then renders matching line items grouped by source record.
 
 ## Setup
@@ -22,6 +22,7 @@ Note: This plugin injects its own CSS at runtime; `plugins/backlinks/plugin.css`
 
 - Scroll to the bottom of a page to see **Linked References**.
 - If other records link to this record via a record-link property, you'll also see **Property References** grouped as "[Property] in...".
+- Click a property group header to collapse/expand it (saved locally).
 - Click a record header to open the source record.
 - Click a reference line to open the source record and (best-effort) focus that line.
 - Hold Ctrl/Cmd while clicking to open in a new panel.
@@ -64,7 +65,7 @@ Decision:
 ## Verification Checklist
 
 1. Open a record A that you know is referenced by other records.
-2. Confirm the footer appears at the bottom with a "Linked References" header.
+2. Confirm the footer appears at the bottom with a "Backreferences" header.
 3. If any records link to A via a record-link property, confirm you see a "Property References" section grouped as "[Property] in...".
 4. Click "Refresh" and confirm linked reference results render and are grouped by source record.
 5. Click a source record header and confirm it navigates to that record.
