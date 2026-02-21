@@ -35,7 +35,7 @@ Note: This plugin injects its own CSS at runtime; no `plugin.css` is needed.
 
 Command palette:
 
-- `Backlinks: Refresh (Active Page)` (Thymer command palette label)
+- `Backreferences: Refresh (Active Page)`
 
 ## Configuration
 

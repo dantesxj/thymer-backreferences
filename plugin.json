@@ -1,9 +1,9 @@
 {
   "ver": 1,
-  "version": "0.2.2",
-  "name": "Backlinks",
+  "version": "0.2.3",
+  "name": "Backreferences",
   "icon": "ti-link",
-  "description": "Linked + property references footer for every page",
+  "description": "Backreferences footer (linked + property references)",
   "custom": {
     "maxResults": 200,
     "collapsedByDefault": false,

@@ -1,16 +1,18 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.2.2';
-    this._pluginName = 'Backlinks';
+    this._version = '0.2.3';
+    this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
     this._eventHandlerIds = [];
 
-    this._storageKeyCollapsed = 'thymer_backlinks_collapsed_v1';
+    this._storageKeyCollapsed = 'thymer_backreferences_collapsed_v1';
+    this._legacyStorageKeyCollapsed = 'thymer_backlinks_collapsed_v1';
     this._collapsed = this.loadCollapsedSetting();
 
-    this._storageKeyPropGroupCollapsed = 'thymer_backlinks_prop_group_collapsed_v1';
+    this._storageKeyPropGroupCollapsed = 'thymer_backreferences_prop_group_collapsed_v1';
+    this._legacyStorageKeyPropGroupCollapsed = 'thymer_backlinks_prop_group_collapsed_v1';
     this._propGroupCollapsed = this.loadPropGroupCollapsedSetting();
 
     this._defaultMaxResults = 200;
@@ -19,7 +21,7 @@ class Plugin extends AppPlugin {
     this.injectCss();
 
     this._cmdRefresh = this.ui.addCommandPaletteCommand({
-      label: 'Backlinks: Refresh (Active Page)',
+      label: 'Backreferences: Refresh (Active Page)',
       icon: 'refresh',
       onSelected: () => {
         const panel = this.ui.getActivePanel();
@@ -40,7 +42,7 @@ class Plugin extends AppPlugin {
       this.events.on('reload', () => this.refreshAllPanels({ force: true, reason: 'reload' }))
     );
 
-    // Keep backlinks reasonably fresh when references are created/edited elsewhere.
+    // Keep backreferences reasonably fresh when references are created/edited elsewhere.
     this._eventHandlerIds.push(this.events.on('lineitem.updated', (ev) => this.handleLineItemUpdated(ev)));
     this._eventHandlerIds.push(this.events.on('lineitem.deleted', () => this.handleLineItemDeleted()));
     this._eventHandlerIds.push(this.events.on('record.updated', (ev) => this.handleRecordUpdated(ev)));
@@ -383,6 +385,24 @@ class Plugin extends AppPlugin {
       // ignore
     }
 
+    // Migration: older versions used a back"links" storage key.
+    try {
+      const legacyKey = this._legacyStorageKeyCollapsed;
+      if (legacyKey && legacyKey !== this._storageKeyCollapsed) {
+        const v = localStorage.getItem(legacyKey);
+        if (v === '1' || v === '0') {
+          try {
+            localStorage.setItem(this._storageKeyCollapsed, v);
+          } catch (e) {
+            // ignore
+          }
+          return v === '1';
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
     const cfg = this.getConfiguration?.() || {};
     return cfg.custom?.collapsedByDefault === true;
   }
@@ -396,22 +416,52 @@ class Plugin extends AppPlugin {
   }
 
   loadPropGroupCollapsedSetting() {
+    const parse = (v) => {
+      if (typeof v !== 'string' || !v.trim()) return null;
+      try {
+        const parsed = JSON.parse(v);
+        if (!Array.isArray(parsed)) return null;
+
+        const out = new Set();
+        for (const x of parsed) {
+          if (typeof x !== 'string') continue;
+          const t = x.trim();
+          if (t) out.add(t);
+        }
+        return out;
+      } catch (e) {
+        // ignore
+      }
+      return null;
+    };
+
     try {
       const v = localStorage.getItem(this._storageKeyPropGroupCollapsed);
-      if (!v) return new Set();
-      const parsed = JSON.parse(v);
-      if (!Array.isArray(parsed)) return new Set();
-
-      const out = new Set();
-      for (const x of parsed) {
-        if (typeof x !== 'string') continue;
-        const t = x.trim();
-        if (t) out.add(t);
-      }
-      return out;
+      const set = parse(v);
+      if (set) return set;
     } catch (e) {
       // ignore
     }
+
+    // Migration: older versions used a back"links" storage key.
+    try {
+      const legacyKey = this._legacyStorageKeyPropGroupCollapsed;
+      if (legacyKey && legacyKey !== this._storageKeyPropGroupCollapsed) {
+        const v = localStorage.getItem(legacyKey);
+        const set = parse(v);
+        if (set) {
+          try {
+            localStorage.setItem(this._storageKeyPropGroupCollapsed, JSON.stringify(Array.from(set)));
+          } catch (e) {
+            // ignore
+          }
+          return set;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
     return new Set();
   }
 
