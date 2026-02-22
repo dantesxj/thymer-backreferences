@@ -1149,7 +1149,7 @@ class Plugin extends AppPlugin {
         el.dataset.refGuid = guid;
 
         const title = seg.text?.title || this.resolveRecordName(guid) || '[link]';
-        el.textContent = `[[${title}]]`;
+        el.textContent = title;
         container.appendChild(el);
         continue;
       }
@@ -1264,7 +1264,7 @@ class Plugin extends AppPlugin {
 
       .tlr-divider {
         margin: 12px 0 8px;
-        border-top: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+        border-top: 2px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
       }
 
       .tlr-prop-group { margin: 10px 0 14px; }
@@ -1277,7 +1277,7 @@ class Plugin extends AppPlugin {
         width: 100%;
         padding: 6px 8px;
         border-radius: 10px;
-        border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+        border: 2px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
         background: var(--bg-panel, transparent);
         cursor: pointer;
         text-align: left;
@@ -1333,12 +1333,14 @@ class Plugin extends AppPlugin {
         border-radius: 10px;
         cursor: pointer;
         text-align: left;
-        color: var(--text, inherit);
+        color: var(--ed-link-color, var(--link-color, var(--accent, inherit)));
       }
 
       .tlr-prop-record:hover {
         border-color: var(--border-subtle, rgba(0, 0, 0, 0.12));
         background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+        color: var(--ed-link-hover-color, var(--link-hover-color, var(--ed-link-color, var(--link-color, var(--accent, inherit)))));
+        text-decoration: underline;
       }
 
       .tlr-group { margin: 10px 0 14px; }
@@ -1351,7 +1353,7 @@ class Plugin extends AppPlugin {
         gap: 10px;
         padding: 6px 8px;
         border-radius: 10px;
-        border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+        border: 2px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
         background: var(--bg-panel, transparent);
         cursor: pointer;
         text-align: left;
@@ -1409,13 +1411,14 @@ class Plugin extends AppPlugin {
         padding: 1px 4px;
         border-radius: 6px;
       }
-      .tlr-seg-link { color: var(--accent, #2b6cb0); text-decoration: none; }
-      .tlr-seg-link:hover { text-decoration: underline; }
+      .tlr-seg-link { color: var(--ed-link-color, var(--link-color, var(--accent, inherit))); text-decoration: underline; }
+      .tlr-seg-link:visited { color: var(--ed-link-color, var(--link-color, var(--accent, inherit))); }
+      .tlr-seg-link:hover { color: var(--ed-link-hover-color, var(--link-hover-color, var(--ed-link-color, var(--link-color, var(--accent, inherit))))); }
       .tlr-seg-hashtag { color: var(--accent, #2b6cb0); }
       .tlr-seg-datetime { color: var(--accent, #2b6cb0); }
       .tlr-seg-mention { color: var(--accent, #2b6cb0); }
-      .tlr-seg-ref { color: var(--accent, #2b6cb0); cursor: pointer; }
-      .tlr-seg-ref:hover { text-decoration: underline; }
+      .tlr-seg-ref { color: var(--ed-link-color, var(--link-color, var(--accent, inherit))); cursor: pointer; text-decoration: underline; }
+      .tlr-seg-ref:hover { color: var(--ed-link-hover-color, var(--link-hover-color, var(--ed-link-color, var(--link-color, var(--accent, inherit))))); }
 
       .tlr-loading .tlr-btn[data-action="refresh"] { opacity: 0.6; cursor: default; }
     `);
