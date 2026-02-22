@@ -6,7 +6,7 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
 
 ## Screenshot
 
-![Backreferences footer screenshot](screenshot-2026-02-20_16-48-44.png)
+![Backreferences footer screenshot](screenshot-2026-02-22_15-40-24.png)
 
 How it works:
 
