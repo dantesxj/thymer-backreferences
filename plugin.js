@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.2.3';
+    this._version = '0.2.4';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -113,9 +113,16 @@ class Plugin extends AppPlugin {
         rootEl: null,
         bodyEl: null,
         countEl: null,
+        searchToggleEl: null,
+        searchWrapEl: null,
+        searchInputEl: null,
+        searchQuery: '',
+        searchOpen: false,
+        lastResults: null,
         observer: null,
         refreshTimer: null,
-        refreshSeq: 0
+        refreshSeq: 0,
+        isLoading: false
       };
     }
 
@@ -133,6 +140,12 @@ class Plugin extends AppPlugin {
       rootEl: null,
       bodyEl: null,
       countEl: null,
+      searchToggleEl: null,
+      searchWrapEl: null,
+      searchInputEl: null,
+      searchQuery: '',
+      searchOpen: false,
+      lastResults: null,
       observer: null,
       refreshTimer: null,
       refreshSeq: 0,
@@ -183,6 +196,10 @@ class Plugin extends AppPlugin {
       state.rootEl = this.buildFooterRoot(state);
       state.bodyEl = state.rootEl.querySelector('[data-role="body"]');
       state.countEl = state.rootEl.querySelector('[data-role="count"]');
+      this.setSearchOpen(state, state.searchOpen === true);
+      if (state.lastResults) {
+        this.renderReferences(state, state.lastResults);
+      }
     }
 
     // Ensure it is mounted in the right container.
@@ -239,18 +256,79 @@ class Plugin extends AppPlugin {
     const spacer = document.createElement('div');
     spacer.className = 'tlr-spacer';
 
-    const refreshBtn = document.createElement('button');
-    refreshBtn.className = 'tlr-btn';
-    refreshBtn.type = 'button';
-    refreshBtn.dataset.action = 'refresh';
-    refreshBtn.title = 'Refresh';
-    refreshBtn.textContent = 'Refresh';
+    const searchToggle = document.createElement('button');
+    searchToggle.className = 'tlr-btn tlr-search-toggle';
+    searchToggle.type = 'button';
+    searchToggle.dataset.action = 'toggle-search';
+    searchToggle.title = 'Filter references';
+    searchToggle.setAttribute('aria-expanded', state.searchOpen === true ? 'true' : 'false');
+    try {
+      searchToggle.appendChild(this.ui.createIcon('ti-search'));
+    } catch (e) {
+      searchToggle.textContent = 'Search';
+    }
+
+    const searchWrap = document.createElement('div');
+    searchWrap.className = 'tlr-search-wrap';
+
+    const searchIcon = document.createElement('div');
+    searchIcon.className = 'tlr-search-icon';
+    try {
+      searchIcon.appendChild(this.ui.createIcon('ti-search'));
+    } catch (e) {
+      searchIcon.textContent = 'Search';
+    }
+
+    const input = document.createElement('input');
+    input.className = 'tlr-search-input';
+    input.type = 'text';
+    input.placeholder = 'Filter references...';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.value = state.searchQuery || '';
+
+    const stopKeys = (e) => {
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    };
+
+    input.addEventListener('keydown', (e) => {
+      stopKeys(e);
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        const q = (state.searchQuery || '').trim();
+        if (q) {
+          state.searchQuery = '';
+          input.value = '';
+          this.renderFromCache(state);
+        } else {
+          this.setSearchOpen(state, false);
+        }
+      }
+    });
+
+    input.addEventListener('input', () => {
+      state.searchQuery = input.value;
+      this.renderFromCache(state);
+    });
+
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'tlr-search-clear';
+    clearBtn.type = 'button';
+    clearBtn.dataset.action = 'clear-search';
+    clearBtn.title = 'Clear';
+    clearBtn.textContent = 'x';
+
+    searchWrap.appendChild(searchIcon);
+    searchWrap.appendChild(input);
+    searchWrap.appendChild(clearBtn);
 
     header.appendChild(toggleBtn);
     header.appendChild(title);
     header.appendChild(count);
     header.appendChild(spacer);
-    header.appendChild(refreshBtn);
+    header.appendChild(searchWrap);
+    header.appendChild(searchToggle);
 
     const body = document.createElement('div');
     body.className = 'tlr-body';
@@ -262,6 +340,11 @@ class Plugin extends AppPlugin {
     root.addEventListener('click', (e) => this.handleFooterClick(e));
 
     this.applyCollapsedState(root, this._collapsed);
+    root.classList.toggle('tlr-search-open', state.searchOpen === true);
+
+    state.searchToggleEl = searchToggle;
+    state.searchWrapEl = searchWrap;
+    state.searchInputEl = input;
     return root;
   }
 
@@ -305,14 +388,30 @@ class Plugin extends AppPlugin {
     }
 
     const state = this._panelStates.get(panelId) || null;
-    const panel = state?.panel || null;
-    if (!panel) return;
 
-    if (action === 'refresh') {
-      if (state?.isLoading) return;
-      this.scheduleRefreshForPanel(panel, { force: true, reason: 'button' });
+    if (action === 'toggle-search') {
+      if (!state) return;
+      this.setSearchOpen(state, !(state.searchOpen === true));
       return;
     }
+
+    if (action === 'clear-search') {
+      if (!state) return;
+      const q = (state.searchQuery || '').trim();
+      if (q) {
+        state.searchQuery = '';
+        if (state.searchInputEl) state.searchInputEl.value = '';
+        this.renderFromCache(state);
+        // Keep the input open for continued searching.
+        this.setSearchOpen(state, true);
+      } else {
+        this.setSearchOpen(state, false);
+      }
+      return;
+    }
+
+    const panel = state?.panel || null;
+    if (!panel) return;
 
     if (action === 'open-record') {
       const guid = actionEl.dataset.recordGuid || null;
@@ -374,6 +473,42 @@ class Plugin extends AppPlugin {
   applyCollapsedState(root, collapsed) {
     if (!root) return;
     root.classList.toggle('tlr-collapsed', collapsed === true);
+  }
+
+  setSearchOpen(state, open) {
+    if (!state) return;
+    state.searchOpen = open === true;
+    if (!state.rootEl) return;
+
+    state.rootEl.classList.toggle('tlr-search-open', state.searchOpen === true);
+    state.searchToggleEl?.setAttribute?.('aria-expanded', state.searchOpen === true ? 'true' : 'false');
+
+    if (state.searchInputEl) {
+      state.searchInputEl.value = state.searchQuery || '';
+      if (state.searchOpen === true) {
+        setTimeout(() => {
+          try {
+            state.searchInputEl?.focus?.();
+          } catch (e) {
+            // ignore
+          }
+        }, 0);
+      }
+    }
+  }
+
+  renderFromCache(state) {
+    if (!state) return;
+    const cached = state.lastResults || null;
+    if (!cached) return;
+
+    const panel = state.panel || null;
+    if (panel && (!state.rootEl || !state.rootEl.isConnected)) {
+      this.mountFooter(panel, state);
+    }
+
+    if (!state.bodyEl || !state.countEl) return;
+    this.renderReferences(state, cached);
   }
 
   loadCollapsedSetting() {
@@ -577,13 +712,14 @@ class Plugin extends AppPlugin {
       propertyError = 'Error loading property references.';
     }
 
-    this.renderReferences(state, {
+    state.lastResults = {
       propertyGroups,
       propertyError,
       linkedGroups,
       linkedError,
       maxResults
-    });
+    };
+    this.renderFromCache(state);
     this.setLoadingState(state, false);
   }
 
@@ -840,37 +976,93 @@ class Plugin extends AppPlugin {
     const body = state.bodyEl;
     body.innerHTML = '';
 
-    const props = Array.isArray(propertyGroups) ? propertyGroups : [];
-    const linked = Array.isArray(linkedGroups) ? linkedGroups : [];
+    const query = (state.searchQuery || '').trim();
+    const queryLower = query.toLowerCase();
 
-    const propRefCount = props.reduce((n, g) => n + (g?.records?.length || 0), 0);
-    const linkedRefCount = linked.reduce((n, g) => n + (g?.lines?.length || 0), 0);
+    const propsAll = Array.isArray(propertyGroups) ? propertyGroups : [];
+    const linkedAll = Array.isArray(linkedGroups) ? linkedGroups : [];
 
-    const uniquePages = new Set();
+    const totalPropRefCount = propsAll.reduce((n, g) => n + (g?.records?.length || 0), 0);
+    const totalLinkedRefCount = linkedAll.reduce((n, g) => n + (g?.lines?.length || 0), 0);
+
+    const totalUniquePages = new Set();
+    for (const g of propsAll) {
+      for (const r of g?.records || []) {
+        const guid = r?.guid || null;
+        if (guid) totalUniquePages.add(guid);
+      }
+    }
+    for (const g of linkedAll) {
+      const guid = g?.record?.guid || null;
+      if (guid) totalUniquePages.add(guid);
+    }
+
+    let props = propsAll;
+    let linked = linkedAll;
+
+    if (queryLower) {
+      const nextProps = [];
+      for (const g of propsAll) {
+        const propertyName = (g?.propertyName || '').trim();
+        if (!propertyName) continue;
+        const recs = (g?.records || []).filter((r) => {
+          const name = (r?.getName?.() || '').toLowerCase();
+          return name.includes(queryLower);
+        });
+        if (recs.length > 0) nextProps.push({ propertyName, records: recs });
+      }
+      props = nextProps;
+
+      const nextLinked = [];
+      for (const g of linkedAll) {
+        const record = g?.record || null;
+        const recordGuid = record?.guid || null;
+        if (!recordGuid) continue;
+        const lines = (g?.lines || []).filter((line) => {
+          const text = this.segmentsToPlainText(line?.segments || []);
+          return text.toLowerCase().includes(queryLower);
+        });
+        if (lines.length > 0) nextLinked.push({ record, lines });
+      }
+      linked = nextLinked;
+    }
+
+    const filteredPropRefCount = props.reduce((n, g) => n + (g?.records?.length || 0), 0);
+    const filteredLinkedRefCount = linked.reduce((n, g) => n + (g?.lines?.length || 0), 0);
+
+    const filteredUniquePages = new Set();
     for (const g of props) {
       for (const r of g?.records || []) {
         const guid = r?.guid || null;
-        if (guid) uniquePages.add(guid);
+        if (guid) filteredUniquePages.add(guid);
       }
     }
     for (const g of linked) {
       const guid = g?.record?.guid || null;
-      if (guid) uniquePages.add(guid);
+      if (guid) filteredUniquePages.add(guid);
     }
 
     const parts = [];
-    if (uniquePages.size > 0) parts.push(`${uniquePages.size} page${uniquePages.size === 1 ? '' : 's'}`);
-    if (propRefCount > 0) parts.push(`${propRefCount} prop ref${propRefCount === 1 ? '' : 's'}`);
-    if (linkedRefCount > 0) parts.push(`${linkedRefCount} line ref${linkedRefCount === 1 ? '' : 's'}`);
+    if (queryLower) {
+      const shortQuery = query.length > 24 ? `${query.slice(0, 24)}...` : query;
+      parts.push(`Filter: "${shortQuery}"`);
+      if (totalUniquePages.size > 0) parts.push(`${filteredUniquePages.size}/${totalUniquePages.size} pages`);
+      if (totalPropRefCount > 0) parts.push(`${filteredPropRefCount}/${totalPropRefCount} prop refs`);
+      if (totalLinkedRefCount > 0) parts.push(`${filteredLinkedRefCount}/${totalLinkedRefCount} line refs`);
+    } else {
+      if (totalUniquePages.size > 0) parts.push(`${totalUniquePages.size} page${totalUniquePages.size === 1 ? '' : 's'}`);
+      if (totalPropRefCount > 0) parts.push(`${totalPropRefCount} prop ref${totalPropRefCount === 1 ? '' : 's'}`);
+      if (totalLinkedRefCount > 0) parts.push(`${totalLinkedRefCount} line ref${totalLinkedRefCount === 1 ? '' : 's'}`);
+    }
     state.countEl.textContent = parts.join(' | ');
 
     this.appendSectionTitle(body, 'Property References');
     if (propertyError) {
       this.appendError(body, propertyError);
     } else if (props.length === 0) {
-      this.appendEmpty(body, 'No property references.');
+      this.appendEmpty(body, queryLower ? 'No matching property references.' : 'No property references.');
     } else {
-      this.appendPropertyReferenceGroups(body, props);
+      this.appendPropertyReferenceGroups(body, props, { query });
     }
 
     const divider = document.createElement('div');
@@ -883,7 +1075,12 @@ class Plugin extends AppPlugin {
       return;
     }
 
-    this.appendLinkedReferenceGroups(body, linked, { maxResults });
+    this.appendLinkedReferenceGroups(body, linked, {
+      maxResults,
+      query,
+      totalLineCount: totalLinkedRefCount,
+      emptyMessage: queryLower ? 'No matching linked references.' : 'No linked references.'
+    });
   }
 
   appendSectionTitle(container, text) {
@@ -910,8 +1107,10 @@ class Plugin extends AppPlugin {
     container.appendChild(el);
   }
 
-  appendPropertyReferenceGroups(container, groups) {
+  appendPropertyReferenceGroups(container, groups, opts) {
     if (!container) return;
+
+    const query = (opts?.query || '').trim();
 
     for (const g of groups || []) {
       const propName = (g?.propertyName || '').trim();
@@ -959,7 +1158,9 @@ class Plugin extends AppPlugin {
         btn.className = 'tlr-prop-record';
         btn.dataset.action = 'open-record';
         btn.dataset.recordGuid = guid;
-        btn.textContent = r.getName?.() || 'Untitled';
+        const name = r.getName?.() || 'Untitled';
+        btn.textContent = '';
+        this.appendHighlightedText(btn, name, query);
         recsEl.appendChild(btn);
       }
 
@@ -969,8 +1170,13 @@ class Plugin extends AppPlugin {
     }
   }
 
-  appendLinkedReferenceGroups(container, groups, { maxResults }) {
+  appendLinkedReferenceGroups(container, groups, opts) {
     if (!container) return;
+
+    const maxResults = opts?.maxResults || 0;
+    const query = (opts?.query || '').trim();
+    const totalLineCount = typeof opts?.totalLineCount === 'number' ? opts.totalLineCount : null;
+    const emptyMessage = (opts?.emptyMessage || '').trim() || 'No linked references.';
 
     const pageCount = groups.length;
     const refCount = groups.reduce((n, g) => n + (g?.lines?.length || 0), 0);
@@ -978,7 +1184,7 @@ class Plugin extends AppPlugin {
     if (pageCount === 0) {
       const empty = document.createElement('div');
       empty.className = 'tlr-empty';
-      empty.textContent = 'No linked references.';
+      empty.textContent = emptyMessage;
       container.appendChild(empty);
       return;
     }
@@ -1029,7 +1235,7 @@ class Plugin extends AppPlugin {
 
         const content = document.createElement('span');
         content.className = 'tlr-line-content';
-        this.appendSegments(content, line.segments || []);
+        this.appendSegments(content, line.segments || [], query);
         lineEl.appendChild(content);
 
         linesEl.appendChild(lineEl);
@@ -1040,7 +1246,7 @@ class Plugin extends AppPlugin {
       container.appendChild(groupEl);
     }
 
-    if (refCount >= maxResults) {
+    if (maxResults > 0 && (totalLineCount ?? refCount) >= maxResults) {
       const note = document.createElement('div');
       note.className = 'tlr-note';
       note.textContent = `Showing first ${maxResults} matches.`;
@@ -1063,7 +1269,99 @@ class Plugin extends AppPlugin {
     return '';
   }
 
-  appendSegments(container, segments) {
+  segmentsToPlainText(segments) {
+    if (!Array.isArray(segments) || segments.length === 0) return '';
+
+    let out = '';
+    for (const seg of segments) {
+      if (!seg) continue;
+
+      if (seg.type === 'text' || seg.type === 'bold' || seg.type === 'italic' || seg.type === 'code' || seg.type === 'link') {
+        if (typeof seg.text === 'string') out += seg.text;
+        continue;
+      }
+
+      if (seg.type === 'linkobj') {
+        const link = seg.text?.link || '';
+        const title = seg.text?.title || link;
+        out += title;
+        continue;
+      }
+
+      if (seg.type === 'hashtag') {
+        const t = typeof seg.text === 'string' ? seg.text : '';
+        if (!t) continue;
+        out += t.startsWith('#') ? t : `#${t}`;
+        continue;
+      }
+
+      if (seg.type === 'datetime') {
+        out += this.formatDateTimeSegment(seg.text);
+        continue;
+      }
+
+      if (seg.type === 'mention') {
+        const guid = typeof seg.text === 'string' ? seg.text : '';
+        out += this.formatMention(guid);
+        continue;
+      }
+
+      if (seg.type === 'ref') {
+        const guid = seg.text?.guid || null;
+        const title = seg.text?.title || (guid ? this.resolveRecordName(guid) : '') || '';
+        out += title;
+        continue;
+      }
+
+      if (typeof seg.text === 'string') {
+        out += seg.text;
+      }
+    }
+
+    return out;
+  }
+
+  appendHighlightedText(container, text, query) {
+    if (!container) return;
+    const s = typeof text === 'string' ? text : '';
+    if (!s) return;
+
+    const q = typeof query === 'string' ? query.trim() : '';
+    if (!q) {
+      container.appendChild(document.createTextNode(s));
+      return;
+    }
+
+    const hayLower = s.toLowerCase();
+    const needleLower = q.toLowerCase();
+    if (!needleLower) {
+      container.appendChild(document.createTextNode(s));
+      return;
+    }
+
+    let idx = 0;
+    while (idx < s.length) {
+      const next = hayLower.indexOf(needleLower, idx);
+      if (next === -1) break;
+
+      if (next > idx) {
+        container.appendChild(document.createTextNode(s.slice(idx, next)));
+      }
+
+      const mark = document.createElement('mark');
+      mark.className = 'tlr-search-mark';
+      mark.textContent = s.slice(next, next + needleLower.length);
+      container.appendChild(mark);
+
+      idx = next + needleLower.length;
+    }
+
+    if (idx < s.length) {
+      container.appendChild(document.createTextNode(s.slice(idx)));
+    }
+  }
+
+  appendSegments(container, segments, query) {
     if (!container) return;
     if (!Array.isArray(segments) || segments.length === 0) {
       container.textContent = '';
@@ -1074,14 +1372,15 @@ class Plugin extends AppPlugin {
       if (!seg) continue;
 
       if (seg.type === 'text') {
-        container.appendChild(document.createTextNode(typeof seg.text === 'string' ? seg.text : ''));
+        this.appendHighlightedText(container, typeof seg.text === 'string' ? seg.text : '', query);
         continue;
       }
 
       if (seg.type === 'bold' || seg.type === 'italic' || seg.type === 'code') {
         const el = document.createElement('span');
         el.className = seg.type === 'bold' ? 'tlr-seg-bold' : seg.type === 'italic' ? 'tlr-seg-italic' : 'tlr-seg-code';
-        el.textContent = typeof seg.text === 'string' ? seg.text : '';
+        el.textContent = '';
+        this.appendHighlightedText(el, typeof seg.text === 'string' ? seg.text : '', query);
         container.appendChild(el);
         continue;
       }
@@ -1094,7 +1393,8 @@ class Plugin extends AppPlugin {
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
         a.className = 'tlr-seg-link';
-        a.textContent = url;
+        a.textContent = '';
+        this.appendHighlightedText(a, url, query);
         container.appendChild(a);
         continue;
       }
@@ -1108,7 +1408,8 @@ class Plugin extends AppPlugin {
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
         a.className = 'tlr-seg-link';
-        a.textContent = title;
+        a.textContent = '';
+        this.appendHighlightedText(a, title, query);
         container.appendChild(a);
         continue;
       }
@@ -1118,7 +1419,9 @@ class Plugin extends AppPlugin {
         if (!t) continue;
         const el = document.createElement('span');
         el.className = 'tlr-seg-hashtag';
-        el.textContent = t.startsWith('#') ? t : `#${t}`;
+        const tag = t.startsWith('#') ? t : `#${t}`;
+        el.textContent = '';
+        this.appendHighlightedText(el, tag, query);
         container.appendChild(el);
         continue;
       }
@@ -1126,7 +1429,9 @@ class Plugin extends AppPlugin {
       if (seg.type === 'datetime') {
         const el = document.createElement('span');
         el.className = 'tlr-seg-datetime';
-        el.textContent = this.formatDateTimeSegment(seg.text);
+        const text = this.formatDateTimeSegment(seg.text);
+        el.textContent = '';
+        this.appendHighlightedText(el, text, query);
         container.appendChild(el);
         continue;
       }
@@ -1135,7 +1440,9 @@ class Plugin extends AppPlugin {
         const el = document.createElement('span');
         el.className = 'tlr-seg-mention';
         const guid = typeof seg.text === 'string' ? seg.text : '';
-        el.textContent = this.formatMention(guid);
+        const text = this.formatMention(guid);
+        el.textContent = '';
+        this.appendHighlightedText(el, text, query);
         container.appendChild(el);
         continue;
       }
@@ -1149,14 +1456,15 @@ class Plugin extends AppPlugin {
         el.dataset.refGuid = guid;
 
         const title = seg.text?.title || this.resolveRecordName(guid) || '[link]';
-        el.textContent = title;
+        el.textContent = '';
+        this.appendHighlightedText(el, title, query);
         container.appendChild(el);
         continue;
       }
 
       // Fallback: render as plain text when possible.
       if (typeof seg.text === 'string' && seg.text) {
-        container.appendChild(document.createTextNode(seg.text));
+        this.appendHighlightedText(container, seg.text, query);
       }
     }
   }
@@ -1232,6 +1540,56 @@ class Plugin extends AppPlugin {
 
       .tlr-btn:hover {
         background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+      }
+
+      .tlr-search-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .tlr-search-wrap {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        border: 2px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+        border-radius: 10px;
+        background: var(--bg-panel, transparent);
+      }
+
+      .tlr-search-open .tlr-search-wrap { display: flex; }
+      .tlr-search-open .tlr-search-toggle { display: none; }
+
+      .tlr-search-icon {
+        display: flex;
+        align-items: center;
+        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+      }
+
+      .tlr-search-input {
+        width: 220px;
+        max-width: 40vw;
+        border: 0;
+        outline: none;
+        background: transparent;
+        color: var(--text, inherit);
+        font-size: 12px;
+      }
+
+      .tlr-search-clear {
+        border: 0;
+        outline: none;
+        background: transparent;
+        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        cursor: pointer;
+        padding: 2px 6px;
+        border-radius: 8px;
+      }
+
+      .tlr-search-clear:hover {
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+        color: var(--text, inherit);
       }
 
       .tlr-toggle {
@@ -1420,7 +1778,14 @@ class Plugin extends AppPlugin {
       .tlr-seg-ref { color: var(--ed-link-color, var(--link-color, var(--accent, inherit))); cursor: pointer; text-decoration: underline; }
       .tlr-seg-ref:hover { color: var(--ed-link-hover-color, var(--link-hover-color, var(--ed-link-color, var(--link-color, var(--accent, inherit))))); }
 
-      .tlr-loading .tlr-btn[data-action="refresh"] { opacity: 0.6; cursor: default; }
+      .tlr-search-mark {
+        background: var(--ed-selection-self-bg, var(--selection-bg, rgba(255, 217, 61, 0.35)));
+        color: inherit;
+        padding: 0 1px;
+        border-radius: 4px;
+      }
+
+      .tlr-loading .tlr-search-toggle { opacity: 0.6; cursor: default; }
     `);
   }
 }
