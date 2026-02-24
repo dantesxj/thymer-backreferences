@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.2.4';
+    this._version = '0.3.0';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -14,6 +14,12 @@ class Plugin extends AppPlugin {
     this._storageKeyPropGroupCollapsed = 'thymer_backreferences_prop_group_collapsed_v1';
     this._legacyStorageKeyPropGroupCollapsed = 'thymer_backlinks_prop_group_collapsed_v1';
     this._propGroupCollapsed = this.loadPropGroupCollapsedSetting();
+
+    this._defaultSortBy = 'page_last_edited';
+    this._defaultSortDir = 'desc';
+    this._storageKeySortByRecord = 'thymer_backreferences_sort_by_record_v1';
+    this._legacyStorageKeySortByRecord = 'thymer_backlinks_sort_by_record_v1';
+    this._sortByRecord = this.loadSortByRecordSetting();
 
     this._defaultMaxResults = 200;
     this._refreshDebounceMs = 350;
@@ -88,6 +94,13 @@ class Plugin extends AppPlugin {
     const recordChanged = state.recordGuid !== recordGuid;
     state.recordGuid = recordGuid;
 
+    if (recordChanged || !this.isValidSortBy(state.sortBy) || !this.isValidSortDir(state.sortDir)) {
+      const pref = this.getSortPreferenceForRecord(recordGuid);
+      state.sortBy = pref.sortBy;
+      state.sortDir = pref.sortDir;
+      state.sortMenuOpen = false;
+    }
+
     this.mountFooter(panel, state);
 
     // Always refresh on navigation; on focus we debounce unless already loaded.
@@ -113,11 +126,17 @@ class Plugin extends AppPlugin {
         rootEl: null,
         bodyEl: null,
         countEl: null,
+        sortToggleEl: null,
+        sortMenuEl: null,
         searchToggleEl: null,
         searchWrapEl: null,
         searchInputEl: null,
         searchQuery: '',
         searchOpen: false,
+        sortBy: this._defaultSortBy,
+        sortDir: this._defaultSortDir,
+        sortMenuOpen: false,
+        sortMenuDismissHandler: null,
         lastResults: null,
         observer: null,
         refreshTimer: null,
@@ -140,11 +159,17 @@ class Plugin extends AppPlugin {
       rootEl: null,
       bodyEl: null,
       countEl: null,
+      sortToggleEl: null,
+      sortMenuEl: null,
       searchToggleEl: null,
       searchWrapEl: null,
       searchInputEl: null,
       searchQuery: '',
       searchOpen: false,
+      sortBy: this._defaultSortBy,
+      sortDir: this._defaultSortDir,
+      sortMenuOpen: false,
+      sortMenuDismissHandler: null,
       lastResults: null,
       observer: null,
       refreshTimer: null,
@@ -172,6 +197,8 @@ class Plugin extends AppPlugin {
     }
     state.observer = null;
 
+    this.setSortMenuOpen(state, false);
+
     try {
       state.rootEl?.remove?.();
     } catch (e) {
@@ -197,6 +224,9 @@ class Plugin extends AppPlugin {
       state.bodyEl = state.rootEl.querySelector('[data-role="body"]');
       state.countEl = state.rootEl.querySelector('[data-role="count"]');
       this.setSearchOpen(state, state.searchOpen === true);
+      this.renderSortMenu(state);
+      this.syncSortControlState(state);
+      this.setSortMenuOpen(state, state.sortMenuOpen === true);
       if (state.lastResults) {
         this.renderReferences(state, state.lastResults);
       }
@@ -207,6 +237,9 @@ class Plugin extends AppPlugin {
       container.appendChild(state.rootEl);
       state.mountedIn = container;
     }
+
+    this.renderSortMenu(state);
+    this.syncSortControlState(state);
 
     // If the container/panel DOM churns, remount when our root disappears.
     if (!state.observer) {
@@ -323,12 +356,36 @@ class Plugin extends AppPlugin {
     searchWrap.appendChild(input);
     searchWrap.appendChild(clearBtn);
 
+    const sortWrap = document.createElement('div');
+    sortWrap.className = 'tlr-sort-wrap';
+
+    const sortToggle = document.createElement('button');
+    sortToggle.className = 'tlr-btn tlr-sort-toggle';
+    sortToggle.type = 'button';
+    sortToggle.dataset.action = 'toggle-sort-menu';
+    sortToggle.setAttribute('aria-haspopup', 'menu');
+    sortToggle.setAttribute('aria-expanded', state.sortMenuOpen === true ? 'true' : 'false');
+    sortToggle.title = 'Sort options';
+    try {
+      sortToggle.appendChild(this.ui.createIcon('ti-arrows-sort'));
+    } catch (e) {
+      sortToggle.textContent = 'Sort';
+    }
+
+    const sortMenu = document.createElement('div');
+    sortMenu.className = 'tlr-sort-menu';
+    sortMenu.setAttribute('role', 'menu');
+
+    sortWrap.appendChild(sortToggle);
+    sortWrap.appendChild(sortMenu);
+
     header.appendChild(toggleBtn);
     header.appendChild(title);
     header.appendChild(count);
     header.appendChild(spacer);
-    header.appendChild(searchWrap);
     header.appendChild(searchToggle);
+    header.appendChild(sortWrap);
+    header.appendChild(searchWrap);
 
     const body = document.createElement('div');
     body.className = 'tlr-body';
@@ -341,7 +398,10 @@ class Plugin extends AppPlugin {
 
     this.applyCollapsedState(root, this._collapsed);
     root.classList.toggle('tlr-search-open', state.searchOpen === true);
+    root.classList.toggle('tlr-sort-open', state.sortMenuOpen === true);
 
+    state.sortToggleEl = sortToggle;
+    state.sortMenuEl = sortMenu;
     state.searchToggleEl = searchToggle;
     state.searchWrapEl = searchWrap;
     state.searchInputEl = input;
@@ -360,6 +420,8 @@ class Plugin extends AppPlugin {
     const action = actionEl.dataset.action || '';
     const panelId = root.dataset.panelId || null;
     if (!panelId) return;
+
+    const state = this._panelStates.get(panelId) || null;
 
     if (action === 'toggle') {
       this._collapsed = !this._collapsed;
@@ -387,11 +449,33 @@ class Plugin extends AppPlugin {
       return;
     }
 
-    const state = this._panelStates.get(panelId) || null;
-
     if (action === 'toggle-search') {
       if (!state) return;
       this.setSearchOpen(state, !(state.searchOpen === true));
+      return;
+    }
+
+    if (action === 'toggle-sort-menu') {
+      if (!state) return;
+      this.setSortMenuOpen(state, !(state.sortMenuOpen === true));
+      return;
+    }
+
+    if (action === 'set-sort-by') {
+      if (!state) return;
+      const nextSortBy = this.normalizeSortBy(actionEl.dataset.sortBy);
+      if (!nextSortBy) return;
+      this.applySortPreferenceForRecord(state.recordGuid, nextSortBy, state.sortDir);
+      this.setSortMenuOpen(state, true);
+      return;
+    }
+
+    if (action === 'set-sort-dir') {
+      if (!state) return;
+      const nextSortDir = this.normalizeSortDir(actionEl.dataset.sortDir);
+      if (!nextSortDir) return;
+      this.applySortPreferenceForRecord(state.recordGuid, state.sortBy, nextSortDir);
+      this.setSortMenuOpen(state, true);
       return;
     }
 
@@ -416,6 +500,7 @@ class Plugin extends AppPlugin {
     if (action === 'open-record') {
       const guid = actionEl.dataset.recordGuid || null;
       if (!guid) return;
+      this.setSortMenuOpen(state, false);
       this.openRecord(panel, guid, null, e);
       return;
     }
@@ -424,6 +509,7 @@ class Plugin extends AppPlugin {
       const guid = actionEl.dataset.recordGuid || null;
       const lineGuid = actionEl.dataset.lineGuid || null;
       if (!guid) return;
+      this.setSortMenuOpen(state, false);
       this.openRecord(panel, guid, lineGuid || null, e);
       return;
     }
@@ -431,6 +517,7 @@ class Plugin extends AppPlugin {
     if (action === 'open-ref') {
       const guid = actionEl.dataset.refGuid || null;
       if (!guid) return;
+      this.setSortMenuOpen(state, false);
       this.openRecord(panel, guid, null, e);
       return;
     }
@@ -478,6 +565,7 @@ class Plugin extends AppPlugin {
   setSearchOpen(state, open) {
     if (!state) return;
     state.searchOpen = open === true;
+    if (state.searchOpen === true) this.setSortMenuOpen(state, false);
     if (!state.rootEl) return;
 
     state.rootEl.classList.toggle('tlr-search-open', state.searchOpen === true);
@@ -494,6 +582,195 @@ class Plugin extends AppPlugin {
           }
         }, 0);
       }
+    }
+  }
+
+  getSortOptions() {
+    return [
+      { id: 'page_last_edited', label: 'Page Last Edited' },
+      { id: 'reference_activity', label: 'Reference Activity' },
+      { id: 'reference_count', label: 'Reference Count' },
+      { id: 'page_title', label: 'Page Title' },
+      { id: 'page_created_date', label: 'Page Created Date' }
+    ];
+  }
+
+  getSortLabel(sortBy) {
+    const id = this.normalizeSortBy(sortBy) || this._defaultSortBy;
+    for (const option of this.getSortOptions()) {
+      if (option.id === id) return option.label;
+    }
+    return 'Page Last Edited';
+  }
+
+  isValidSortBy(sortBy) {
+    if (typeof sortBy !== 'string') return false;
+    return this.getSortOptions().some((x) => x.id === sortBy);
+  }
+
+  isValidSortDir(sortDir) {
+    return sortDir === 'asc' || sortDir === 'desc';
+  }
+
+  normalizeSortBy(sortBy) {
+    return this.isValidSortBy(sortBy) ? sortBy : null;
+  }
+
+  normalizeSortDir(sortDir) {
+    return this.isValidSortDir(sortDir) ? sortDir : null;
+  }
+
+  getSortPreferenceForRecord(recordGuid) {
+    const guid = (recordGuid || '').trim();
+    const fallback = { sortBy: this._defaultSortBy, sortDir: this._defaultSortDir };
+    if (!guid) return fallback;
+
+    const raw = this._sortByRecord?.[guid] || null;
+    if (!raw || typeof raw !== 'object') return fallback;
+
+    return {
+      sortBy: this.normalizeSortBy(raw.sortBy) || fallback.sortBy,
+      sortDir: this.normalizeSortDir(raw.sortDir) || fallback.sortDir
+    };
+  }
+
+  applySortPreferenceForRecord(recordGuid, sortBy, sortDir) {
+    const guid = (recordGuid || '').trim();
+    if (!guid) return;
+
+    const nextSortBy = this.normalizeSortBy(sortBy) || this._defaultSortBy;
+    const nextSortDir = this.normalizeSortDir(sortDir) || this._defaultSortDir;
+
+    this.setSortPreferenceForRecord(guid, nextSortBy, nextSortDir);
+
+    for (const s of this._panelStates.values()) {
+      if (!s || s.recordGuid !== guid) continue;
+      s.sortBy = nextSortBy;
+      s.sortDir = nextSortDir;
+      this.renderSortMenu(s);
+      this.syncSortControlState(s);
+      this.renderFromCache(s);
+    }
+  }
+
+  renderSortMenu(state) {
+    const menu = state?.sortMenuEl || null;
+    if (!menu) return;
+
+    const sortBy = this.normalizeSortBy(state.sortBy) || this._defaultSortBy;
+    const sortDir = this.normalizeSortDir(state.sortDir) || this._defaultSortDir;
+    state.sortBy = sortBy;
+    state.sortDir = sortDir;
+
+    menu.innerHTML = '';
+
+    const title = document.createElement('div');
+    title.className = 'tlr-sort-menu-title';
+    title.textContent = 'Sort By';
+    menu.appendChild(title);
+
+    for (const option of this.getSortOptions()) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'tlr-sort-option';
+      row.dataset.action = 'set-sort-by';
+      row.dataset.sortBy = option.id;
+      if (option.id === sortBy) row.classList.add('is-active');
+
+      const check = document.createElement('span');
+      check.className = 'tlr-sort-option-check';
+      check.textContent = option.id === sortBy ? '>' : '';
+
+      const label = document.createElement('span');
+      label.className = 'tlr-sort-option-label';
+      label.textContent = option.label;
+
+      row.appendChild(check);
+      row.appendChild(label);
+      menu.appendChild(row);
+    }
+
+    const divider = document.createElement('div');
+    divider.className = 'tlr-sort-menu-divider';
+    menu.appendChild(divider);
+
+    const dirRow = document.createElement('div');
+    dirRow.className = 'tlr-sort-dir-row';
+
+    const ascBtn = document.createElement('button');
+    ascBtn.type = 'button';
+    ascBtn.className = 'tlr-sort-dir-btn';
+    ascBtn.dataset.action = 'set-sort-dir';
+    ascBtn.dataset.sortDir = 'asc';
+    ascBtn.textContent = 'Ascending';
+    if (sortDir === 'asc') ascBtn.classList.add('is-active');
+
+    const descBtn = document.createElement('button');
+    descBtn.type = 'button';
+    descBtn.className = 'tlr-sort-dir-btn';
+    descBtn.dataset.action = 'set-sort-dir';
+    descBtn.dataset.sortDir = 'desc';
+    descBtn.textContent = 'Descending';
+    if (sortDir === 'desc') descBtn.classList.add('is-active');
+
+    dirRow.appendChild(ascBtn);
+    dirRow.appendChild(descBtn);
+    menu.appendChild(dirRow);
+  }
+
+  syncSortControlState(state) {
+    if (!state) return;
+    const sortBy = this.normalizeSortBy(state.sortBy) || this._defaultSortBy;
+    const sortDir = this.normalizeSortDir(state.sortDir) || this._defaultSortDir;
+    state.sortBy = sortBy;
+    state.sortDir = sortDir;
+
+    const sortLabel = this.getSortLabel(sortBy);
+    const dirLabel = sortDir === 'asc' ? 'Ascending' : 'Descending';
+
+    if (state.sortToggleEl) {
+      state.sortToggleEl.title = `Sort: ${sortLabel} (${dirLabel})`;
+      state.sortToggleEl.setAttribute('aria-expanded', state.sortMenuOpen === true ? 'true' : 'false');
+    }
+
+    if (state.rootEl) {
+      state.rootEl.classList.toggle('tlr-sort-open', state.sortMenuOpen === true);
+    }
+  }
+
+  setSortMenuOpen(state, open) {
+    if (!state) return;
+    state.sortMenuOpen = open === true;
+
+    if (state.sortMenuDismissHandler) {
+      try {
+        document.removeEventListener('mousedown', state.sortMenuDismissHandler, true);
+      } catch (e) {
+        // ignore
+      }
+      state.sortMenuDismissHandler = null;
+    }
+
+    this.syncSortControlState(state);
+
+    if (state.sortMenuOpen !== true) return;
+
+    const onOutsideMouseDown = (ev) => {
+      const root = state.rootEl || null;
+      if (!root || !root.isConnected) {
+        this.setSortMenuOpen(state, false);
+        return;
+      }
+
+      if (root.contains(ev.target)) return;
+      this.setSortMenuOpen(state, false);
+    };
+
+    state.sortMenuDismissHandler = onOutsideMouseDown;
+    try {
+      document.addEventListener('mousedown', onOutsideMouseDown, true);
+    } catch (e) {
+      // ignore
     }
   }
 
@@ -622,6 +899,87 @@ class Plugin extends AppPlugin {
     if (collapsed === true) this._propGroupCollapsed.add(name);
     else this._propGroupCollapsed.delete(name);
     this.savePropGroupCollapsedSetting();
+  }
+
+  loadSortByRecordSetting() {
+    const parse = (v) => {
+      if (typeof v !== 'string' || !v.trim()) return null;
+      try {
+        const parsed = JSON.parse(v);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+        const out = {};
+        for (const [recordGuid, pref] of Object.entries(parsed)) {
+          const guid = typeof recordGuid === 'string' ? recordGuid.trim() : '';
+          if (!guid) continue;
+          const sortBy = this.normalizeSortBy(pref?.sortBy);
+          const sortDir = this.normalizeSortDir(pref?.sortDir);
+          if (!sortBy || !sortDir) continue;
+          out[guid] = { sortBy, sortDir };
+        }
+        return out;
+      } catch (e) {
+        // ignore
+      }
+      return null;
+    };
+
+    try {
+      const v = localStorage.getItem(this._storageKeySortByRecord);
+      const map = parse(v);
+      if (map) return map;
+    } catch (e) {
+      // ignore
+    }
+
+    // Migration: older versions used a back"links" storage key.
+    try {
+      const legacyKey = this._legacyStorageKeySortByRecord;
+      if (legacyKey && legacyKey !== this._storageKeySortByRecord) {
+        const v = localStorage.getItem(legacyKey);
+        const map = parse(v);
+        if (map) {
+          try {
+            localStorage.setItem(this._storageKeySortByRecord, JSON.stringify(map));
+          } catch (e) {
+            // ignore
+          }
+          return map;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return {};
+  }
+
+  saveSortByRecordSetting() {
+    try {
+      localStorage.setItem(this._storageKeySortByRecord, JSON.stringify(this._sortByRecord || {}));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  setSortPreferenceForRecord(recordGuid, sortBy, sortDir) {
+    const guid = (recordGuid || '').trim();
+    if (!guid) return;
+
+    const nextSortBy = this.normalizeSortBy(sortBy) || this._defaultSortBy;
+    const nextSortDir = this.normalizeSortDir(sortDir) || this._defaultSortDir;
+
+    if (!this._sortByRecord || typeof this._sortByRecord !== 'object') {
+      this._sortByRecord = {};
+    }
+
+    if (nextSortBy === this._defaultSortBy && nextSortDir === this._defaultSortDir) {
+      delete this._sortByRecord[guid];
+    } else {
+      this._sortByRecord[guid] = { sortBy: nextSortBy, sortDir: nextSortDir };
+    }
+
+    this.saveSortByRecordSetting();
   }
 
   // ---------- Refresh orchestration ----------
@@ -959,6 +1317,160 @@ class Plugin extends AppPlugin {
     return groups;
   }
 
+  sortPropertyGroupsForRender(groups, sortSpec, sortMetrics) {
+    return (groups || []).map((g) => {
+      const records = Array.isArray(g?.records) ? Array.from(g.records) : [];
+      records.sort((a, b) => this.compareRecordsForSort(a, b, sortSpec, sortMetrics));
+      return {
+        propertyName: g?.propertyName || '',
+        records
+      };
+    });
+  }
+
+  sortLinkedGroupsForRender(groups, sortSpec, sortMetrics) {
+    const out = (groups || []).map((g) => ({
+      record: g?.record || null,
+      lines: Array.isArray(g?.lines) ? Array.from(g.lines) : []
+    }));
+
+    out.sort((a, b) => this.compareRecordsForSort(a?.record || null, b?.record || null, sortSpec, sortMetrics));
+    return out;
+  }
+
+  computeRecordSortMetrics(propertyGroups, linkedGroups) {
+    const referenceCountByGuid = new Map();
+    const referenceActivityByGuid = new Map();
+
+    const addReferenceCount = (recordGuid, delta) => {
+      const guid = (recordGuid || '').trim();
+      if (!guid) return;
+      const n = Number(delta);
+      if (!Number.isFinite(n) || n === 0) return;
+      const prev = referenceCountByGuid.get(guid) || 0;
+      referenceCountByGuid.set(guid, prev + n);
+    };
+
+    const setReferenceActivity = (recordGuid, timestamp) => {
+      const guid = (recordGuid || '').trim();
+      if (!guid) return;
+      const ts = Number(timestamp);
+      if (!Number.isFinite(ts) || ts <= 0) return;
+      const prev = referenceActivityByGuid.get(guid) || 0;
+      if (ts > prev) referenceActivityByGuid.set(guid, ts);
+    };
+
+    for (const g of propertyGroups || []) {
+      for (const record of g?.records || []) {
+        const guid = record?.guid || null;
+        if (!guid) continue;
+        addReferenceCount(guid, 1);
+        setReferenceActivity(guid, this.getRecordUpdatedTimestamp(record));
+      }
+    }
+
+    for (const g of linkedGroups || []) {
+      const record = g?.record || null;
+      const guid = record?.guid || null;
+      if (!guid) continue;
+
+      const lines = Array.isArray(g?.lines) ? g.lines : [];
+      addReferenceCount(guid, lines.length);
+
+      let newestLineActivity = 0;
+      for (const line of lines) {
+        const ts = this.getLineActivityTimestamp(line);
+        if (ts > newestLineActivity) newestLineActivity = ts;
+      }
+
+      if (newestLineActivity <= 0) {
+        newestLineActivity = this.getRecordUpdatedTimestamp(record);
+      }
+      setReferenceActivity(guid, newestLineActivity);
+    }
+
+    return { referenceCountByGuid, referenceActivityByGuid };
+  }
+
+  compareRecordsForSort(a, b, sortSpec, sortMetrics) {
+    const sortBy = this.normalizeSortBy(sortSpec?.sortBy) || this._defaultSortBy;
+    const sortDir = this.normalizeSortDir(sortSpec?.sortDir) || this._defaultSortDir;
+
+    const aGuid = a?.guid || '';
+    const bGuid = b?.guid || '';
+
+    let primary = 0;
+
+    if (sortBy === 'page_title') {
+      primary = this.compareText(this.getRecordNameForSort(a), this.getRecordNameForSort(b));
+    } else if (sortBy === 'page_created_date') {
+      primary = this.compareNumbers(this.getRecordCreatedTimestamp(a), this.getRecordCreatedTimestamp(b));
+    } else if (sortBy === 'reference_count') {
+      const ac = sortMetrics?.referenceCountByGuid?.get?.(aGuid) || 0;
+      const bc = sortMetrics?.referenceCountByGuid?.get?.(bGuid) || 0;
+      primary = this.compareNumbers(ac, bc);
+    } else if (sortBy === 'reference_activity') {
+      const at = this.getReferenceActivityTimestamp(a, sortMetrics);
+      const bt = this.getReferenceActivityTimestamp(b, sortMetrics);
+      primary = this.compareNumbers(at, bt);
+    } else {
+      primary = this.compareNumbers(this.getRecordUpdatedTimestamp(a), this.getRecordUpdatedTimestamp(b));
+    }
+
+    if (sortDir === 'desc') primary *= -1;
+    if (primary !== 0) return primary;
+
+    const nameTieBreak = this.compareText(this.getRecordNameForSort(a), this.getRecordNameForSort(b));
+    if (nameTieBreak !== 0) return nameTieBreak;
+
+    return this.compareText(aGuid, bGuid);
+  }
+
+  getRecordNameForSort(record) {
+    return (record?.getName?.() || '').trim().toLowerCase();
+  }
+
+  getRecordUpdatedTimestamp(record) {
+    const d = record?.getUpdatedAt?.() || null;
+    return d instanceof Date ? d.getTime() : 0;
+  }
+
+  getRecordCreatedTimestamp(record) {
+    const d = record?.getCreatedAt?.() || null;
+    return d instanceof Date ? d.getTime() : 0;
+  }
+
+  getLineActivityTimestamp(line) {
+    const updatedAt = line?.getUpdatedAt?.() || null;
+    if (updatedAt instanceof Date) return updatedAt.getTime();
+    const createdAt = line?.getCreatedAt?.() || null;
+    return createdAt instanceof Date ? createdAt.getTime() : 0;
+  }
+
+  getReferenceActivityTimestamp(record, sortMetrics) {
+    const guid = record?.guid || '';
+    if (!guid) return 0;
+    const fromLinked = sortMetrics?.referenceActivityByGuid?.get?.(guid) || 0;
+    if (fromLinked > 0) return fromLinked;
+    return this.getRecordUpdatedTimestamp(record);
+  }
+
+  compareNumbers(a, b) {
+    const av = Number(a) || 0;
+    const bv = Number(b) || 0;
+    if (av < bv) return -1;
+    if (av > bv) return 1;
+    return 0;
+  }
+
+  compareText(a, b) {
+    const av = typeof a === 'string' ? a : '';
+    const bv = typeof b === 'string' ? b : '';
+    if (av < bv) return -1;
+    if (av > bv) return 1;
+    return 0;
+  }
+
   renderError(state, message) {
     if (!state?.bodyEl || !state?.countEl) return;
     state.countEl.textContent = '';
@@ -1041,6 +1553,14 @@ class Plugin extends AppPlugin {
       const guid = g?.record?.guid || null;
       if (guid) filteredUniquePages.add(guid);
     }
+
+    const sortSpec = {
+      sortBy: this.normalizeSortBy(state?.sortBy) || this._defaultSortBy,
+      sortDir: this.normalizeSortDir(state?.sortDir) || this._defaultSortDir
+    };
+    const sortMetrics = this.computeRecordSortMetrics(props, linked);
+    props = this.sortPropertyGroupsForRender(props, sortSpec, sortMetrics);
+    linked = this.sortLinkedGroupsForRender(linked, sortSpec, sortMetrics);
 
     const parts = [];
     if (queryLower) {
@@ -1548,6 +2068,109 @@ class Plugin extends AppPlugin {
         justify-content: center;
       }
 
+      .tlr-sort-wrap {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+      }
+
+      .tlr-sort-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .tlr-sort-menu {
+        display: none;
+        position: absolute;
+        top: calc(100% + 6px);
+        right: 0;
+        min-width: 260px;
+        padding: 8px;
+        border-radius: 12px;
+        border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+        background: var(--bg-panel, #fff);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+        z-index: 20;
+      }
+
+      .tlr-sort-open .tlr-sort-menu {
+        display: block;
+      }
+
+      .tlr-sort-menu-title {
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin: 2px 4px 6px;
+      }
+
+      .tlr-sort-option {
+        width: 100%;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--text, inherit);
+        padding: 6px 8px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .tlr-sort-option:hover {
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+      }
+
+      .tlr-sort-option.is-active {
+        border-color: var(--border-subtle, rgba(0, 0, 0, 0.12));
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+      }
+
+      .tlr-sort-option-check {
+        width: 14px;
+        color: var(--text, inherit);
+        opacity: 0.95;
+        flex: 0 0 auto;
+      }
+
+      .tlr-sort-option-label {
+        flex: 1 1 auto;
+      }
+
+      .tlr-sort-menu-divider {
+        margin: 8px 0;
+        border-top: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+      }
+
+      .tlr-sort-dir-row {
+        display: flex;
+        gap: 8px;
+      }
+
+      .tlr-sort-dir-btn {
+        flex: 1 1 auto;
+        border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.12));
+        border-radius: 8px;
+        background: transparent;
+        color: var(--text, inherit);
+        padding: 6px 8px;
+        cursor: pointer;
+        text-align: center;
+      }
+
+      .tlr-sort-dir-btn:hover {
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+      }
+
+      .tlr-sort-dir-btn.is-active {
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+        border-color: var(--text-muted, rgba(0, 0, 0, 0.6));
+      }
+
       .tlr-search-wrap {
         display: none;
         align-items: center;
@@ -1786,6 +2409,26 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-loading .tlr-search-toggle { opacity: 0.6; cursor: default; }
+      .tlr-loading .tlr-sort-toggle { opacity: 0.6; cursor: default; }
+
+      @media (max-width: 760px) {
+        .tlr-header {
+          flex-wrap: wrap;
+          row-gap: 8px;
+        }
+
+        .tlr-sort-menu {
+          right: auto;
+          left: 0;
+          min-width: 240px;
+          max-width: min(92vw, 320px);
+        }
+
+        .tlr-search-input {
+          width: 160px;
+          max-width: 60vw;
+        }
+      }
     `);
   }
 }
