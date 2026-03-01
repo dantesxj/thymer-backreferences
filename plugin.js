@@ -783,7 +783,6 @@ class Plugin extends AppPlugin {
       try {
         document.removeEventListener('pointerdown', state.sortMenuDismissHandler, true);
         document.removeEventListener('mousedown', state.sortMenuDismissHandler, true);
-        document.removeEventListener('focusin', state.sortMenuDismissHandler, true);
       } catch (e) {
         // ignore
       }
@@ -812,7 +811,6 @@ class Plugin extends AppPlugin {
     try {
       document.addEventListener('pointerdown', onOutsideMouseDown, true);
       document.addEventListener('mousedown', onOutsideMouseDown, true);
-      document.addEventListener('focusin', onOutsideMouseDown, true);
     } catch (e) {
       // ignore
     }
