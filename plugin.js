@@ -602,10 +602,16 @@ class Plugin extends AppPlugin {
       action === 'toggle-context-down' ||
       action === 'toggle-context-above' ||
       action === 'toggle-context-below' ||
+      action === 'toggle-context-ancestor' ||
       action === 'toggle-context-reset'
     ) {
       if (!state) return;
-      this.handleLinkedContextAction(state, action, actionEl.dataset.lineGuid || null).catch(() => {
+      this.handleLinkedContextAction(
+        state,
+        action,
+        actionEl.dataset.lineGuid || null,
+        actionEl.dataset.ancestorGuid || null
+      ).catch(() => {
         // ignore
       });
       return;
@@ -1236,6 +1242,7 @@ class Plugin extends AppPlugin {
       ctx.depthByGuid = {};
       ctx.aboveItems = [];
       ctx.belowItems = [];
+      ctx.expandedAncestorGuid = null;
     }
   }
 
@@ -1644,7 +1651,8 @@ class Plugin extends AppPlugin {
       descendants: [],
       depthByGuid: {},
       aboveItems: [],
-      belowItems: []
+      belowItems: [],
+      expandedAncestorGuid: null
     };
     state.linkedContextByLine.set(guid, ctx);
     return ctx;
@@ -1733,7 +1741,17 @@ class Plugin extends AppPlugin {
     ctx.showDescendants = false;
     ctx.siblingAboveCount = 0;
     ctx.siblingBelowCount = 0;
+    ctx.expandedAncestorGuid = null;
     ctx.error = '';
+  }
+
+  getExpandedAncestorLine(ctx) {
+    const target = (ctx?.expandedAncestorGuid || '').trim();
+    if (!target) return null;
+    for (const line of ctx?.ancestors || []) {
+      if ((line?.guid || '') === target) return line;
+    }
+    return null;
   }
 
   findLinkedLineByGuid(state, lineGuid) {
@@ -1831,6 +1849,9 @@ class Plugin extends AppPlugin {
       ctx.depthByGuid = descendantContext.depthByGuid;
       ctx.aboveItems = aboveItems;
       ctx.belowItems = belowItems;
+      if (ctx.expandedAncestorGuid && !ancestors.some((item) => (item?.guid || '') === ctx.expandedAncestorGuid)) {
+        ctx.expandedAncestorGuid = null;
+      }
       ctx.loaded = true;
 
       const availableAbove = this.getAvailableAboveContextCount(ctx);
@@ -1853,7 +1874,7 @@ class Plugin extends AppPlugin {
     return ctx.loadPromise;
   }
 
-  async handleLinkedContextAction(state, action, lineGuid) {
+  async handleLinkedContextAction(state, action, lineGuid, ancestorGuid) {
     const line = this.findLinkedLineByGuid(state, lineGuid);
     if (!line) return;
 
@@ -1868,12 +1889,18 @@ class Plugin extends AppPlugin {
 
     if (action === 'toggle-context-up') {
       ctx.showAncestors = !(ctx.showAncestors === true);
+      if (ctx.showAncestors !== true) ctx.expandedAncestorGuid = null;
     } else if (action === 'toggle-context-down') {
       ctx.showDescendants = !(ctx.showDescendants === true);
     } else if (action === 'toggle-context-above') {
       ctx.siblingAboveCount = this.adjustContextWindowCount(ctx.siblingAboveCount, this.getAvailableAboveContextCount(ctx));
     } else if (action === 'toggle-context-below') {
       ctx.siblingBelowCount = this.adjustContextWindowCount(ctx.siblingBelowCount, this.getAvailableBelowContextCount(ctx));
+    } else if (action === 'toggle-context-ancestor') {
+      const target = (ancestorGuid || '').trim();
+      if (!target) return;
+      ctx.showAncestors = true;
+      ctx.expandedAncestorGuid = ctx.expandedAncestorGuid === target ? null : target;
     } else {
       return;
     }
@@ -2647,6 +2674,46 @@ class Plugin extends AppPlugin {
     return btn;
   }
 
+  buildAncestorBreadcrumbs(ctx) {
+    if (!ctx || ctx.showAncestors !== true || ctx.loaded !== true) return null;
+
+    const ancestors = Array.isArray(ctx.ancestors) ? ctx.ancestors : [];
+    if (ancestors.length === 0) return null;
+
+    const trail = document.createElement('div');
+    trail.className = 'tlr-ancestor-crumbs';
+
+    for (let i = 0; i < ancestors.length; i += 1) {
+      const line = ancestors[i] || null;
+      const guid = line?.guid || null;
+      if (!guid) continue;
+
+      if (trail.childElementCount > 0) {
+        const sep = document.createElement('span');
+        sep.className = 'tlr-ancestor-sep text-details';
+        sep.textContent = '>';
+        trail.appendChild(sep);
+      }
+
+      const crumb = document.createElement('button');
+      crumb.type = 'button';
+      crumb.className = 'tlr-ancestor-crumb button-none button-minimal-hover';
+      crumb.dataset.action = 'toggle-context-ancestor';
+      crumb.dataset.lineGuid = ctx.lineGuid || '';
+      crumb.dataset.ancestorGuid = guid;
+      crumb.title = this.getCompactContextLabel(line, 160);
+      if ((ctx.expandedAncestorGuid || '') === guid) crumb.classList.add('is-active');
+
+      const label = document.createElement('span');
+      label.className = 'tlr-ancestor-crumb-label';
+      label.textContent = this.getCompactContextLabel(line, 40);
+      crumb.appendChild(label);
+      trail.appendChild(crumb);
+    }
+
+    return trail.childElementCount > 0 ? trail : null;
+  }
+
   appendLineText(container, line, query) {
     if (!container) return;
 
@@ -2671,11 +2738,16 @@ class Plugin extends AppPlugin {
     if (position === 'top') {
       if (ctx.showAncestors === true) {
         const ancestors = Array.isArray(ctx.ancestors) ? ctx.ancestors : [];
-        for (let i = 0; i < ancestors.length; i += 1) {
+        const trail = this.buildAncestorBreadcrumbs(ctx);
+        if (trail) container.appendChild(trail);
+
+        const expandedAncestor = this.getExpandedAncestorLine(ctx);
+        if (expandedAncestor) {
+          const idx = ancestors.findIndex((item) => (item?.guid || '') === (expandedAncestor?.guid || ''));
           items.push({
-            line: ancestors[i],
-            label: i === ancestors.length - 1 ? 'Parent' : 'Ancestor',
-            indent: i
+            line: expandedAncestor,
+            label: idx === ancestors.length - 1 ? 'Parent' : 'Ancestor',
+            indent: 0
           });
         }
       }
@@ -2742,6 +2814,20 @@ class Plugin extends AppPlugin {
     if (t === 'heading') return '# ';
     if (t === 'quote') return '> ';
     return '';
+  }
+
+  getCompactContextLabel(line, maxLength) {
+    const base = this.segmentsToPlainText(line?.segments || []).replace(/\s+/g, ' ').trim();
+    const prefix = line?.type === 'task' ? this.getLinePrefix(line) : '';
+    const label = `${prefix}${base || 'Untitled'}`.trim();
+    return this.truncateText(label, maxLength || 48);
+  }
+
+  truncateText(text, maxLength) {
+    const s = typeof text === 'string' ? text.trim() : '';
+    const limit = Math.max(4, maxLength || 0);
+    if (!s || s.length <= limit) return s;
+    return `${s.slice(0, Math.max(0, limit - 3)).trimEnd()}...`;
   }
 
   segmentsToPlainText(segments) {
@@ -3393,6 +3479,41 @@ class Plugin extends AppPlugin {
         flex-wrap: wrap;
         gap: 6px;
         padding: 0 10px 2px;
+      }
+
+      .tlr-ancestor-crumbs {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        padding: 0 10px 2px;
+      }
+
+      .tlr-ancestor-sep {
+        color: var(--text-muted, rgba(0, 0, 0, 0.55));
+      }
+
+      .tlr-ancestor-crumb {
+        display: inline-flex;
+        align-items: center;
+        max-width: min(100%, 220px);
+        padding: 2px 8px;
+        border: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        border-radius: 999px;
+        color: var(--text-muted, rgba(0, 0, 0, 0.72));
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+      }
+
+      .tlr-ancestor-crumb.is-active {
+        color: var(--text-default, var(--text, inherit));
+        background: var(--bg-selected, var(--bg-hover, rgba(0, 0, 0, 0.06)));
+      }
+
+      .tlr-ancestor-crumb-label {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .tlr-context-btn.is-active {
