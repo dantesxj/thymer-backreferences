@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.0';
+    this._version = '0.4.1';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -1498,22 +1498,23 @@ class Plugin extends AppPlugin {
     const showSelf = cfg.custom?.showSelf === true;
 
     const query = `@linkto = "${recordGuid}"`;
-    const [searchSettled, propSettled] = await Promise.allSettled([
-      this.data.searchByQuery(query, maxResults),
-      this.getPropertyBacklinkGroups(record, recordGuid, { showSelf })
-    ]);
+    const searchSettled = await Promise.allSettled([
+      this.data.searchByQuery(query, maxResults)
+    ]).then((x) => x[0]);
 
     // Ignore stale refreshes.
     if (!this._panelStates.has(panelId) || state.refreshSeq !== seq) return;
 
     let linkedError = '';
     let linkedGroups = [];
+    let propertyCandidateRecords = null;
     if (searchSettled.status === 'fulfilled') {
       const result = searchSettled.value;
       if (result?.error) {
         linkedError = result.error;
       } else {
         const lines = Array.isArray(result?.lines) ? result.lines : [];
+        propertyCandidateRecords = Array.isArray(result?.records) ? result.records : null;
         linkedGroups = this.groupBacklinkLines(lines, recordGuid, { showSelf });
       }
     } else {
@@ -1522,9 +1523,12 @@ class Plugin extends AppPlugin {
 
     let propertyError = '';
     let propertyGroups = [];
-    if (propSettled.status === 'fulfilled') {
-      propertyGroups = Array.isArray(propSettled.value) ? propSettled.value : [];
-    } else {
+    try {
+      propertyGroups = await this.getPropertyBacklinkGroups(record, recordGuid, {
+        showSelf,
+        candidateRecords: propertyCandidateRecords
+      });
+    } catch (e) {
       propertyError = 'Error loading property references.';
     }
 
@@ -1875,17 +1879,23 @@ class Plugin extends AppPlugin {
 
   // ---------- Grouping + rendering ----------
 
-  async getPropertyBacklinkGroups(_targetRecord, targetGuid, { showSelf }) {
+  async getPropertyBacklinkGroups(_targetRecord, targetGuid, { showSelf, candidateRecords }) {
     if (!targetGuid) return [];
 
-    // NOTE: Thymer's built-in backlinks/backrefs do not include record-link properties,
-    // so we scan all records' properties to find record-link fields pointing at targetGuid.
-    const allRecords = this.data.getAllRecords?.() || [];
+    // searchByQuery("@linkto = ...") already returns page-level matches for property-only
+    // record links in result.records, so we can inspect only those candidates when available.
+    // Fall back to a full scan only if the search result is unavailable.
+    const sourceRecords = Array.isArray(candidateRecords)
+      ? candidateRecords
+      : (this.data.getAllRecords?.() || []);
     const byProp = new Map();
+    const seenSourceGuids = new Set();
 
-    for (const src of allRecords || []) {
+    for (const src of sourceRecords || []) {
       const srcGuid = src?.guid || null;
       if (!srcGuid) continue;
+      if (seenSourceGuids.has(srcGuid)) continue;
+      seenSourceGuids.add(srcGuid);
       if (!showSelf && srcGuid === targetGuid) continue;
 
       const props = src.getAllProperties?.() || [];
