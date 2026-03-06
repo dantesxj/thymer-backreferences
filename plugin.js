@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.3.3';
+    this._version = '0.4.0';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -38,6 +38,17 @@ class Plugin extends AppPlugin {
       }
     });
 
+    this._statusItem = this.ui.addStatusBarItem({
+      icon: 'ti-link',
+      label: '0',
+      tooltip: 'Backreferences',
+      onClick: () => {
+        const panel = this.ui.getActivePanel();
+        if (panel) this.scheduleRefreshForPanel(panel, { force: true, reason: 'status-item' });
+      }
+    });
+    this._statusItem?.hide?.();
+
     this._eventHandlerIds.push(
       this.events.on('panel.navigated', (ev) => this.handlePanelChanged(ev.panel, 'panel.navigated'))
     );
@@ -52,9 +63,14 @@ class Plugin extends AppPlugin {
     );
 
     // Keep backreferences reasonably fresh when references are created/edited elsewhere.
+    this._eventHandlerIds.push(this.events.on('lineitem.created', (ev) => this.handleLineItemCreated(ev)));
     this._eventHandlerIds.push(this.events.on('lineitem.updated', (ev) => this.handleLineItemUpdated(ev)));
-    this._eventHandlerIds.push(this.events.on('lineitem.deleted', () => this.handleLineItemDeleted()));
+    this._eventHandlerIds.push(this.events.on('lineitem.moved', (ev) => this.handleLineItemMoved(ev)));
+    this._eventHandlerIds.push(this.events.on('lineitem.undeleted', (ev) => this.handleLineItemUndeleted(ev)));
+    this._eventHandlerIds.push(this.events.on('lineitem.deleted', (ev) => this.handleLineItemDeleted(ev)));
+    this._eventHandlerIds.push(this.events.on('record.created', (ev) => this.handleRecordCreated(ev)));
     this._eventHandlerIds.push(this.events.on('record.updated', (ev) => this.handleRecordUpdated(ev)));
+    this._eventHandlerIds.push(this.events.on('record.moved', (ev) => this.handleRecordMoved(ev)));
 
     const panel = this.ui.getActivePanel();
     if (panel) this.handlePanelChanged(panel, 'initial');
@@ -80,6 +96,7 @@ class Plugin extends AppPlugin {
     this._eventHandlerIds = [];
 
     this._cmdRefresh?.remove?.();
+    this._statusItem?.remove?.();
 
     for (const panelId of Array.from(this._panelStates?.keys?.() || [])) {
       this.disposePanelState(panelId);
@@ -96,12 +113,14 @@ class Plugin extends AppPlugin {
     const panelEl = panel?.getElement?.() || null;
     if (this.shouldSuppressInPanel(panel, panelEl)) {
       this.disposePanelState(panelId);
+      this.syncStatusItem();
       return;
     }
 
     const mountContainer = this.findMountContainer(panelEl);
     if (!mountContainer) {
       this.disposePanelState(panelId);
+      this.syncStatusItem();
       return;
     }
 
@@ -111,6 +130,7 @@ class Plugin extends AppPlugin {
     if (!recordGuid) {
       // If the panel no longer shows a record, remove our footer.
       this.disposePanelState(panelId);
+      this.syncStatusItem();
       return;
     }
 
@@ -121,6 +141,12 @@ class Plugin extends AppPlugin {
     if (recordChanged || !this.isValidSortBy(state.sortBy) || !this.isValidSortDir(state.sortDir)) {
       state.emptyStateExpanded = false;
       state.linkedContextByLine = new Map();
+      state.liveBaselineSnapshot = null;
+      state.liveCurrentSnapshot = null;
+      state.liveNewKeys = new Set();
+      state.liveRemoteBadgesByKey = new Map();
+      state.pendingRemoteSync = false;
+      state.pendingRemoteUsers = new Set();
       const pref = this.getSortPreferenceForRecord(recordGuid);
       state.sortBy = pref.sortBy;
       state.sortDir = pref.sortDir;
@@ -134,6 +160,7 @@ class Plugin extends AppPlugin {
       force: recordChanged,
       reason: reason || (recordChanged ? 'record-changed' : 'record-same')
     });
+    this.syncStatusItem();
   }
 
   shouldSuppressInPanel(panel, panelEl) {
@@ -152,6 +179,7 @@ class Plugin extends AppPlugin {
     const panelId = panel?.getId?.() || null;
     if (!panelId) return;
     this.disposePanelState(panelId);
+    this.syncStatusItem();
   }
 
   getOrCreatePanelState(panel) {
@@ -173,6 +201,12 @@ class Plugin extends AppPlugin {
         searchOpen: false,
         emptyStateExpanded: false,
         linkedContextByLine: new Map(),
+        liveBaselineSnapshot: null,
+        liveCurrentSnapshot: null,
+        liveNewKeys: new Set(),
+        liveRemoteBadgesByKey: new Map(),
+        pendingRemoteSync: false,
+        pendingRemoteUsers: new Set(),
         sortBy: this._defaultSortBy,
         sortDir: this._defaultSortDir,
         sortMenuOpen: false,
@@ -208,6 +242,12 @@ class Plugin extends AppPlugin {
       searchOpen: false,
       emptyStateExpanded: false,
       linkedContextByLine: new Map(),
+      liveBaselineSnapshot: null,
+      liveCurrentSnapshot: null,
+      liveNewKeys: new Set(),
+      liveRemoteBadgesByKey: new Map(),
+      pendingRemoteSync: false,
+      pendingRemoteUsers: new Set(),
       sortBy: this._defaultSortBy,
       sortDir: this._defaultSortDir,
       sortMenuOpen: false,
@@ -1199,6 +1239,206 @@ class Plugin extends AppPlugin {
     }
   }
 
+  getPropertySnapshotKey(propertyName, recordGuid) {
+    return `prop:${(propertyName || '').trim()}::${(recordGuid || '').trim()}`;
+  }
+
+  getLinkedSnapshotKey(lineGuid) {
+    return `line:${(lineGuid || '').trim()}`;
+  }
+
+  buildResultsSnapshot(propertyGroups, linkedGroups) {
+    const itemsByKey = new Map();
+    const sourceRecordGuids = new Set();
+    let propertyCount = 0;
+    let linkedCount = 0;
+
+    for (const g of propertyGroups || []) {
+      const propertyName = (g?.propertyName || '').trim();
+      if (!propertyName) continue;
+      for (const record of g?.records || []) {
+        const recordGuid = record?.guid || null;
+        if (!recordGuid) continue;
+        const key = this.getPropertySnapshotKey(propertyName, recordGuid);
+        itemsByKey.set(key, {
+          kind: 'property',
+          key,
+          signature: key,
+          recordGuid,
+          propertyName
+        });
+        sourceRecordGuids.add(recordGuid);
+        propertyCount += 1;
+      }
+    }
+
+    for (const g of linkedGroups || []) {
+      const recordGuid = g?.record?.guid || null;
+      if (!recordGuid) continue;
+      sourceRecordGuids.add(recordGuid);
+      for (const line of g?.lines || []) {
+        const lineGuid = line?.guid || null;
+        if (!lineGuid) continue;
+        const key = this.getLinkedSnapshotKey(lineGuid);
+        itemsByKey.set(key, {
+          kind: 'line',
+          key,
+          signature: `${recordGuid}|${lineGuid}|${this.segmentsToPlainText(line?.segments || [])}|${this.getLineActivityTimestamp(line)}`,
+          recordGuid,
+          lineGuid
+        });
+        linkedCount += 1;
+      }
+    }
+
+    return {
+      itemsByKey,
+      sourceRecordGuids,
+      propertyCount,
+      linkedCount,
+      totalCount: propertyCount + linkedCount,
+      pageCount: sourceRecordGuids.size
+    };
+  }
+
+  diffCurrentSnapshotKeys(prevSnapshot, nextSnapshot) {
+    const changed = new Set();
+    const prevItems = prevSnapshot?.itemsByKey instanceof Map ? prevSnapshot.itemsByKey : new Map();
+    const nextItems = nextSnapshot?.itemsByKey instanceof Map ? nextSnapshot.itemsByKey : new Map();
+
+    for (const [key, nextItem] of nextItems.entries()) {
+      const prevItem = prevItems.get(key) || null;
+      if (!prevItem || prevItem.signature !== nextItem.signature) changed.add(key);
+    }
+
+    return changed;
+  }
+
+  markStatePendingRemote(state, ev) {
+    if (!state || ev?.source?.isLocal !== false) return;
+    state.pendingRemoteSync = true;
+    if (!(state.pendingRemoteUsers instanceof Set)) state.pendingRemoteUsers = new Set();
+
+    const user = typeof ev.getSourceUser === 'function' ? ev.getSourceUser() : null;
+    const name = (user?.getDisplayName?.() || '').trim();
+    if (name) state.pendingRemoteUsers.add(name);
+  }
+
+  markAllStatesPendingRemote(ev) {
+    for (const state of this._panelStates.values()) {
+      this.markStatePendingRemote(state, ev);
+    }
+  }
+
+  getRemoteBadgeTooltip(userNames) {
+    const names = Array.from(userNames || []).filter(Boolean);
+    if (names.length === 1) return `Changed remotely by ${names[0]}`;
+    if (names.length > 1) return `Changed remotely by ${names.join(', ')}`;
+    return 'Changed remotely';
+  }
+
+  applyLiveSnapshot(state, snapshot) {
+    if (!state) return;
+
+    const currentSnapshot = snapshot || this.buildResultsSnapshot([], []);
+    const baseline = state.liveBaselineSnapshot;
+    const previous = state.liveCurrentSnapshot;
+
+    if (!baseline || !previous) {
+      state.liveBaselineSnapshot = currentSnapshot;
+      state.liveCurrentSnapshot = currentSnapshot;
+      state.liveNewKeys = new Set();
+      state.liveRemoteBadgesByKey = new Map();
+      state.pendingRemoteSync = false;
+      state.pendingRemoteUsers = new Set();
+      return;
+    }
+
+    const nextNewKeys = new Set();
+    for (const key of currentSnapshot.itemsByKey.keys()) {
+      if (!baseline.itemsByKey.has(key)) nextNewKeys.add(key);
+    }
+
+    const nextRemoteBadges = state.liveRemoteBadgesByKey instanceof Map
+      ? new Map(state.liveRemoteBadgesByKey)
+      : new Map();
+
+    for (const key of Array.from(nextRemoteBadges.keys())) {
+      if (!currentSnapshot.itemsByKey.has(key)) nextRemoteBadges.delete(key);
+    }
+
+    if (state.pendingRemoteSync === true) {
+      const tooltip = this.getRemoteBadgeTooltip(state.pendingRemoteUsers);
+      for (const key of this.diffCurrentSnapshotKeys(previous, currentSnapshot)) {
+        if (!currentSnapshot.itemsByKey.has(key)) continue;
+        nextRemoteBadges.set(key, tooltip);
+      }
+    }
+
+    state.liveCurrentSnapshot = currentSnapshot;
+    state.liveNewKeys = nextNewKeys;
+    state.liveRemoteBadgesByKey = nextRemoteBadges;
+    state.pendingRemoteSync = false;
+    state.pendingRemoteUsers = new Set();
+  }
+
+  getLiveBadgesForKey(state, itemKey) {
+    const badges = [];
+    if (!state || !itemKey) return badges;
+
+    if (state.liveNewKeys instanceof Set && state.liveNewKeys.has(itemKey)) {
+      badges.push({ label: 'New', className: 'is-new', tooltip: 'Added since this page was opened' });
+    }
+
+    if (state.liveRemoteBadgesByKey instanceof Map && state.liveRemoteBadgesByKey.has(itemKey)) {
+      badges.push({ label: 'Changed', className: 'is-remote', tooltip: state.liveRemoteBadgesByKey.get(itemKey) || 'Changed remotely' });
+    }
+
+    return badges;
+  }
+
+  appendLiveBadges(container, state, itemKey) {
+    if (!container) return;
+
+    for (const badge of this.getLiveBadgesForKey(state, itemKey)) {
+      container.appendChild(document.createTextNode(' '));
+      const el = document.createElement('span');
+      el.className = `tlr-live-badge text-details ${badge.className || ''}`.trim();
+      el.textContent = badge.label;
+      if (badge.tooltip) el.title = badge.tooltip;
+      container.appendChild(el);
+    }
+  }
+
+  syncStatusItem() {
+    const item = this._statusItem || null;
+    if (!item) return;
+
+    const activePanel = this.ui.getActivePanel?.() || null;
+    const panelId = activePanel?.getId?.() || null;
+    const state = panelId ? (this._panelStates.get(panelId) || null) : null;
+    if (!state || !state.liveCurrentSnapshot) {
+      item.hide?.();
+      return;
+    }
+
+    const snapshot = state.liveCurrentSnapshot;
+    item.setLabel?.(`${snapshot.totalCount}`);
+    item.setTooltip?.(`Backreferences: ${snapshot.totalCount} total (${snapshot.pageCount} pages, ${snapshot.propertyCount} property, ${snapshot.linkedCount} linked)`);
+    item.show?.();
+  }
+
+  handleWorkspaceInvalidation(ev, reason) {
+    this.markAllStatesPendingRemote(ev);
+    this.refreshAllPanels({ force: false, reason: reason || 'workspace-invalidated' });
+  }
+
+  snapshotIncludesSourceRecord(state, recordGuid) {
+    const guid = (recordGuid || '').trim();
+    if (!guid) return false;
+    return state?.liveCurrentSnapshot?.sourceRecordGuids?.has?.(guid) === true;
+  }
+
   // ---------- Refresh orchestration ----------
 
   scheduleRefreshForPanel(panel, { force, reason }) {
@@ -1295,9 +1535,11 @@ class Plugin extends AppPlugin {
       linkedError,
       maxResults
     };
+    this.applyLiveSnapshot(state, this.buildResultsSnapshot(propertyGroups, linkedGroups));
     this.invalidateLinkedContextCache(state);
     this.renderFromCache(state);
     this.setLoadingState(state, false);
+    this.syncStatusItem();
   }
 
   setLoadingState(state, isLoading) {
@@ -1313,29 +1555,55 @@ class Plugin extends AppPlugin {
     // Refresh footers when key-value properties change so property backlinks stay fresh.
     if (!ev) return;
     if (!ev.properties) return;
-    this.refreshAllPanels({ force: false, reason: 'record.updated' });
+    this.handleWorkspaceInvalidation(ev, 'record.updated');
+  }
+
+  handleRecordCreated(ev) {
+    this.handleWorkspaceInvalidation(ev, 'record.created');
+  }
+
+  handleRecordMoved(ev) {
+    this.handleWorkspaceInvalidation(ev, 'record.moved');
   }
 
   handleLineItemUpdated(ev) {
-    if (!ev?.hasSegments?.() || typeof ev.getSegments !== 'function') return;
+    if (!ev) return;
 
-    const segments = ev.getSegments() || [];
+    const segments = ev?.hasSegments?.() && typeof ev.getSegments === 'function'
+      ? (ev.getSegments() || [])
+      : [];
     const referenced = this.extractReferencedRecordGuids(segments);
-    if (referenced.size === 0) return;
 
     for (const state of this._panelStates.values()) {
       const panel = state?.panel || null;
       if (!panel) continue;
       if (!state.recordGuid) continue;
-      if (!referenced.has(state.recordGuid)) continue;
+
+      const hitsTargetRecord = referenced.has(state.recordGuid);
+      const hitsKnownSource = this.snapshotIncludesSourceRecord(state, ev.recordGuid || null);
+      if (!hitsTargetRecord && !hitsKnownSource) continue;
+
+      this.markStatePendingRemote(state, ev);
       this.scheduleRefreshForPanel(panel, { force: false, reason: 'lineitem.updated' });
     }
   }
 
-  handleLineItemDeleted() {
+  handleLineItemCreated(ev) {
+    this.handleWorkspaceInvalidation(ev, 'lineitem.created');
+  }
+
+  handleLineItemMoved(ev) {
+    this.handleWorkspaceInvalidation(ev, 'lineitem.moved');
+  }
+
+  handleLineItemUndeleted(ev) {
+    this.handleWorkspaceInvalidation(ev, 'lineitem.undeleted');
+  }
+
+  handleLineItemDeleted(ev) {
     // We don't know which record(s) were referenced by the deleted item.
     // This is rare, so we just refresh all visible footers (debounced).
-    this.refreshAllPanels({ force: false, reason: 'lineitem.deleted' });
+    this.handleWorkspaceInvalidation(ev, 'lineitem.deleted');
   }
 
   countLinkedReferences(groups) {
@@ -2071,7 +2339,7 @@ class Plugin extends AppPlugin {
     } else if (props.length === 0) {
       this.appendEmpty(body, queryLower ? 'No matching property references.' : 'No property references.');
     } else {
-      this.appendPropertyReferenceGroups(body, props, { query });
+      this.appendPropertyReferenceGroups(body, props, { query, state });
     }
 
     const divider = document.createElement('div');
@@ -2146,6 +2414,7 @@ class Plugin extends AppPlugin {
     if (!container) return;
 
     const query = (opts?.query || '').trim();
+    const state = opts?.state || null;
 
     for (const g of groups || []) {
       const propName = (g?.propertyName || '').trim();
@@ -2196,6 +2465,7 @@ class Plugin extends AppPlugin {
         const name = r.getName?.() || 'Untitled';
         btn.textContent = '';
         this.appendHighlightedText(btn, name, query);
+        this.appendLiveBadges(btn, state, this.getPropertySnapshotKey(propName, guid));
         recsEl.appendChild(btn);
       }
 
@@ -2273,6 +2543,7 @@ class Plugin extends AppPlugin {
         lineEl.dataset.recordGuid = recordGuid;
         lineEl.dataset.lineGuid = line.guid;
         this.appendLineText(lineEl, line, query);
+        this.appendLiveBadges(lineEl, state, this.getLinkedSnapshotKey(line.guid));
         entryEl.appendChild(lineEl);
 
         if (state && ctx) {
@@ -3124,6 +3395,26 @@ class Plugin extends AppPlugin {
 
       .tlr-context-note {
         padding: 0 10px 2px;
+      }
+
+      .tlr-live-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 1px 6px;
+        border-radius: 999px;
+        border: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+        color: var(--text-muted, rgba(0, 0, 0, 0.68));
+        font-size: 11px;
+        vertical-align: middle;
+      }
+
+      .tlr-live-badge.is-new {
+        color: var(--text-default, var(--text, inherit));
+      }
+
+      .tlr-live-badge.is-remote {
+        border-style: dashed;
       }
 
       .tlr-seg-bold { font-weight: 600; }
