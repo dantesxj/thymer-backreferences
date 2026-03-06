@@ -119,6 +119,7 @@ class Plugin extends AppPlugin {
     state.recordGuid = recordGuid;
 
     if (recordChanged || !this.isValidSortBy(state.sortBy) || !this.isValidSortDir(state.sortDir)) {
+      state.emptyStateExpanded = false;
       const pref = this.getSortPreferenceForRecord(recordGuid);
       state.sortBy = pref.sortBy;
       state.sortDir = pref.sortDir;
@@ -169,6 +170,7 @@ class Plugin extends AppPlugin {
         searchInputEl: null,
         searchQuery: '',
         searchOpen: false,
+        emptyStateExpanded: false,
         sortBy: this._defaultSortBy,
         sortDir: this._defaultSortDir,
         sortMenuOpen: false,
@@ -202,6 +204,7 @@ class Plugin extends AppPlugin {
       searchInputEl: null,
       searchQuery: '',
       searchOpen: false,
+      emptyStateExpanded: false,
       sortBy: this._defaultSortBy,
       sortDir: this._defaultSortDir,
       sortMenuOpen: false,
@@ -541,6 +544,13 @@ class Plugin extends AppPlugin {
       } else {
         this.setSearchOpen(state, false);
       }
+      return;
+    }
+
+    if (action === 'expand-empty') {
+      if (!state) return;
+      state.emptyStateExpanded = true;
+      this.renderFromCache(state);
       return;
     }
 
@@ -1680,6 +1690,20 @@ class Plugin extends AppPlugin {
 
     const totalPropRefCount = propsAll.reduce((n, g) => n + (g?.records?.length || 0), 0);
     const totalLinkedRefCount = this.countLinkedReferences(linkedAll);
+    const hasAnyErrors = Boolean(propertyError || linkedError);
+    const isEmptyWithoutFilter = !hasAnyErrors && totalPropRefCount === 0 && totalLinkedRefCount === 0;
+    const useCompactEmpty = isEmptyWithoutFilter && !queryLower && state.emptyStateExpanded !== true;
+
+    if (useCompactEmpty) {
+      state.rootEl?.classList?.add('tlr-empty-compact');
+      this.setSearchOpen(state, false);
+      this.setSortMenuOpen(state, false);
+      state.countEl.textContent = 'No references yet';
+      this.appendCompactEmptyState(body);
+      return;
+    }
+
+    state.rootEl?.classList?.remove('tlr-empty-compact');
 
     const totalUniquePages = new Set();
     for (const g of propsAll) {
@@ -1809,6 +1833,31 @@ class Plugin extends AppPlugin {
     el.className = 'tlr-empty';
     el.textContent = message || '';
     container.appendChild(el);
+  }
+
+  appendCompactEmptyState(container) {
+    if (!container) return;
+
+    const field = document.createElement('div');
+    field.className = 'tlr-empty-compact-card form-field';
+
+    const row = document.createElement('div');
+    row.className = 'tlr-empty-compact-row form-field-row';
+
+    const summary = document.createElement('div');
+    summary.className = 'tlr-empty-compact-copy text-details';
+    summary.textContent = 'No references yet.';
+
+    const expandBtn = document.createElement('button');
+    expandBtn.type = 'button';
+    expandBtn.className = 'tlr-empty-compact-btn button-none button-small button-minimal-hover';
+    expandBtn.dataset.action = 'expand-empty';
+    expandBtn.textContent = 'Show sections';
+
+    row.appendChild(summary);
+    row.appendChild(expandBtn);
+    field.appendChild(row);
+    container.appendChild(field);
   }
 
   appendPropertyReferenceGroups(container, groups, opts) {
@@ -2399,6 +2448,16 @@ class Plugin extends AppPlugin {
       .tlr-search-open .tlr-search-wrap { display: flex; }
       .tlr-search-open .tlr-search-toggle { display: none; }
 
+      .tlr-empty-compact .tlr-search-toggle,
+      .tlr-empty-compact .tlr-search-wrap,
+      .tlr-empty-compact .tlr-sort-wrap {
+        display: none !important;
+      }
+
+      .tlr-empty-compact .tlr-header {
+        margin-bottom: 6px;
+      }
+
       .tlr-search-icon {
         display: flex;
         align-items: center;
@@ -2449,6 +2508,25 @@ class Plugin extends AppPlugin {
         color: var(--text-muted, rgba(0, 0, 0, 0.6));
         padding: 8px 0;
         font-size: 12px;
+      }
+
+      .tlr-empty-compact-card {
+        padding: 6px 0 2px;
+      }
+
+      .tlr-empty-compact-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .tlr-empty-compact-copy {
+        min-width: 0;
+      }
+
+      .tlr-empty-compact-btn {
+        flex: 0 0 auto;
       }
 
       .tlr-section-title {
