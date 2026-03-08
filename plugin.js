@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.14';
+    this._version = '0.4.15';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -29,7 +29,6 @@ class Plugin extends AppPlugin {
     this._defaultMaxResults = 200;
     this._refreshDebounceMs = 350;
     this._queryFilterDebounceMs = 180;
-    this._queryFilterChunkSize = 24;
     this._queryFilterMaxResults = 1000;
     this._legacyIgnoreMetaKey = 'plugin.refs.v1.ignore';
     this._storageKeyIgnoreCleanupDone = 'thymer_backreferences_ignore_cleanup_v1';
@@ -918,49 +917,6 @@ class Plugin extends AppPlugin {
     return out;
   }
 
-  buildScopedQueryChunks(query, recordGuids) {
-    const trimmedQuery = (query || '').trim();
-    if (!trimmedQuery) return [];
-
-    const guids = Array.isArray(recordGuids) ? recordGuids.filter(Boolean) : [];
-    if (guids.length === 0) return [];
-
-    const chunkSize = Math.max(1, this._queryFilterChunkSize || 40);
-    const queries = [];
-    for (let i = 0; i < guids.length; i += chunkSize) {
-      const chunk = guids.slice(i, i + chunkSize);
-      const scope = chunk
-        .map((guid) => `(@rguid = "${guid}" OR @guid = "${guid}")`)
-        .join(' OR ');
-      queries.push(`(${trimmedQuery}) AND (${scope})`);
-    }
-    return queries;
-  }
-
-  mergeScopedQuerySearchResults(resultList) {
-    const records = [];
-    const lines = [];
-    const seenRecordGuids = new Set();
-    const seenLineGuids = new Set();
-
-    for (const result of resultList || []) {
-      for (const record of result?.records || []) {
-        const guid = (record?.guid || '').trim();
-        if (!guid || seenRecordGuids.has(guid)) continue;
-        seenRecordGuids.add(guid);
-        records.push(record);
-      }
-      for (const line of result?.lines || []) {
-        const guid = (line?.guid || '').trim();
-        if (!guid || seenLineGuids.has(guid)) continue;
-        seenLineGuids.add(guid);
-        lines.push(line);
-      }
-    }
-
-    return { records, lines };
-  }
-
   scheduleQueryFilterRefresh(state, { immediate, reason } = {}) {
     if (!state) return;
 
@@ -1014,8 +970,9 @@ class Plugin extends AppPlugin {
     const includeUnlinked = this.shouldIncludeUnlinkedInQueryScope(state, results);
     const recordGuids = this.collectQueryScopeRecordGuids(results, { includeUnlinked });
     if (recordGuids.length === 0) {
-      if (!this._panelStates.has(panelId) || state.queryFilterSeq !== seq) return;
+      if (!this._panelStates.has(panelId)) return;
       state.queryFilterState = this.createQueryFilterState(query, {
+        loading: false,
         ready: true,
         includesUnlinked: includeUnlinked
       });
@@ -1023,24 +980,33 @@ class Plugin extends AppPlugin {
       return;
     }
 
-    const scopedQueries = this.buildScopedQueryChunks(query, recordGuids);
-    let merged = { records: [], lines: [] };
+    let result = null;
     let error = '';
     try {
-      const settled = await Promise.all(scopedQueries.map((scopedQuery) => this.data.searchByQuery(scopedQuery, this._queryFilterMaxResults)));
-      const firstError = settled.find((result) => typeof result?.error === 'string' && result.error.trim());
-      if (firstError?.error) {
-        error = firstError.error.trim();
-      } else {
-        merged = this.mergeScopedQuerySearchResults(settled);
-      }
+      result = await this.data.searchByQuery(query, this._queryFilterMaxResults);
+      if (typeof result?.error === 'string' && result.error.trim()) error = result.error.trim();
     } catch (e) {
       error = 'Could not apply query filter.';
     }
 
     if (!this._panelStates.has(panelId)) return;
-    if (state.queryFilterSeq !== seq) return;
     if ((state.searchQuery || '').trim() !== query) return;
+
+    const latestResults = state.lastResults || results;
+    const latestIncludesUnlinked = this.shouldIncludeUnlinkedInQueryScope(state, latestResults);
+    const latestScopedRecordGuids = new Set(
+      this.collectQueryScopeRecordGuids(latestResults, { includeUnlinked: latestIncludesUnlinked })
+    );
+
+    if (latestScopedRecordGuids.size === 0) {
+      state.queryFilterState = this.createQueryFilterState(query, {
+        loading: false,
+        ready: true,
+        includesUnlinked: latestIncludesUnlinked
+      });
+      this.renderFromCache(state);
+      return;
+    }
 
     const previous = this.getQueryFilterState(state, query);
     if (error) {
@@ -1048,7 +1014,7 @@ class Plugin extends AppPlugin {
         loading: false,
         ready: previous?.ready === true,
         error,
-        includesUnlinked,
+        includesUnlinked: latestIncludesUnlinked,
         matchedRecordGuids: previous?.matchedRecordGuids,
         matchedLineGuids: previous?.matchedLineGuids,
         matchedLineRecordGuids: previous?.matchedLineRecordGuids
@@ -1061,24 +1027,25 @@ class Plugin extends AppPlugin {
     const matchedLineGuids = new Set();
     const matchedLineRecordGuids = new Set();
 
-    for (const record of merged.records || []) {
+    for (const record of result?.records || []) {
       const guid = (record?.guid || '').trim();
-      if (!guid) continue;
+      if (!guid || !latestScopedRecordGuids.has(guid)) continue;
       matchedRecordGuids.add(guid);
       matchedLineRecordGuids.add(guid);
     }
 
-    for (const line of merged.lines || []) {
+    for (const line of result?.lines || []) {
+      const recordGuid = (line?.getRecord?.()?.guid || '').trim();
+      if (!recordGuid || !latestScopedRecordGuids.has(recordGuid)) continue;
       const guid = (line?.guid || '').trim();
       if (guid) matchedLineGuids.add(guid);
-      const recordGuid = (line?.getRecord?.()?.guid || '').trim();
-      if (recordGuid) matchedLineRecordGuids.add(recordGuid);
+      matchedLineRecordGuids.add(recordGuid);
     }
 
     state.queryFilterState = this.createQueryFilterState(query, {
       loading: false,
       ready: true,
-      includesUnlinked,
+      includesUnlinked: latestIncludesUnlinked,
       matchedRecordGuids,
       matchedLineGuids,
       matchedLineRecordGuids
