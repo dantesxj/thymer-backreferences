@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.2';
+    this._version = '0.4.3';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -1741,11 +1741,14 @@ class Plugin extends AppPlugin {
   collectDescendantContext(line) {
     const descendants = [];
     const depthByGuid = {};
+    const seen = new Set();
 
     const walk = (items, depth) => {
       for (const item of items || []) {
         const guid = item?.guid || null;
         if (!guid) continue;
+        if (seen.has(guid)) continue;
+        seen.add(guid);
         descendants.push(item);
         depthByGuid[guid] = depth;
         walk(Array.isArray(item?.children) ? item.children : [], depth + 1);
@@ -2595,13 +2598,6 @@ class Plugin extends AppPlugin {
     const controls = document.createElement('div');
     controls.className = 'tlr-line-actions text-details';
 
-    controls.appendChild(this.buildLinkedContextButton('toggle-context-more', lineGuid, {
-      icon: 'more',
-      label: ctx?.showMoreContext === true ? 'Hide context' : 'Show more context',
-      disabled: ctx?.showMoreContext !== true && ctx?.loaded === true && !this.hasAnyLinkedContext(ctx),
-      active: ctx?.showMoreContext === true
-    }));
-
     if (ctx?.showMoreContext === true) {
       controls.appendChild(this.buildLinkedContextButton('toggle-context-above', lineGuid, {
         icon: 'up',
@@ -2616,6 +2612,13 @@ class Plugin extends AppPlugin {
         active: (ctx?.siblingBelowCount || 0) > 0
       }));
     }
+
+    controls.appendChild(this.buildLinkedContextButton('toggle-context-more', lineGuid, {
+      icon: 'toggle',
+      label: ctx?.showMoreContext === true ? 'Hide context' : 'Show more context',
+      disabled: ctx?.showMoreContext !== true && ctx?.loaded === true && !this.hasAnyLinkedContext(ctx),
+      active: ctx?.showMoreContext === true
+    }));
 
     return controls;
   }
@@ -2632,10 +2635,43 @@ class Plugin extends AppPlugin {
     if (opts?.active === true) btn.classList.add('is-active');
     if (opts?.disabled === true) btn.disabled = true;
 
-    const glyph = document.createElement('span');
-    glyph.className = `tlr-context-glyph tlr-context-glyph-${opts?.icon || 'more'}`;
-    btn.appendChild(glyph);
+    btn.appendChild(this.buildLinkedContextGlyph(opts?.icon || 'toggle'));
     return btn;
+  }
+
+  buildLinkedContextGlyph(icon) {
+    const glyph = document.createElement('span');
+    glyph.className = `tlr-context-glyph tlr-context-glyph-${icon}`;
+    glyph.setAttribute('aria-hidden', 'true');
+
+    const addChevron = (dir) => {
+      let iconEl = null;
+      try {
+        iconEl = this.ui.createIcon(`ti-chevron-${dir}`);
+      } catch (e) {
+        iconEl = null;
+      }
+
+      if (!iconEl) {
+        iconEl = document.createElement('span');
+        iconEl.className = `ti ti-chevron-${dir}`;
+      }
+
+      glyph.appendChild(iconEl);
+    };
+
+    if (icon === 'toggle') {
+      addChevron('up');
+      addChevron('down');
+      return glyph;
+    }
+
+    if (icon === 'up' || icon === 'down') {
+      addChevron(icon);
+      return glyph;
+    }
+
+    return glyph;
   }
 
   appendLineText(container, line, query) {
@@ -3392,43 +3428,41 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-context-glyph {
-        position: relative;
-        display: block;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+      }
+
+      .tlr-context-glyph > * {
+        width: 14px;
+        height: 14px;
+        flex: 0 0 auto;
+      }
+
+      .tlr-context-glyph .ti {
+        font-size: 14px;
+        line-height: 1;
+      }
+
+      .tlr-context-glyph-toggle {
+        flex-direction: column;
+        gap: 0;
+      }
+
+      .tlr-context-glyph-toggle .ti {
+        font-size: 12px;
+        margin: -3px 0;
+      }
+
+      .tlr-context-glyph-toggle > * {
         width: 12px;
         height: 12px;
       }
 
-      .tlr-context-glyph-more::before {
-        content: '';
-        position: absolute;
-        top: 1px;
-        left: 1px;
-        width: 10px;
-        height: 2px;
-        background: currentColor;
-        box-shadow: 0 4px 0 currentColor, 0 8px 0 currentColor;
-        opacity: 0.9;
-      }
-
-      .tlr-context-glyph-up::before,
-      .tlr-context-glyph-down::before {
-        content: '';
-        position: absolute;
-        left: 2px;
-        width: 7px;
-        height: 7px;
-        border-top: 2px solid currentColor;
-        border-left: 2px solid currentColor;
-      }
-
-      .tlr-context-glyph-up::before {
-        top: 3px;
-        transform: rotate(45deg);
-      }
-
-      .tlr-context-glyph-down::before {
-        top: 1px;
-        transform: rotate(-135deg);
+      .tlr-context-btn-toggle {
+        width: 26px;
       }
 
       .tlr-context-list {
