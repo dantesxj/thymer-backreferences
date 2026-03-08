@@ -598,19 +598,15 @@ class Plugin extends AppPlugin {
     }
 
     if (
-      action === 'toggle-context-up' ||
-      action === 'toggle-context-down' ||
+      action === 'toggle-context-more' ||
       action === 'toggle-context-above' ||
-      action === 'toggle-context-below' ||
-      action === 'toggle-context-ancestor' ||
-      action === 'toggle-context-reset'
+      action === 'toggle-context-below'
     ) {
       if (!state) return;
       this.handleLinkedContextAction(
         state,
         action,
-        actionEl.dataset.lineGuid || null,
-        actionEl.dataset.ancestorGuid || null
+        actionEl.dataset.lineGuid || null
       ).catch(() => {
         // ignore
       });
@@ -1237,12 +1233,10 @@ class Plugin extends AppPlugin {
       ctx.loading = false;
       ctx.loadPromise = null;
       ctx.error = '';
-      ctx.ancestors = [];
       ctx.descendants = [];
       ctx.depthByGuid = {};
       ctx.aboveItems = [];
       ctx.belowItems = [];
-      ctx.expandedAncestorGuid = null;
     }
   }
 
@@ -1639,20 +1633,17 @@ class Plugin extends AppPlugin {
 
     ctx = {
       lineGuid: guid,
-      showAncestors: false,
-      showDescendants: false,
+      showMoreContext: false,
       siblingAboveCount: 0,
       siblingBelowCount: 0,
       loaded: false,
       loading: false,
       loadPromise: null,
       error: '',
-      ancestors: [],
       descendants: [],
       depthByGuid: {},
       aboveItems: [],
-      belowItems: [],
-      expandedAncestorGuid: null
+      belowItems: []
     };
     state.linkedContextByLine.set(guid, ctx);
     return ctx;
@@ -1660,18 +1651,7 @@ class Plugin extends AppPlugin {
 
   hasRequestedLinkedContext(ctx) {
     return Boolean(
-      ctx && (ctx.showAncestors === true || ctx.showDescendants === true || (ctx.siblingAboveCount || 0) > 0 || (ctx.siblingBelowCount || 0) > 0)
-    );
-  }
-
-  hasVisibleLinkedContext(ctx) {
-    return Boolean(
-      ctx && (
-        (ctx.showAncestors === true && (ctx.ancestors || []).length > 0) ||
-        (ctx.showDescendants === true && (ctx.descendants || []).length > 0) ||
-        this.getVisibleAboveContextItems(ctx).length > 0 ||
-        this.getVisibleBelowContextItems(ctx).length > 0
-      )
+      ctx && (ctx.showMoreContext === true || (ctx.siblingAboveCount || 0) > 0 || (ctx.siblingBelowCount || 0) > 0)
     );
   }
 
@@ -1702,12 +1682,13 @@ class Plugin extends AppPlugin {
     return ctx.belowItems.slice(0, count);
   }
 
-  getAncestorToggleLabel(ctx) {
-    return ctx?.showAncestors === true ? 'Hide up' : 'Expand up';
-  }
-
-  getDescendantToggleLabel(ctx) {
-    return ctx?.showDescendants === true ? 'Hide down' : 'Expand down';
+  hasAnyLinkedContext(ctx) {
+    if (!ctx || ctx.loaded !== true) return false;
+    return Boolean(
+      (ctx.descendants || []).length > 0 ||
+      this.getAvailableAboveContextCount(ctx) > 0 ||
+      this.getAvailableBelowContextCount(ctx) > 0
+    );
   }
 
   getAboveToggleLabel(ctx) {
@@ -1737,21 +1718,10 @@ class Plugin extends AppPlugin {
 
   resetLinkedContextState(ctx) {
     if (!ctx) return;
-    ctx.showAncestors = false;
-    ctx.showDescendants = false;
+    ctx.showMoreContext = false;
     ctx.siblingAboveCount = 0;
     ctx.siblingBelowCount = 0;
-    ctx.expandedAncestorGuid = null;
     ctx.error = '';
-  }
-
-  getExpandedAncestorLine(ctx) {
-    const target = (ctx?.expandedAncestorGuid || '').trim();
-    if (!target) return null;
-    for (const line of ctx?.ancestors || []) {
-      if ((line?.guid || '') === target) return line;
-    }
-    return null;
   }
 
   findLinkedLineByGuid(state, lineGuid) {
@@ -1844,14 +1814,10 @@ class Plugin extends AppPlugin {
         }
       }
 
-      ctx.ancestors = ancestors;
       ctx.descendants = descendantContext.descendants;
       ctx.depthByGuid = descendantContext.depthByGuid;
       ctx.aboveItems = aboveItems;
       ctx.belowItems = belowItems;
-      if (ctx.expandedAncestorGuid && !ancestors.some((item) => (item?.guid || '') === ctx.expandedAncestorGuid)) {
-        ctx.expandedAncestorGuid = null;
-      }
       ctx.loaded = true;
 
       const availableAbove = this.getAvailableAboveContextCount(ctx);
@@ -1874,33 +1840,24 @@ class Plugin extends AppPlugin {
     return ctx.loadPromise;
   }
 
-  async handleLinkedContextAction(state, action, lineGuid, ancestorGuid) {
+  async handleLinkedContextAction(state, action, lineGuid) {
     const line = this.findLinkedLineByGuid(state, lineGuid);
     if (!line) return;
 
     const ctx = this.getLinkedContextState(state, lineGuid);
     if (!ctx) return;
 
-    if (action === 'toggle-context-reset') {
-      this.resetLinkedContextState(ctx);
-      this.renderFromCache(state);
-      return;
-    }
-
-    if (action === 'toggle-context-up') {
-      ctx.showAncestors = !(ctx.showAncestors === true);
-      if (ctx.showAncestors !== true) ctx.expandedAncestorGuid = null;
-    } else if (action === 'toggle-context-down') {
-      ctx.showDescendants = !(ctx.showDescendants === true);
+    if (action === 'toggle-context-more') {
+      if (ctx.showMoreContext === true) {
+        this.resetLinkedContextState(ctx);
+        this.renderFromCache(state);
+        return;
+      }
+      ctx.showMoreContext = true;
     } else if (action === 'toggle-context-above') {
       ctx.siblingAboveCount = this.adjustContextWindowCount(ctx.siblingAboveCount, this.getAvailableAboveContextCount(ctx));
     } else if (action === 'toggle-context-below') {
       ctx.siblingBelowCount = this.adjustContextWindowCount(ctx.siblingBelowCount, this.getAvailableBelowContextCount(ctx));
-    } else if (action === 'toggle-context-ancestor') {
-      const target = (ancestorGuid || '').trim();
-      if (!target) return;
-      ctx.showAncestors = true;
-      ctx.expandedAncestorGuid = ctx.expandedAncestorGuid === target ? null : target;
     } else {
       return;
     }
@@ -2638,80 +2595,47 @@ class Plugin extends AppPlugin {
     const controls = document.createElement('div');
     controls.className = 'tlr-line-actions text-details';
 
-    controls.appendChild(this.buildLinkedContextButton('toggle-context-up', lineGuid, this.getAncestorToggleLabel(ctx), {
-      disabled: ctx?.loaded === true && (ctx.ancestors || []).length === 0,
-      active: ctx?.showAncestors === true
-    }));
-    controls.appendChild(this.buildLinkedContextButton('toggle-context-down', lineGuid, this.getDescendantToggleLabel(ctx), {
-      disabled: ctx?.loaded === true && (ctx.descendants || []).length === 0,
-      active: ctx?.showDescendants === true
-    }));
-    controls.appendChild(this.buildLinkedContextButton('toggle-context-above', lineGuid, this.getAboveToggleLabel(ctx), {
-      disabled: ctx?.loaded === true && this.getAvailableAboveContextCount(ctx) === 0,
-      active: (ctx?.siblingAboveCount || 0) > 0
-    }));
-    controls.appendChild(this.buildLinkedContextButton('toggle-context-below', lineGuid, this.getBelowToggleLabel(ctx), {
-      disabled: ctx?.loaded === true && this.getAvailableBelowContextCount(ctx) === 0,
-      active: (ctx?.siblingBelowCount || 0) > 0
+    controls.appendChild(this.buildLinkedContextButton('toggle-context-more', lineGuid, {
+      icon: 'more',
+      label: ctx?.showMoreContext === true ? 'Hide context' : 'Show more context',
+      disabled: ctx?.showMoreContext !== true && ctx?.loaded === true && !this.hasAnyLinkedContext(ctx),
+      active: ctx?.showMoreContext === true
     }));
 
-    if (this.hasRequestedLinkedContext(ctx)) {
-      controls.appendChild(this.buildLinkedContextButton('toggle-context-reset', lineGuid, 'Reset', { active: false }));
+    if (ctx?.showMoreContext === true) {
+      controls.appendChild(this.buildLinkedContextButton('toggle-context-above', lineGuid, {
+        icon: 'up',
+        label: this.getAboveToggleLabel(ctx),
+        disabled: ctx?.loaded === true && this.getAvailableAboveContextCount(ctx) === 0,
+        active: (ctx?.siblingAboveCount || 0) > 0
+      }));
+      controls.appendChild(this.buildLinkedContextButton('toggle-context-below', lineGuid, {
+        icon: 'down',
+        label: this.getBelowToggleLabel(ctx),
+        disabled: ctx?.loaded === true && this.getAvailableBelowContextCount(ctx) === 0,
+        active: (ctx?.siblingBelowCount || 0) > 0
+      }));
     }
 
     return controls;
   }
 
-  buildLinkedContextButton(action, lineGuid, label, opts) {
+  buildLinkedContextButton(action, lineGuid, opts) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'tlr-context-btn button-none button-small button-minimal-hover';
     btn.dataset.action = action;
     btn.dataset.lineGuid = lineGuid || '';
-    btn.textContent = label || '';
+    btn.title = opts?.label || '';
+    btn.setAttribute('aria-label', opts?.label || '');
+    btn.classList.add(`tlr-context-btn-${opts?.icon || 'more'}`);
     if (opts?.active === true) btn.classList.add('is-active');
     if (opts?.disabled === true) btn.disabled = true;
+
+    const glyph = document.createElement('span');
+    glyph.className = `tlr-context-glyph tlr-context-glyph-${opts?.icon || 'more'}`;
+    btn.appendChild(glyph);
     return btn;
-  }
-
-  buildAncestorBreadcrumbs(ctx) {
-    if (!ctx || ctx.showAncestors !== true || ctx.loaded !== true) return null;
-
-    const ancestors = Array.isArray(ctx.ancestors) ? ctx.ancestors : [];
-    if (ancestors.length === 0) return null;
-
-    const trail = document.createElement('div');
-    trail.className = 'tlr-ancestor-crumbs';
-
-    for (let i = 0; i < ancestors.length; i += 1) {
-      const line = ancestors[i] || null;
-      const guid = line?.guid || null;
-      if (!guid) continue;
-
-      if (trail.childElementCount > 0) {
-        const sep = document.createElement('span');
-        sep.className = 'tlr-ancestor-sep text-details';
-        sep.textContent = '>';
-        trail.appendChild(sep);
-      }
-
-      const crumb = document.createElement('button');
-      crumb.type = 'button';
-      crumb.className = 'tlr-ancestor-crumb button-none button-minimal-hover';
-      crumb.dataset.action = 'toggle-context-ancestor';
-      crumb.dataset.lineGuid = ctx.lineGuid || '';
-      crumb.dataset.ancestorGuid = guid;
-      crumb.title = this.getCompactContextLabel(line, 160);
-      if ((ctx.expandedAncestorGuid || '') === guid) crumb.classList.add('is-active');
-
-      const label = document.createElement('span');
-      label.className = 'tlr-ancestor-crumb-label';
-      label.textContent = this.getCompactContextLabel(line, 40);
-      crumb.appendChild(label);
-      trail.appendChild(crumb);
-    }
-
-    return trail.childElementCount > 0 ? trail : null;
   }
 
   appendLineText(container, line, query) {
@@ -2736,38 +2660,21 @@ class Plugin extends AppPlugin {
 
     const items = [];
     if (position === 'top') {
-      if (ctx.showAncestors === true) {
-        const ancestors = Array.isArray(ctx.ancestors) ? ctx.ancestors : [];
-        const trail = this.buildAncestorBreadcrumbs(ctx);
-        if (trail) container.appendChild(trail);
-
-        const expandedAncestor = this.getExpandedAncestorLine(ctx);
-        if (expandedAncestor) {
-          const idx = ancestors.findIndex((item) => (item?.guid || '') === (expandedAncestor?.guid || ''));
-          items.push({
-            line: expandedAncestor,
-            label: idx === ancestors.length - 1 ? 'Parent' : 'Ancestor',
-            indent: 0
-          });
-        }
-      }
-
       for (const line of this.getVisibleAboveContextItems(ctx)) {
-        items.push({ line, label: 'Above', indent: 0 });
+        items.push({ line, indent: 0 });
       }
     } else {
-      if (ctx.showDescendants === true) {
+      if (ctx.showMoreContext === true) {
         for (const line of ctx.descendants || []) {
           items.push({
             line,
-            label: 'Child',
             indent: Number(ctx.depthByGuid?.[line?.guid] || 1)
           });
         }
       }
 
       for (const line of this.getVisibleBelowContextItems(ctx)) {
-        items.push({ line, label: 'Below', indent: 0 });
+        items.push({ line, indent: 0 });
       }
     }
 
@@ -2789,11 +2696,6 @@ class Plugin extends AppPlugin {
       row.dataset.lineGuid = guid;
       row.style.setProperty('--tlr-context-indent', `${Math.max(0, item.indent || 0) * 12}px`);
 
-      const badge = document.createElement('span');
-      badge.className = 'tlr-context-role text-details';
-      badge.textContent = item.label || 'Context';
-      row.appendChild(badge);
-
       this.appendLineText(row, line, query);
       list.appendChild(row);
     }
@@ -2814,20 +2716,6 @@ class Plugin extends AppPlugin {
     if (t === 'heading') return '# ';
     if (t === 'quote') return '> ';
     return '';
-  }
-
-  getCompactContextLabel(line, maxLength) {
-    const base = this.segmentsToPlainText(line?.segments || []).replace(/\s+/g, ' ').trim();
-    const prefix = line?.type === 'task' ? this.getLinePrefix(line) : '';
-    const label = `${prefix}${base || 'Untitled'}`.trim();
-    return this.truncateText(label, maxLength || 48);
-  }
-
-  truncateText(text, maxLength) {
-    const s = typeof text === 'string' ? text.trim() : '';
-    const limit = Math.max(4, maxLength || 0);
-    if (!s || s.length <= limit) return s;
-    return `${s.slice(0, Math.max(0, limit - 3)).trimEnd()}...`;
   }
 
   segmentsToPlainText(segments) {
@@ -3477,53 +3365,76 @@ class Plugin extends AppPlugin {
       .tlr-line-actions {
         display: flex;
         flex-wrap: wrap;
-        gap: 6px;
+        gap: 4px;
         padding: 0 10px 2px;
       }
 
-      .tlr-ancestor-crumbs {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 6px;
-        padding: 0 10px 2px;
-      }
-
-      .tlr-ancestor-sep {
-        color: var(--text-muted, rgba(0, 0, 0, 0.55));
-      }
-
-      .tlr-ancestor-crumb {
+      .tlr-context-btn {
         display: inline-flex;
         align-items: center;
-        max-width: min(100%, 220px);
-        padding: 2px 8px;
-        border: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
-        border-radius: 999px;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border-radius: 6px;
         color: var(--text-muted, rgba(0, 0, 0, 0.72));
-        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
       }
 
-      .tlr-ancestor-crumb.is-active {
+      .tlr-context-btn:hover:not(:disabled),
+      .tlr-context-btn.is-active {
         color: var(--text-default, var(--text, inherit));
         background: var(--bg-selected, var(--bg-hover, rgba(0, 0, 0, 0.06)));
       }
 
-      .tlr-ancestor-crumb-label {
-        display: block;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+      .tlr-context-btn:disabled {
+        opacity: 0.4;
+        cursor: default;
       }
 
-      .tlr-context-btn.is-active {
-        color: var(--text-default, var(--text, inherit));
+      .tlr-context-glyph {
+        position: relative;
+        display: block;
+        width: 12px;
+        height: 12px;
+      }
+
+      .tlr-context-glyph-more::before {
+        content: '';
+        position: absolute;
+        top: 1px;
+        left: 1px;
+        width: 10px;
+        height: 2px;
+        background: currentColor;
+        box-shadow: 0 4px 0 currentColor, 0 8px 0 currentColor;
+        opacity: 0.9;
+      }
+
+      .tlr-context-glyph-up::before,
+      .tlr-context-glyph-down::before {
+        content: '';
+        position: absolute;
+        left: 2px;
+        width: 7px;
+        height: 7px;
+        border-top: 2px solid currentColor;
+        border-left: 2px solid currentColor;
+      }
+
+      .tlr-context-glyph-up::before {
+        top: 3px;
+        transform: rotate(45deg);
+      }
+
+      .tlr-context-glyph-down::before {
+        top: 1px;
+        transform: rotate(-135deg);
       }
 
       .tlr-context-list {
         display: flex;
         flex-direction: column;
-        gap: 4px;
+        gap: 2px;
       }
 
       .tlr-context-line {
@@ -3531,15 +3442,9 @@ class Plugin extends AppPlugin {
         width: 100%;
         padding: 6px 10px 6px calc(10px + var(--tlr-context-indent, 0px));
         text-align: left;
-        color: var(--text-muted, rgba(0, 0, 0, 0.72));
+        color: var(--text, inherit);
         line-height: 1.35;
         border-left: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
-      }
-
-      .tlr-context-role {
-        display: inline-block;
-        margin-right: 8px;
-        min-width: 48px;
       }
 
       .tlr-context-note {

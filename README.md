@@ -38,8 +38,8 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
   - Typing filters mentions and highlights matching text.
 
 - **Expand linked context**
-  - Each linked mention can reveal parent context, child context, and nearby sibling lines on demand.
-  - Use `Reset` to collapse the extra context for a single mention.
+  - Each linked mention starts with a compact `Show more context` control.
+  - Clicking it expands the full child subtree for that mention and exposes up/down controls for nearby sibling lines.
 
 - **Compact empty state**
   - When a page has no references yet, the footer stays minimal until you click `Show sections`.
@@ -78,7 +78,7 @@ Edit `custom` in `plugin.json`:
 4. Confirm Linked References are grouped by source note.
 5. Toggle search and verify filtering/highlighting.
 6. Change sort field and direction and verify order updates.
-7. Expand a linked reference and verify above/below context loads lazily.
+7. Expand a linked reference and verify descendants load first, then above/below context can be added with the arrow controls.
 8. Make or receive a new reference while the page stays open and verify `New` / `Changed` badges update.
 9. Confirm the status bar count matches the footer.
 10. Click a source note to navigate; Ctrl/Cmd-click to open in a new panel.
