@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.9';
+    this._version = '0.4.10';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -1927,15 +1927,31 @@ class Plugin extends AppPlugin {
 
   // ---------- Grouping + rendering ----------
 
-  async getPropertyBacklinkGroups(_targetRecord, targetGuid, { showSelf, candidateRecords }) {
+  async getPropertyBacklinkGroups(targetRecord, targetGuid, { showSelf, candidateRecords }) {
     if (!targetGuid) return [];
 
-    // searchByQuery("@linkto = ...") already returns page-level matches for property-only
-    // record links in result.records, so we can inspect only those candidates when available.
-    // Fall back to a full scan only if the search result is unavailable.
-    const sourceRecords = Array.isArray(candidateRecords)
+    const indexedCandidates = Array.isArray(candidateRecords)
       ? candidateRecords
-      : (this.data.getAllRecords?.() || []);
+      : [];
+    if (indexedCandidates.length > 0) {
+      const groups = this.buildPropertyBacklinkGroupsFromRecords(indexedCandidates, targetGuid, { showSelf });
+      if (groups.length > 0) return groups;
+    }
+
+    try {
+      const backrefRecords = await targetRecord?.getBackReferenceRecords?.();
+      if (Array.isArray(backrefRecords) && backrefRecords.length > 0) {
+        const groups = this.buildPropertyBacklinkGroupsFromRecords(backrefRecords, targetGuid, { showSelf });
+        if (groups.length > 0) return groups;
+      }
+    } catch (e) {
+      // ignore and continue to the full scan fallback
+    }
+
+    return this.buildPropertyBacklinkGroupsFromRecords(this.data.getAllRecords?.() || [], targetGuid, { showSelf });
+  }
+
+  buildPropertyBacklinkGroupsFromRecords(sourceRecords, targetGuid, { showSelf }) {
     const byProp = new Map();
     const seenSourceGuids = new Set();
 
