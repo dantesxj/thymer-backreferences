@@ -17,13 +17,14 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
 
 - **Property References**: references to the active note through record-link properties, grouped by property name.
 - **Linked References**: line-level mentions grouped by source note.
-- **Unlinked References**: text-only mentions of the active note title, grouped by source note and kept visually consistent with linked references.
+- **Unlinked References**: text-only mentions of the active note title, grouped by source note, kept visually consistent with linked references, and loaded only after you expand that section.
 - **Live Activity**: new references added after a page opens are marked in place, and remote edits are called out inline.
 
 ## Options
 
 - **Collapse results**
   - Use the header toggle (`-` / `+`) to collapse or expand the Backreferences section.
+  - Each subsection also has its own `-` / `+` toggle for hiding Property, Linked, or Unlinked references independently.
   - Default behavior is open and expanded.
 
 - **Change sort order**
@@ -44,6 +45,7 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
 
 - **Review unlinked mentions**
   - Text mentions of the current note title appear in a separate `Unlinked References` section.
+  - That section starts collapsed and only runs its title-search query after you expand it.
   - The section reuses the existing search, sort, grouping, and context controls instead of adding a separate interaction model.
 
 - **Compact empty state**

@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.11';
+    this._version = '0.4.12';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -135,10 +135,14 @@ class Plugin extends AppPlugin {
     }
 
     const state = this.getOrCreatePanelState(panel);
+    if (!state.sectionCollapsed || typeof state.sectionCollapsed !== 'object') {
+      state.sectionCollapsed = this.createDefaultSectionCollapsedState();
+    }
     const recordChanged = state.recordGuid !== recordGuid;
     state.recordGuid = recordGuid;
 
     if (recordChanged || !this.isValidSortBy(state.sortBy) || !this.isValidSortDir(state.sortDir)) {
+      state.sectionCollapsed = this.createDefaultSectionCollapsedState();
       state.emptyStateExpanded = false;
       state.linkedContextByLine = new Map();
       state.liveBaselineSnapshot = null;
@@ -199,6 +203,7 @@ class Plugin extends AppPlugin {
         searchInputEl: null,
         searchQuery: '',
         searchOpen: false,
+        sectionCollapsed: this.createDefaultSectionCollapsedState(),
         emptyStateExpanded: false,
         linkedContextByLine: new Map(),
         liveBaselineSnapshot: null,
@@ -240,6 +245,7 @@ class Plugin extends AppPlugin {
       searchInputEl: null,
       searchQuery: '',
       searchOpen: false,
+      sectionCollapsed: this.createDefaultSectionCollapsedState(),
       emptyStateExpanded: false,
       linkedContextByLine: new Map(),
       liveBaselineSnapshot: null,
@@ -545,6 +551,23 @@ class Plugin extends AppPlugin {
       return;
     }
 
+    if (action === 'toggle-section') {
+      if (!state) return;
+      const sectionId = this.normalizeSectionId(actionEl.dataset.sectionId);
+      if (!sectionId) return;
+
+      const nextCollapsed = !this.isSectionCollapsed(state, sectionId);
+      this.setSectionCollapsed(state, sectionId, nextCollapsed);
+      this.renderFromCache(state);
+
+      if (sectionId === 'unlinked' && nextCollapsed !== true) {
+        this.ensureDeferredUnlinkedLoaded(state).catch(() => {
+          // ignore
+        });
+      }
+      return;
+    }
+
     if (action === 'toggle-search') {
       if (!state) return;
       this.setSearchOpen(state, !(state.searchOpen === true));
@@ -679,6 +702,43 @@ class Plugin extends AppPlugin {
   applyCollapsedState(root, collapsed) {
     if (!root) return;
     root.classList.toggle('tlr-collapsed', collapsed === true);
+  }
+
+  createDefaultSectionCollapsedState() {
+    return {
+      property: false,
+      linked: false,
+      unlinked: true
+    };
+  }
+
+  normalizeSectionId(sectionId) {
+    return sectionId === 'property' || sectionId === 'linked' || sectionId === 'unlinked'
+      ? sectionId
+      : null;
+  }
+
+  getDefaultSectionCollapsed(sectionId) {
+    const defaults = this.createDefaultSectionCollapsedState();
+    return defaults[sectionId] === true;
+  }
+
+  isSectionCollapsed(state, sectionId) {
+    const id = this.normalizeSectionId(sectionId);
+    if (!id) return false;
+    const current = state?.sectionCollapsed?.[id];
+    if (typeof current === 'boolean') return current;
+    return this.getDefaultSectionCollapsed(id);
+  }
+
+  setSectionCollapsed(state, sectionId, collapsed) {
+    if (!state) return;
+    const id = this.normalizeSectionId(sectionId);
+    if (!id) return;
+    if (!state.sectionCollapsed || typeof state.sectionCollapsed !== 'object') {
+      state.sectionCollapsed = this.createDefaultSectionCollapsedState();
+    }
+    state.sectionCollapsed[id] = collapsed === true;
   }
 
   setSearchOpen(state, open) {
@@ -1500,11 +1560,19 @@ class Plugin extends AppPlugin {
 
     const recordName = (record?.getName?.() || '').trim();
     const query = `@linkto = "${recordGuid}"`;
-    const searchPromises = [
-      this.data.searchByQuery(query, maxResults),
-      recordName ? this.data.searchByQuery(recordName, maxResults) : Promise.resolve({ lines: [], records: [] })
-    ];
-    const [searchSettled, unlinkedSettled] = await Promise.allSettled(searchPromises);
+
+    let searchSettled;
+    try {
+      searchSettled = {
+        status: 'fulfilled',
+        value: await this.data.searchByQuery(query, maxResults)
+      };
+    } catch (e) {
+      searchSettled = {
+        status: 'rejected',
+        reason: e
+      };
+    }
 
     if (!this._panelStates.has(panelId) || state.refreshSeq !== seq) return;
 
@@ -1524,20 +1592,32 @@ class Plugin extends AppPlugin {
       linkedError = 'Error loading linked references.';
     }
 
-    let propertyError = '';
-    let propertyGroups = [];
-    try {
-      propertyGroups = await this.getPropertyBacklinkGroups(record, recordGuid, {
+    const shouldLoadUnlinked = Boolean(recordName) && !this.isSectionCollapsed(state, 'unlinked');
+    const followupPromises = [
+      this.getPropertyBacklinkGroups(record, recordGuid, {
         showSelf,
         candidateRecords: propertyCandidateRecords
-      });
-    } catch (e) {
+      })
+    ];
+    if (shouldLoadUnlinked) {
+      followupPromises.push(this.data.searchByQuery(recordName, maxResults));
+    }
+    const [propertySettled, unlinkedSettled] = await Promise.allSettled(followupPromises);
+
+    if (!this._panelStates.has(panelId) || state.refreshSeq !== seq) return;
+
+    let propertyError = '';
+    let propertyGroups = [];
+    if (propertySettled.status === 'fulfilled') {
+      propertyGroups = Array.isArray(propertySettled.value) ? propertySettled.value : [];
+    } else {
       propertyError = 'Error loading property references.';
     }
 
     let unlinkedError = '';
     let unlinkedGroups = [];
-    if (recordName) {
+    const unlinkedDeferred = Boolean(recordName) && !shouldLoadUnlinked;
+    if (recordName && shouldLoadUnlinked) {
       if (unlinkedSettled.status === 'fulfilled') {
         const result = unlinkedSettled.value;
         if (result?.error) {
@@ -1560,12 +1640,73 @@ class Plugin extends AppPlugin {
       linkedError,
       unlinkedGroups,
       unlinkedError,
+      unlinkedDeferred,
+      unlinkedLoading: false,
       maxResults
     };
     this.applyLiveSnapshot(state, this.buildResultsSnapshot(propertyGroups, linkedGroups));
     this.invalidateLinkedContextCache(state);
     this.renderFromCache(state);
+    if (state.lastResults?.unlinkedDeferred === true && !this.isSectionCollapsed(state, 'unlinked')) {
+      this.ensureDeferredUnlinkedLoaded(state).catch(() => {
+        // ignore
+      });
+    }
     this.setLoadingState(state, false);
+    this.syncStatusItem();
+  }
+
+  async ensureDeferredUnlinkedLoaded(state) {
+    const results = state?.lastResults || null;
+    if (!state || !results) return;
+    if (results.unlinkedDeferred !== true) return;
+    if (results.unlinkedLoading === true) return;
+
+    const panel = state.panel || null;
+    const record = panel?.getActiveRecord?.() || null;
+    const recordGuid = record?.guid || state.recordGuid || null;
+    const recordName = (record?.getName?.() || '').trim();
+    if (!recordGuid || !recordName) return;
+
+    const seq = state.refreshSeq || 0;
+    results.unlinkedLoading = true;
+    results.unlinkedError = '';
+    this.renderFromCache(state);
+
+    const cfg = this.getConfiguration?.() || {};
+    const maxResults = this.coercePositiveInt(cfg.custom?.maxResults, this._defaultMaxResults);
+    const showSelf = cfg.custom?.showSelf === true;
+
+    let nextGroups = [];
+    let nextError = '';
+    try {
+      const result = await this.data.searchByQuery(recordName, maxResults);
+      if (result?.error) {
+        nextError = result.error;
+      } else {
+        const lines = Array.isArray(result?.lines) ? result.lines : [];
+        nextGroups = this.groupUnlinkedReferenceLines(
+          lines,
+          Array.isArray(results.linkedGroups) ? results.linkedGroups : [],
+          recordGuid,
+          recordName,
+          { showSelf }
+        );
+      }
+    } catch (e) {
+      nextError = 'Error loading unlinked references.';
+    }
+
+    if (!this._panelStates.has(state.panelId)) return;
+    if (state.lastResults !== results) return;
+    if (state.refreshSeq !== seq) return;
+    if ((state.recordGuid || '') !== recordGuid) return;
+
+    results.unlinkedGroups = nextGroups;
+    results.unlinkedError = nextError;
+    results.unlinkedDeferred = false;
+    results.unlinkedLoading = false;
+    this.renderFromCache(state);
     this.syncStatusItem();
   }
 
@@ -2442,7 +2583,17 @@ class Plugin extends AppPlugin {
     state.bodyEl.appendChild(el);
   }
 
-  renderReferences(state, { propertyGroups, propertyError, linkedGroups, linkedError, unlinkedGroups, unlinkedError, maxResults }) {
+  renderReferences(state, {
+    propertyGroups,
+    propertyError,
+    linkedGroups,
+    linkedError,
+    unlinkedGroups,
+    unlinkedError,
+    unlinkedDeferred,
+    unlinkedLoading,
+    maxResults
+  }) {
     if (!state?.bodyEl || !state?.countEl) return;
 
     const body = state.bodyEl;
@@ -2463,7 +2614,10 @@ class Plugin extends AppPlugin {
       && totalPropRefCount === 0
       && totalLinkedRefCount === 0
       && totalUnlinkedRefCount === 0;
-    const useCompactEmpty = isEmptyWithoutFilter && !queryLower && state.emptyStateExpanded !== true;
+    const useCompactEmpty = isEmptyWithoutFilter
+      && !queryLower
+      && state.emptyStateExpanded !== true
+      && unlinkedDeferred !== true;
 
     if (useCompactEmpty) {
       state.rootEl?.classList?.add('tlr-empty-compact');
@@ -2581,24 +2735,30 @@ class Plugin extends AppPlugin {
     }
     state.countEl.textContent = parts.join(' | ');
 
-    this.appendSectionTitle(body, 'Property References');
+    const propertySection = this.appendCollapsibleSection(body, state, {
+      sectionId: 'property',
+      title: 'Property References'
+    });
     if (propertyError) {
-      this.appendError(body, propertyError);
+      this.appendError(propertySection.bodyEl, propertyError);
     } else if (props.length === 0) {
-      this.appendEmpty(body, queryLower ? 'No matching property references.' : 'No property references.');
+      this.appendEmpty(propertySection.bodyEl, queryLower ? 'No matching property references.' : 'No property references.');
     } else {
-      this.appendPropertyReferenceGroups(body, props, { query, state });
+      this.appendPropertyReferenceGroups(propertySection.bodyEl, props, { query, state });
     }
 
     const divider = document.createElement('div');
     divider.className = 'tlr-divider';
     body.appendChild(divider);
-    this.appendSectionTitle(body, 'Linked References');
+    const linkedSection = this.appendCollapsibleSection(body, state, {
+      sectionId: 'linked',
+      title: 'Linked References'
+    });
 
     if (linkedError) {
-      this.appendError(body, linkedError);
+      this.appendError(linkedSection.bodyEl, linkedError);
     } else {
-      this.appendLinkedReferenceGroups(body, linked, {
+      this.appendLinkedReferenceGroups(linkedSection.bodyEl, linked, {
         state,
         maxResults,
         query,
@@ -2610,14 +2770,29 @@ class Plugin extends AppPlugin {
     const unlinkedDivider = document.createElement('div');
     unlinkedDivider.className = 'tlr-divider';
     body.appendChild(unlinkedDivider);
-    this.appendSectionTitle(body, 'Unlinked References');
+    const unlinkedSection = this.appendCollapsibleSection(body, state, {
+      sectionId: 'unlinked',
+      title: 'Unlinked References'
+    });
 
-    if (unlinkedError) {
-      this.appendError(body, unlinkedError);
+    if (unlinkedLoading) {
+      this.appendNote(unlinkedSection.bodyEl, 'Loading unlinked references...');
       return;
     }
 
-    this.appendLinkedReferenceGroups(body, unlinked, {
+    if (unlinkedError) {
+      this.appendError(unlinkedSection.bodyEl, unlinkedError);
+      return;
+    }
+
+    if (unlinkedDeferred) {
+      if (!this.isSectionCollapsed(state, 'unlinked')) {
+        this.appendNote(unlinkedSection.bodyEl, 'Loading unlinked references...');
+      }
+      return;
+    }
+
+    this.appendLinkedReferenceGroups(unlinkedSection.bodyEl, unlinked, {
       state,
       maxResults,
       query,
@@ -2626,12 +2801,42 @@ class Plugin extends AppPlugin {
     });
   }
 
-  appendSectionTitle(container, text) {
+  appendCollapsibleSection(container, state, { sectionId, title }) {
     if (!container) return;
-    const el = document.createElement('div');
-    el.className = 'tlr-section-title text-details';
-    el.textContent = text || '';
-    container.appendChild(el);
+
+    const id = this.normalizeSectionId(sectionId) || 'property';
+    const collapsed = this.isSectionCollapsed(state, id);
+
+    const sectionEl = document.createElement('div');
+    sectionEl.className = 'tlr-section';
+    if (collapsed) sectionEl.classList.add('tlr-section-collapsed');
+
+    const headerEl = document.createElement('div');
+    headerEl.className = 'tlr-section-header';
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.type = 'button';
+    toggleBtn.className = 'tlr-btn tlr-section-toggle button-none button-small button-minimal-hover';
+    toggleBtn.dataset.action = 'toggle-section';
+    toggleBtn.dataset.sectionId = id;
+    toggleBtn.title = 'Collapse/expand';
+    toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    toggleBtn.textContent = collapsed ? '+' : '-';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'tlr-section-title text-details';
+    titleEl.textContent = title || '';
+
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'tlr-section-body';
+
+    headerEl.appendChild(toggleBtn);
+    headerEl.appendChild(titleEl);
+    sectionEl.appendChild(headerEl);
+    sectionEl.appendChild(bodyEl);
+    container.appendChild(sectionEl);
+
+    return { sectionEl, bodyEl };
   }
 
   appendError(container, message) {
@@ -2646,6 +2851,14 @@ class Plugin extends AppPlugin {
     if (!container) return;
     const el = document.createElement('div');
     el.className = 'tlr-empty';
+    el.textContent = message || '';
+    container.appendChild(el);
+  }
+
+  appendNote(container, message) {
+    if (!container) return;
+    const el = document.createElement('div');
+    el.className = 'tlr-note';
     el.textContent = message || '';
     container.appendChild(el);
   }
@@ -3518,14 +3731,36 @@ class Plugin extends AppPlugin {
         flex: 0 0 auto;
       }
 
-      .tlr-section-title {
+      .tlr-section-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
         margin-top: 16px;
         margin-bottom: 8px;
+      }
+
+      .tlr-section:first-child .tlr-section-header {
+        margin-top: 0;
+      }
+
+      .tlr-section-toggle {
+        width: 20px;
+        padding: 0;
+        text-align: center;
+        font-weight: 700;
+        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+      }
+
+      .tlr-section-title {
         font-size: 12px;
         font-weight: 650;
         color: var(--text-muted, rgba(0, 0, 0, 0.6));
         text-transform: none;
         letter-spacing: 0;
+      }
+
+      .tlr-section-collapsed .tlr-section-body {
+        display: none;
       }
 
       .tlr-divider {
