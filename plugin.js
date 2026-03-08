@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.5';
+    this._version = '0.4.6';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -2641,14 +2641,20 @@ class Plugin extends AppPlugin {
     const controls = document.createElement('div');
     controls.className = 'tlr-line-actions text-details';
 
+    const primary = document.createElement('div');
+    primary.className = 'tlr-line-actions-primary';
+
+    const nav = document.createElement('div');
+    nav.className = 'tlr-line-actions-nav';
+
     if (ctx?.showMoreContext === true) {
-      controls.appendChild(this.buildLinkedContextButton('toggle-context-above', lineGuid, {
+      nav.appendChild(this.buildLinkedContextButton('toggle-context-above', lineGuid, {
         icon: 'up',
         label: this.getAboveToggleLabel(ctx),
         disabled: ctx?.loaded === true && this.getAvailableAboveContextCount(ctx) === 0,
         active: (ctx?.siblingAboveCount || 0) > 0
       }));
-      controls.appendChild(this.buildLinkedContextButton('toggle-context-below', lineGuid, {
+      nav.appendChild(this.buildLinkedContextButton('toggle-context-below', lineGuid, {
         icon: 'down',
         label: this.getBelowToggleLabel(ctx),
         disabled: ctx?.loaded === true && this.getAvailableBelowContextCount(ctx) === 0,
@@ -2656,13 +2662,15 @@ class Plugin extends AppPlugin {
       }));
     }
 
-    controls.appendChild(this.buildLinkedContextButton('toggle-context-more', lineGuid, {
+    primary.appendChild(this.buildLinkedContextButton('toggle-context-more', lineGuid, {
       icon: 'toggle',
       label: ctx?.showMoreContext === true ? 'Hide context' : 'Show more context',
       disabled: ctx?.showMoreContext !== true && ctx?.loaded === true && !this.hasAnyLinkedContext(ctx),
       active: ctx?.showMoreContext === true
     }));
 
+    controls.appendChild(primary);
+    if (nav.childElementCount > 0) controls.appendChild(nav);
     return controls;
   }
 
@@ -3443,9 +3451,24 @@ class Plugin extends AppPlugin {
 
       .tlr-line-actions {
         display: flex;
-        flex-wrap: wrap;
-        gap: 4px;
+        align-items: center;
+        gap: 8px;
         padding: 0 10px 2px;
+      }
+
+      .tlr-line-actions-primary {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        flex: 0 0 auto;
+      }
+
+      .tlr-line-actions-nav {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        margin-left: auto;
+        flex: 0 0 auto;
       }
 
       .tlr-context-btn {
