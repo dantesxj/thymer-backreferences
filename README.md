@@ -89,20 +89,21 @@ Edit `custom` in `plugin.json`:
 
 1. Open a note that is referenced elsewhere.
 2. Confirm Backreferences appears at the bottom.
-3. Confirm Property References are grouped by property with an outside-chevron collapse toggle when applicable.
-4. Confirm Linked References are grouped by source note.
-5. Confirm Unlinked References appear separately when the note title is mentioned without a record link.
-6. Confirm only the Filter and Sort buttons appear in the header's top-right before the filter bar is opened.
-7. Click `Filter` and verify the query bar appears on its own row below the header.
-8. Focus the query bar and verify the accent outline appears only while focused.
-9. Type `@Sources`, accept the collection autocomplete, and verify the query remains `@Sources` rather than `@@Sources`.
-10. Type `@Sources.` and verify all properties are available in a scrollable autocomplete list.
-11. Type plain text and verify the footer filters/highlights matching titles and lines.
-12. Type query syntax such as `@task`, `@Journey`, and `foo AND bar` and verify only matching backreferences remain.
-13. Expand `Unlinked References`, repeat a query, and verify that section joins the scoped results.
-14. Change sort field and direction and verify order updates.
-15. Collapse and re-expand a linked group and an unlinked group and verify the per-page toggle only hides that group's rows.
-16. Expand a linked or unlinked reference and verify descendants load first, then above/below context can be added with the arrow controls.
-17. Make or receive a new reference while the page stays open and verify `New` / `Changed` badges update.
-18. Confirm the status bar count matches the footer.
-19. Click a source note to navigate; Ctrl/Cmd-click to open in a new panel.
+3. Confirm the top summary stays compact while each section header shows its own ref count.
+4. Confirm Property References are grouped by property with an outside-chevron collapse toggle when applicable.
+5. Confirm Linked References are grouped by source note.
+6. Confirm Unlinked References appear separately when the note title is mentioned without a record link.
+7. Confirm only the Filter and Sort buttons appear in the header's top-right before the filter bar is opened.
+8. Click `Filter` and verify the query bar appears on its own row below the header.
+9. Focus the query bar and verify the accent outline appears only while focused.
+10. Type `@Sources`, accept the collection autocomplete, and verify the query remains `@Sources` rather than `@@Sources`.
+11. Type `@Sources.` and verify all properties are available in a scrollable autocomplete list.
+12. Type plain text and verify the footer filters/highlights matching titles and lines.
+13. Type query syntax such as `@task`, `@Journey`, and `foo AND bar` and verify only matching backreferences remain.
+14. Expand `Unlinked References`, repeat a query, and verify that section joins the scoped results.
+15. Change sort field and direction and verify order updates.
+16. Collapse and re-expand a linked group and an unlinked group and verify the per-page toggle only hides that group's rows.
+17. Expand a linked or unlinked reference and verify descendants load first, then above/below context can be added with the arrow controls.
+18. Make or receive a new reference while the page stays open and verify `New` / `Changed` badges update.
+19. Confirm the status bar count matches the footer.
+20. Click a source note to navigate; Ctrl/Cmd-click to open in a new panel.

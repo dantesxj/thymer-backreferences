@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.24';
+    this._version = '0.4.25';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -4223,6 +4223,21 @@ class Plugin extends AppPlugin {
     state.bodyEl.appendChild(el);
   }
 
+  formatCountLabel(count, noun, opts) {
+    const totalCount = typeof opts?.totalCount === 'number' ? opts.totalCount : null;
+    const useRatio = opts?.scoped === true && totalCount !== null && totalCount !== count;
+    const includeZero = opts?.includeZero === true;
+    const unit = totalCount !== null ? totalCount : count;
+
+    if (!includeZero && Number(unit) <= 0 && (!useRatio || Number(count) <= 0)) return '';
+
+    if (useRatio) {
+      return `${count}/${totalCount} ${noun}${totalCount === 1 ? '' : 's'}`;
+    }
+
+    return `${unit} ${noun}${unit === 1 ? '' : 's'}`;
+  }
+
   renderReferences(state, {
     propertyGroups,
     propertyError,
@@ -4351,6 +4366,9 @@ class Plugin extends AppPlugin {
     const filteredUnlinkedRefCount = this.countLinkedReferences(unlinked);
     const hasScopedView = (searchMode === 'text' && Boolean(textQueryLower)) || (searchMode === 'query' && canApplyScopedQuery);
     const showUnlinkedCounts = searchMode !== 'query' || shouldScopeUnlinked;
+    const showScopedCounts = hasScopedView || (searchMode === 'query' && canApplyScopedQuery);
+    const totalVisibleRefCount = totalPropRefCount + totalLinkedRefCount + (showUnlinkedCounts ? totalUnlinkedRefCount : 0);
+    const filteredVisibleRefCount = filteredPropRefCount + filteredLinkedRefCount + (showUnlinkedCounts ? filteredUnlinkedRefCount : 0);
 
     const filteredUniquePages = new Set();
     for (const g of props) {
@@ -4388,26 +4406,38 @@ class Plugin extends AppPlugin {
       }
 
       if (canApplyScopedQuery) {
-        if (totalUniquePages.size > 0) parts.push(`${filteredUniquePages.size}/${totalUniquePages.size} pages`);
-        if (totalPropRefCount > 0) parts.push(`${filteredPropRefCount}/${totalPropRefCount} prop refs`);
-        if (totalLinkedRefCount > 0) parts.push(`${filteredLinkedRefCount}/${totalLinkedRefCount} line refs`);
-        if (showUnlinkedCounts && totalUnlinkedRefCount > 0) parts.push(`${filteredUnlinkedRefCount}/${totalUnlinkedRefCount} unlinked refs`);
+        const pageLabel = this.formatCountLabel(filteredUniquePages.size, 'page', {
+          totalCount: totalUniquePages.size,
+          scoped: true
+        });
+        const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
+          totalCount: totalVisibleRefCount,
+          scoped: true
+        });
+        if (pageLabel) parts.push(pageLabel);
+        if (refLabel) parts.push(refLabel);
       } else {
-        if (totalUniquePages.size > 0) parts.push(`${totalUniquePages.size} pages`);
-        if (totalPropRefCount > 0) parts.push(`${totalPropRefCount} prop refs`);
-        if (totalLinkedRefCount > 0) parts.push(`${totalLinkedRefCount} line refs`);
-        if (showUnlinkedCounts && totalUnlinkedRefCount > 0) parts.push(`${totalUnlinkedRefCount} unlinked refs`);
+        const pageLabel = this.formatCountLabel(totalUniquePages.size, 'page');
+        const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
+        if (pageLabel) parts.push(pageLabel);
+        if (refLabel) parts.push(refLabel);
       }
     } else if (hasScopedView) {
-      if (totalUniquePages.size > 0) parts.push(`${filteredUniquePages.size}/${totalUniquePages.size} pages`);
-      if (totalPropRefCount > 0) parts.push(`${filteredPropRefCount}/${totalPropRefCount} prop refs`);
-      if (totalLinkedRefCount > 0) parts.push(`${filteredLinkedRefCount}/${totalLinkedRefCount} line refs`);
-      if (totalUnlinkedRefCount > 0) parts.push(`${filteredUnlinkedRefCount}/${totalUnlinkedRefCount} unlinked refs`);
+      const pageLabel = this.formatCountLabel(filteredUniquePages.size, 'page', {
+        totalCount: totalUniquePages.size,
+        scoped: true
+      });
+      const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
+        totalCount: totalVisibleRefCount,
+        scoped: true
+      });
+      if (pageLabel) parts.push(pageLabel);
+      if (refLabel) parts.push(refLabel);
     } else {
-      if (totalUniquePages.size > 0) parts.push(`${totalUniquePages.size} page${totalUniquePages.size === 1 ? '' : 's'}`);
-      if (totalPropRefCount > 0) parts.push(`${totalPropRefCount} prop ref${totalPropRefCount === 1 ? '' : 's'}`);
-      if (totalLinkedRefCount > 0) parts.push(`${totalLinkedRefCount} line ref${totalLinkedRefCount === 1 ? '' : 's'}`);
-      if (totalUnlinkedRefCount > 0) parts.push(`${totalUnlinkedRefCount} unlinked ref${totalUnlinkedRefCount === 1 ? '' : 's'}`);
+      const pageLabel = this.formatCountLabel(totalUniquePages.size, 'page');
+      const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
+      if (pageLabel) parts.push(pageLabel);
+      if (refLabel) parts.push(refLabel);
     }
     state.countEl.textContent = parts.join(' | ');
 
@@ -4421,7 +4451,12 @@ class Plugin extends AppPlugin {
 
     const propertySection = this.appendCollapsibleSection(body, state, {
       sectionId: 'property',
-      title: 'Property References'
+      title: 'Property References',
+      meta: this.formatCountLabel(showScopedCounts ? filteredPropRefCount : totalPropRefCount, 'ref', {
+        totalCount: showScopedCounts ? totalPropRefCount : null,
+        scoped: showScopedCounts,
+        includeZero: true
+      })
     });
     if (propertyError) {
       this.appendError(propertySection.bodyEl, propertyError);
@@ -4436,7 +4471,12 @@ class Plugin extends AppPlugin {
     body.appendChild(divider);
     const linkedSection = this.appendCollapsibleSection(body, state, {
       sectionId: 'linked',
-      title: 'Linked References'
+      title: 'Linked References',
+      meta: this.formatCountLabel(showScopedCounts ? filteredLinkedRefCount : totalLinkedRefCount, 'ref', {
+        totalCount: showScopedCounts ? totalLinkedRefCount : null,
+        scoped: showScopedCounts,
+        includeZero: true
+      })
     });
 
     if (linkedError) {
@@ -4457,7 +4497,16 @@ class Plugin extends AppPlugin {
     body.appendChild(unlinkedDivider);
     const unlinkedSection = this.appendCollapsibleSection(body, state, {
       sectionId: 'unlinked',
-      title: 'Unlinked References'
+      title: 'Unlinked References',
+      meta: this.formatCountLabel(
+        showScopedCounts && showUnlinkedCounts ? filteredUnlinkedRefCount : totalUnlinkedRefCount,
+        'ref',
+        {
+          totalCount: showScopedCounts && showUnlinkedCounts ? totalUnlinkedRefCount : null,
+          scoped: showScopedCounts && showUnlinkedCounts,
+          includeZero: true
+        }
+      )
     });
 
     if (unlinkedLoading) {
@@ -4502,7 +4551,7 @@ class Plugin extends AppPlugin {
     iconEl.classList.add(collapsed === true ? 'ti-chevron-right' : 'ti-chevron-down');
   }
 
-  appendCollapsibleSection(container, state, { sectionId, title }) {
+  appendCollapsibleSection(container, state, { sectionId, title, meta }) {
     if (!container) return;
 
     const id = this.normalizeSectionId(sectionId) || 'property';
@@ -4529,11 +4578,16 @@ class Plugin extends AppPlugin {
     titleEl.className = 'tlr-section-title text-details';
     titleEl.textContent = title || '';
 
+    const metaEl = document.createElement('div');
+    metaEl.className = 'tlr-section-meta text-details';
+    metaEl.textContent = meta || '';
+
     const bodyEl = document.createElement('div');
     bodyEl.className = 'tlr-section-body';
 
     headerEl.appendChild(toggleBtn);
     headerEl.appendChild(titleEl);
+    headerEl.appendChild(metaEl);
     sectionEl.appendChild(headerEl);
     sectionEl.appendChild(bodyEl);
     container.appendChild(sectionEl);
@@ -5235,6 +5289,7 @@ class Plugin extends AppPlugin {
         overflow: hidden;
         text-overflow: ellipsis;
         min-width: 0;
+        opacity: 0.92;
       }
 
       .tlr-btn {
@@ -5682,11 +5737,21 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-section-title {
+        flex: 1 1 auto;
+        min-width: 0;
         font-size: 12px;
         font-weight: 650;
         color: var(--text-muted, rgba(0, 0, 0, 0.6));
         text-transform: none;
         letter-spacing: 0;
+      }
+
+      .tlr-section-meta {
+        flex: 0 0 auto;
+        color: var(--text-muted, rgba(0, 0, 0, 0.58));
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
       }
 
       .tlr-section-collapsed .tlr-section-body {
