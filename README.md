@@ -23,8 +23,8 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
 ## Options
 
 - **Collapse results**
-  - Use the header toggle (`-` / `+`) to collapse or expand the Backreferences section.
-  - Each subsection also has its own `-` / `+` toggle for hiding Property, Linked, or Unlinked references independently.
+  - Use the header chevron to collapse or expand the Backreferences section.
+  - Each subsection also has its own chevron toggle for hiding Property, Linked, or Unlinked references independently.
   - Default behavior is open and expanded.
 
 - **Change sort order**

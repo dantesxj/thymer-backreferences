@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.23';
+    this._version = '0.4.24';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -469,7 +469,9 @@ class Plugin extends AppPlugin {
     toggleBtn.type = 'button';
     toggleBtn.dataset.action = 'toggle';
     toggleBtn.title = 'Collapse/expand';
-    toggleBtn.textContent = this._collapsed ? '+' : '-';
+    toggleBtn.setAttribute('aria-label', this._collapsed ? 'Expand' : 'Collapse');
+    toggleBtn.setAttribute('aria-expanded', this._collapsed ? 'false' : 'true');
+    toggleBtn.appendChild(this.buildChevronIcon(this._collapsed, 'tlr-toggle-caret'));
 
     const title = document.createElement('div');
     title.className = 'tlr-title tlr-section-title text-details';
@@ -735,7 +737,12 @@ class Plugin extends AppPlugin {
         if (!s?.rootEl) continue;
         this.applyCollapsedState(s.rootEl, this._collapsed);
         const btn = s.rootEl.querySelector?.('[data-action="toggle"]') || null;
-        if (btn) btn.textContent = this._collapsed ? '+' : '-';
+        if (btn) {
+          btn.title = this._collapsed ? 'Expand' : 'Collapse';
+          btn.setAttribute('aria-label', this._collapsed ? 'Expand' : 'Collapse');
+          btn.setAttribute('aria-expanded', this._collapsed ? 'false' : 'true');
+          this.syncChevronIcon(btn.querySelector?.('.tlr-toggle-caret') || null, this._collapsed);
+        }
       }
       return;
     }
@@ -4514,8 +4521,9 @@ class Plugin extends AppPlugin {
     toggleBtn.dataset.action = 'toggle-section';
     toggleBtn.dataset.sectionId = id;
     toggleBtn.title = 'Collapse/expand';
+    toggleBtn.setAttribute('aria-label', collapsed ? 'Expand section' : 'Collapse section');
     toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-    toggleBtn.textContent = collapsed ? '+' : '-';
+    toggleBtn.appendChild(this.buildChevronIcon(collapsed, 'tlr-section-caret'));
 
     const titleEl = document.createElement('div');
     titleEl.className = 'tlr-section-title text-details';
@@ -5616,6 +5624,10 @@ class Plugin extends AppPlugin {
 
       .tlr-toggle {
         flex: 0 0 auto;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        color: var(--text-muted, rgba(0, 0, 0, 0.6));
       }
 
       .tlr-body { display: block; }
@@ -5663,10 +5675,10 @@ class Plugin extends AppPlugin {
 
       .tlr-section-toggle {
         width: 20px;
+        height: 20px;
         padding: 0;
-        text-align: center;
-        font-weight: 700;
         color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        flex: 0 0 auto;
       }
 
       .tlr-section-title {
