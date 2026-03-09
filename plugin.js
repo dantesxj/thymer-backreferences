@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.27';
+    this._version = '0.4.28';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -5248,7 +5248,7 @@ class Plugin extends AppPlugin {
       .tlr-footer {
         --tlr-child-indent: 26px;
         --tlr-context-rail-gap: 8px;
-        margin-top: 16px;
+        margin-top: 14px;
         color: var(--text, inherit);
         font-size: 13px;
       }
@@ -5256,8 +5256,8 @@ class Plugin extends AppPlugin {
       .tlr-header {
         display: flex;
         align-items: center;
-        gap: 8px;
-        min-height: 21px;
+        gap: 6px;
+        min-height: 20px;
         margin-bottom: 0;
       }
 
@@ -5266,14 +5266,14 @@ class Plugin extends AppPlugin {
         min-width: 0;
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
       }
 
       .tlr-header-controls {
         flex: 0 0 auto;
         display: inline-flex;
         align-items: center;
-        gap: 6px;
+        gap: 4px;
       }
 
       .tlr-title {
@@ -5510,8 +5510,8 @@ class Plugin extends AppPlugin {
       .tlr-search-row {
         display: none;
         width: 100%;
-        margin-top: 8px;
-        margin-bottom: 10px;
+        margin-top: 6px;
+        margin-bottom: 8px;
       }
 
       .tlr-search-open .tlr-search-row {
@@ -5553,7 +5553,7 @@ class Plugin extends AppPlugin {
         max-width: none;
         min-width: 0;
         position: relative;
-        min-height: 35px;
+        min-height: 34px;
         border: 1px solid var(--input-border-color, var(--divider-color, var(--cmdpal-border-color, var(--border-subtle, rgba(0, 0, 0, 0.12))))) !important;
         outline: none !important;
         background: var(--input-bg-color, var(--cmdpal-input-bg-color, var(--bg-panel, transparent))) !important;
@@ -5561,12 +5561,12 @@ class Plugin extends AppPlugin {
         -webkit-text-fill-color: var(--input-fg-color, var(--text-default, var(--text, inherit))) !important;
         caret-color: var(--input-fg-color, var(--text-default, var(--text, inherit)));
         opacity: 1;
-        font-size: 14px;
-        line-height: 24px;
-        font-family: "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        font-weight: 300;
-        padding: 5px 54px 5px 10px;
-        border-radius: var(--radius-rounded, 999px);
+        font-size: 13px;
+        line-height: 22px;
+        font-family: var(--ed-variable-width-font, inherit);
+        font-weight: 400;
+        padding: 5px 54px 5px 12px;
+        border-radius: var(--radius-normal, 8px);
         box-shadow: none !important;
         transition: border-color 0.15s, box-shadow 0.15s, outline-color 0.15s;
       }
@@ -5584,12 +5584,12 @@ class Plugin extends AppPlugin {
       .tlr-search-autocomplete {
         display: none;
         position: absolute;
-        top: calc(100% + 8px);
+        top: calc(100% + 6px);
         left: 0;
         width: min(420px, max(260px, 100%));
         max-width: min(90vw, 420px);
         padding: 6px;
-        border-radius: 8px;
+        border-radius: var(--radius-normal, 8px);
         border: 1px solid var(--cmdpal-border-color, var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12))));
         background: var(--cmdpal-bg-color, var(--panel-bg-color, var(--bg-default, var(--bg-panel, rgba(22, 26, 24, 0.96)))));
         box-shadow: var(--cmdpal-box-shadow, 0 12px 34px rgba(0, 0, 0, 0.18));
@@ -5696,12 +5696,12 @@ class Plugin extends AppPlugin {
       .tlr-note,
       .tlr-error {
         color: var(--text-muted, rgba(0, 0, 0, 0.6));
-        padding: 8px 0;
+        padding: 6px 0;
         font-size: 12px;
       }
 
       .tlr-empty-compact-card {
-        padding: 6px 0 2px;
+        padding: 4px 0 0;
       }
 
       .tlr-empty-compact-row {
@@ -5723,8 +5723,8 @@ class Plugin extends AppPlugin {
         display: flex;
         align-items: center;
         gap: 8px;
-        margin-top: 16px;
-        margin-bottom: 8px;
+        margin-top: 14px;
+        margin-bottom: 6px;
       }
 
       .tlr-section:first-child .tlr-section-header {
@@ -5762,16 +5762,16 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-divider {
-        margin: 14px 0 10px;
+        margin: 12px 0 8px;
         border-top: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
       }
 
-      .tlr-prop-group { margin: 12px 0 16px; }
+      .tlr-prop-group { margin: 10px 0 12px; }
 
       .tlr-prop-row {
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
       }
 
       .tlr-prop-toggle {
@@ -5791,7 +5791,7 @@ class Plugin extends AppPlugin {
         gap: 10px;
         width: 100%;
         flex: 1 1 auto;
-        padding: 8px 10px;
+        padding: 7px 10px;
         text-align: left;
       }
 
@@ -5841,7 +5841,7 @@ class Plugin extends AppPlugin {
       .tlr-prop-record {
         display: block;
         width: 100%;
-        padding: 8px 10px;
+        padding: 7px 10px;
         text-align: left;
         color: var(--ed-link-color, var(--link-color, var(--accent, inherit)));
         line-height: 1.4;
@@ -5855,12 +5855,12 @@ class Plugin extends AppPlugin {
         text-decoration: underline;
       }
 
-      .tlr-group { margin: 12px 0 16px; }
+      .tlr-group { margin: 10px 0 12px; }
 
       .tlr-group-row {
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
       }
 
       .tlr-group-toggle {
@@ -5880,7 +5880,7 @@ class Plugin extends AppPlugin {
         align-items: center;
         justify-content: space-between;
         gap: 10px;
-        padding: 8px 10px;
+        padding: 7px 10px;
         text-align: left;
       }
 
