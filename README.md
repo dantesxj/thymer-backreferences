@@ -54,6 +54,7 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
   - Text mentions of the current note title appear in a separate `Unlinked References` section.
   - That section starts collapsed and only runs its title-search query after you expand it.
   - The section reuses the existing search, sort, grouping, and context controls instead of adding a separate interaction model.
+  - Source-note groups in both `Linked References` and `Unlinked References` can be collapsed per page.
 
 - **Compact empty state**
   - When a page has no references yet, the footer stays minimal until you click `Show sections`.
@@ -100,7 +101,8 @@ Edit `custom` in `plugin.json`:
 12. Type query syntax such as `@task`, `@Journey`, and `foo AND bar` and verify only matching backreferences remain.
 13. Expand `Unlinked References`, repeat a query, and verify that section joins the scoped results.
 14. Change sort field and direction and verify order updates.
-15. Expand a linked or unlinked reference and verify descendants load first, then above/below context can be added with the arrow controls.
-16. Make or receive a new reference while the page stays open and verify `New` / `Changed` badges update.
-17. Confirm the status bar count matches the footer.
-18. Click a source note to navigate; Ctrl/Cmd-click to open in a new panel.
+15. Collapse and re-expand a linked group and an unlinked group and verify the per-page toggle only hides that group's rows.
+16. Expand a linked or unlinked reference and verify descendants load first, then above/below context can be added with the arrow controls.
+17. Make or receive a new reference while the page stays open and verify `New` / `Changed` badges update.
+18. Confirm the status bar count matches the footer.
+19. Click a source note to navigate; Ctrl/Cmd-click to open in a new panel.

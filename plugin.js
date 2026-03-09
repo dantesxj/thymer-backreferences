@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.21';
+    this._version = '0.4.22';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -14,6 +14,10 @@ class Plugin extends AppPlugin {
     this._storageKeyPropGroupCollapsed = 'thymer_backreferences_prop_group_collapsed_v2';
     this._legacyStorageKeyPropGroupCollapsed = null;
     this._propGroupCollapsed = this.loadPropGroupCollapsedSetting();
+
+    this._storageKeyRecordGroupCollapsed = 'thymer_backreferences_record_group_collapsed_v1';
+    this._legacyStorageKeyRecordGroupCollapsed = null;
+    this._recordGroupCollapsed = this.loadRecordGroupCollapsedSetting();
 
     this._defaultSortBy = 'page_last_edited';
     this._defaultSortDir = 'desc';
@@ -747,6 +751,25 @@ class Plugin extends AppPlugin {
       this.setPropGroupCollapsed(propName, nextCollapsed);
       if (groupEl) groupEl.classList.toggle('tlr-prop-collapsed', nextCollapsed);
       actionEl.setAttribute?.('aria-expanded', nextCollapsed ? 'false' : 'true');
+      this.syncChevronIcon(actionEl.querySelector?.('.tlr-prop-caret') || null, nextCollapsed);
+      return;
+    }
+
+    if (action === 'toggle-record-group') {
+      const sectionId = this.normalizeRecordGroupSectionId(actionEl.dataset.groupSectionId);
+      const recordGuid = (actionEl.dataset.recordGuid || '').trim();
+      if (!sectionId || !recordGuid) return;
+
+      const groupEl = actionEl.closest?.('.tlr-group') || null;
+      const isCollapsed = groupEl ? groupEl.classList.contains('tlr-group-collapsed') : this.isRecordGroupCollapsed(sectionId, recordGuid);
+      const nextCollapsed = !isCollapsed;
+
+      this.setRecordGroupCollapsed(sectionId, recordGuid, nextCollapsed);
+      if (groupEl) groupEl.classList.toggle('tlr-group-collapsed', nextCollapsed);
+      actionEl.setAttribute?.('aria-expanded', nextCollapsed ? 'false' : 'true');
+      actionEl.title = nextCollapsed ? 'Expand' : 'Collapse';
+      actionEl.setAttribute?.('aria-label', nextCollapsed ? 'Expand' : 'Collapse');
+      this.syncChevronIcon(actionEl.querySelector?.('.tlr-group-caret') || null, nextCollapsed);
       return;
     }
 
@@ -2331,10 +2354,68 @@ class Plugin extends AppPlugin {
     return new Set();
   }
 
+  loadRecordGroupCollapsedSetting() {
+    const parse = (v) => {
+      if (typeof v !== 'string' || !v.trim()) return null;
+      try {
+        const parsed = JSON.parse(v);
+        if (!Array.isArray(parsed)) return null;
+
+        const out = new Set();
+        for (const x of parsed) {
+          if (typeof x !== 'string') continue;
+          const t = x.trim();
+          if (t) out.add(t);
+        }
+        return out;
+      } catch (e) {
+        // ignore
+      }
+      return null;
+    };
+
+    try {
+      const v = localStorage.getItem(this._storageKeyRecordGroupCollapsed);
+      const set = parse(v);
+      if (set) return set;
+    } catch (e) {
+      // ignore
+    }
+
+    try {
+      const legacyKey = this._legacyStorageKeyRecordGroupCollapsed;
+      if (legacyKey && legacyKey !== this._storageKeyRecordGroupCollapsed) {
+        const v = localStorage.getItem(legacyKey);
+        const set = parse(v);
+        if (set) {
+          try {
+            localStorage.setItem(this._storageKeyRecordGroupCollapsed, JSON.stringify(Array.from(set)));
+          } catch (e) {
+            // ignore
+          }
+          return set;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return new Set();
+  }
+
   savePropGroupCollapsedSetting() {
     try {
       const arr = Array.from(this._propGroupCollapsed || []);
       localStorage.setItem(this._storageKeyPropGroupCollapsed, JSON.stringify(arr));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  saveRecordGroupCollapsedSetting() {
+    try {
+      const arr = Array.from(this._recordGroupCollapsed || []);
+      localStorage.setItem(this._storageKeyRecordGroupCollapsed, JSON.stringify(arr));
     } catch (e) {
       // ignore
     }
@@ -2353,6 +2434,32 @@ class Plugin extends AppPlugin {
     if (collapsed === true) this._propGroupCollapsed.add(name);
     else this._propGroupCollapsed.delete(name);
     this.savePropGroupCollapsedSetting();
+  }
+
+  normalizeRecordGroupSectionId(sectionId) {
+    return sectionId === 'linked' || sectionId === 'unlinked' ? sectionId : null;
+  }
+
+  getRecordGroupCollapsedKey(sectionId, recordGuid) {
+    const normalizedSectionId = this.normalizeRecordGroupSectionId(sectionId);
+    const guid = typeof recordGuid === 'string' ? recordGuid.trim() : '';
+    if (!normalizedSectionId || !guid) return '';
+    return `${normalizedSectionId}:${guid}`;
+  }
+
+  isRecordGroupCollapsed(sectionId, recordGuid) {
+    const key = this.getRecordGroupCollapsedKey(sectionId, recordGuid);
+    if (!key) return false;
+    return this._recordGroupCollapsed?.has?.(key) === true;
+  }
+
+  setRecordGroupCollapsed(sectionId, recordGuid, collapsed) {
+    const key = this.getRecordGroupCollapsedKey(sectionId, recordGuid);
+    if (!key) return;
+    if (!this._recordGroupCollapsed) this._recordGroupCollapsed = new Set();
+    if (collapsed === true) this._recordGroupCollapsed.add(key);
+    else this._recordGroupCollapsed.delete(key);
+    this.saveRecordGroupCollapsedSetting();
   }
 
   loadSortByRecordSetting() {
@@ -4322,6 +4429,7 @@ class Plugin extends AppPlugin {
       this.appendError(linkedSection.bodyEl, linkedError);
     } else {
       this.appendLinkedReferenceGroups(linkedSection.bodyEl, linked, {
+        groupSectionId: 'linked',
         state,
         maxResults,
         query: highlightQuery,
@@ -4356,12 +4464,28 @@ class Plugin extends AppPlugin {
     }
 
     this.appendLinkedReferenceGroups(unlinkedSection.bodyEl, unlinked, {
+      groupSectionId: 'unlinked',
       state,
       maxResults,
       query: highlightQuery,
       totalLineCount: totalUnlinkedRefCount,
       emptyMessage: hasScopedView ? 'No matching unlinked references.' : 'No unlinked references.'
     });
+  }
+
+  buildChevronIcon(collapsed, extraClass) {
+    const iconEl = document.createElement('span');
+    iconEl.classList.add('ti', 'tlr-fold-icon');
+    if (extraClass) iconEl.classList.add(extraClass);
+    this.syncChevronIcon(iconEl, collapsed === true);
+    iconEl.setAttribute('aria-hidden', 'true');
+    return iconEl;
+  }
+
+  syncChevronIcon(iconEl, collapsed) {
+    if (!iconEl?.classList) return;
+    iconEl.classList.remove('ti-chevron-down', 'ti-chevron-right');
+    iconEl.classList.add(collapsed === true ? 'ti-chevron-right' : 'ti-chevron-down');
   }
 
   appendCollapsibleSection(container, state, { sectionId, title }) {
@@ -4475,9 +4599,7 @@ class Plugin extends AppPlugin {
       header.dataset.propName = propName;
       header.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
 
-      const caret = document.createElement('span');
-      caret.className = 'tlr-prop-caret';
-      caret.setAttribute('aria-hidden', 'true');
+      const caret = this.buildChevronIcon(isCollapsed, 'tlr-prop-caret');
 
       const title = document.createElement('div');
       title.className = 'tlr-prop-title';
@@ -4519,6 +4641,7 @@ class Plugin extends AppPlugin {
   appendLinkedReferenceGroups(container, groups, opts) {
     if (!container) return;
 
+    const groupSectionId = this.normalizeRecordGroupSectionId(opts?.groupSectionId) || 'linked';
     const state = opts?.state || null;
     const maxResults = opts?.maxResults || 0;
     const query = (opts?.query || '').trim();
@@ -4540,9 +4663,25 @@ class Plugin extends AppPlugin {
       const record = g.record || null;
       const recordGuid = record?.guid || null;
       if (!recordGuid) continue;
+      const groupCollapsed = this.isRecordGroupCollapsed(groupSectionId, recordGuid);
 
       const groupEl = document.createElement('div');
       groupEl.className = 'tlr-group';
+      if (groupCollapsed) groupEl.classList.add('tlr-group-collapsed');
+
+      const rowEl = document.createElement('div');
+      rowEl.className = 'tlr-group-row';
+
+      const toggleBtn = document.createElement('button');
+      toggleBtn.type = 'button';
+      toggleBtn.className = 'tlr-btn tlr-group-toggle button-none button-small button-minimal-hover';
+      toggleBtn.dataset.action = 'toggle-record-group';
+      toggleBtn.dataset.groupSectionId = groupSectionId;
+      toggleBtn.dataset.recordGuid = recordGuid;
+      toggleBtn.title = groupCollapsed ? 'Expand' : 'Collapse';
+      toggleBtn.setAttribute('aria-label', groupCollapsed ? 'Expand' : 'Collapse');
+      toggleBtn.setAttribute('aria-expanded', groupCollapsed ? 'false' : 'true');
+      toggleBtn.appendChild(this.buildChevronIcon(groupCollapsed, 'tlr-group-caret'));
 
       const header = document.createElement('button');
       header.type = 'button';
@@ -4560,6 +4699,9 @@ class Plugin extends AppPlugin {
 
       header.appendChild(title);
       header.appendChild(meta);
+
+      rowEl.appendChild(toggleBtn);
+      rowEl.appendChild(header);
 
       const linesEl = document.createElement('div');
       linesEl.className = 'tlr-lines';
@@ -4610,7 +4752,7 @@ class Plugin extends AppPlugin {
         linesEl.appendChild(entryEl);
       }
 
-      groupEl.appendChild(header);
+      groupEl.appendChild(rowEl);
       groupEl.appendChild(linesEl);
       container.appendChild(groupEl);
     }
@@ -5536,20 +5678,16 @@ class Plugin extends AppPlugin {
         text-align: left;
       }
 
-      .tlr-prop-caret {
-        width: 0;
-        height: 0;
-        border-top: 5px solid transparent;
-        border-bottom: 5px solid transparent;
-        border-left: 6px solid var(--text-muted, rgba(0, 0, 0, 0.6));
-        opacity: 0.85;
-        transform: rotate(90deg);
-        transition: transform 140ms ease;
+      .tlr-fold-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         flex: 0 0 auto;
-      }
-
-      .tlr-prop-collapsed .tlr-prop-caret {
-        transform: rotate(0deg);
+        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        opacity: 0.9;
+        font-size: 14px;
+        line-height: 1;
+        transition: transform 140ms ease, color 140ms ease, opacity 140ms ease;
       }
 
       .tlr-prop-collapsed .tlr-prop-records {
@@ -5594,14 +5732,35 @@ class Plugin extends AppPlugin {
 
       .tlr-group { margin: 12px 0 16px; }
 
+      .tlr-group-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .tlr-group-toggle {
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        text-align: center;
+        font-weight: 700;
+        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        flex: 0 0 auto;
+      }
+
       .tlr-group-header {
         width: 100%;
+        flex: 1 1 auto;
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 10px;
         padding: 8px 10px;
         text-align: left;
+      }
+
+      .tlr-group-collapsed .tlr-lines {
+        display: none;
       }
 
       .tlr-group-title {
