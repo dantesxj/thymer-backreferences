@@ -13,6 +13,10 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
 
 ![Backreferences footer screenshot](screenshots/screenshot-2026-03-09_17-20-23.png)
 
+## Credits
+
+- Credit to [@ahpatel](https://github.com/ahpatel) and the fork [ahpatel/thymer-backreferences](https://github.com/ahpatel/thymer-backreferences) for the unlinked references and collapsible header work that informed this plugin.
+
 ## What It Shows
 
 - **Property References**: references to the active note through record-link properties, grouped by property name.
