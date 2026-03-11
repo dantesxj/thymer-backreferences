@@ -4478,7 +4478,161 @@ class Plugin extends AppPlugin {
     return `${unit} ${noun}${unit === 1 ? '' : 's'}`;
   }
 
-  renderReferences(state, {
+  collectUniquePageGuids(propertyGroups, linkedGroups, unlinkedGroups) {
+    const guids = new Set();
+
+    for (const group of propertyGroups || []) {
+      for (const record of group?.records || []) {
+        const guid = record?.guid || null;
+        if (guid) guids.add(guid);
+      }
+    }
+
+    for (const group of linkedGroups || []) {
+      const guid = group?.record?.guid || null;
+      if (guid) guids.add(guid);
+    }
+
+    for (const group of unlinkedGroups || []) {
+      const guid = group?.record?.guid || null;
+      if (guid) guids.add(guid);
+    }
+
+    return guids;
+  }
+
+  filterPropertyGroupsByText(groups, textQueryLower) {
+    const nextGroups = [];
+    for (const group of groups || []) {
+      const propertyName = (group?.propertyName || '').trim();
+      if (!propertyName) continue;
+      const records = (group?.records || []).filter((record) => {
+        const name = (record?.getName?.() || '').toLowerCase();
+        return name.includes(textQueryLower);
+      });
+      if (records.length > 0) nextGroups.push({ propertyName, records });
+    }
+    return nextGroups;
+  }
+
+  filterLineGroupsByText(groups, textQueryLower) {
+    const nextGroups = [];
+    for (const group of groups || []) {
+      const record = group?.record || null;
+      const recordGuid = record?.guid || null;
+      if (!recordGuid) continue;
+      const lines = (group?.lines || []).filter((line) => {
+        const text = this.segmentsToPlainText(line?.segments || []);
+        return text.toLowerCase().includes(textQueryLower);
+      });
+      if (lines.length > 0) nextGroups.push({ record, lines });
+    }
+    return nextGroups;
+  }
+
+  filterReferenceGroupsForRender({
+    propsAll,
+    linkedAll,
+    unlinkedAll,
+    searchMode,
+    textQueryLower,
+    queryFilterState,
+    canApplyScopedQuery,
+    shouldScopeUnlinked
+  }) {
+    let props = propsAll;
+    let linked = linkedAll;
+    let unlinked = shouldScopeUnlinked ? unlinkedAll : [];
+
+    if (searchMode === 'query') {
+      if (canApplyScopedQuery) {
+        props = this.filterPropertyGroupsByScopedQuery(propsAll, queryFilterState);
+        linked = this.filterLineGroupsByScopedQuery(linkedAll, queryFilterState);
+        unlinked = shouldScopeUnlinked
+          ? this.filterLineGroupsByScopedQuery(unlinkedAll, queryFilterState)
+          : [];
+      }
+    } else if (textQueryLower) {
+      props = this.filterPropertyGroupsByText(props, textQueryLower);
+      linked = this.filterLineGroupsByText(linked, textQueryLower);
+      unlinked = this.filterLineGroupsByText(unlinked, textQueryLower);
+    }
+
+    return { props, linked, unlinked };
+  }
+
+  buildReferenceSummaryParts({
+    searchMode,
+    incompleteQueryDraft,
+    queryFilterState,
+    canApplyScopedQuery,
+    hasScopedView,
+    filteredUniquePagesSize,
+    totalUniquePagesSize,
+    filteredVisibleRefCount,
+    totalVisibleRefCount
+  }) {
+    const parts = [];
+
+    if (searchMode === 'query') {
+      if (incompleteQueryDraft) {
+        parts.push('Continue typing...');
+      } else if (queryFilterState?.error) {
+        parts.push('Invalid query');
+      } else if (queryFilterState?.loading === true && canApplyScopedQuery !== true) {
+        parts.push('Applying...');
+      }
+
+      if (canApplyScopedQuery) {
+        const pageLabel = this.formatCountLabel(filteredUniquePagesSize, 'page', {
+          totalCount: totalUniquePagesSize,
+          scoped: true
+        });
+        const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
+          totalCount: totalVisibleRefCount,
+          scoped: true
+        });
+        if (pageLabel) parts.push(pageLabel);
+        if (refLabel) parts.push(refLabel);
+      } else {
+        const pageLabel = this.formatCountLabel(totalUniquePagesSize, 'page');
+        const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
+        if (pageLabel) parts.push(pageLabel);
+        if (refLabel) parts.push(refLabel);
+      }
+      return parts;
+    }
+
+    if (hasScopedView) {
+      const pageLabel = this.formatCountLabel(filteredUniquePagesSize, 'page', {
+        totalCount: totalUniquePagesSize,
+        scoped: true
+      });
+      const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
+        totalCount: totalVisibleRefCount,
+        scoped: true
+      });
+      if (pageLabel) parts.push(pageLabel);
+      if (refLabel) parts.push(refLabel);
+      return parts;
+    }
+
+    const pageLabel = this.formatCountLabel(totalUniquePagesSize, 'page');
+    const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
+    if (pageLabel) parts.push(pageLabel);
+    if (refLabel) parts.push(refLabel);
+    return parts;
+  }
+
+  buildReferenceSectionMeta(visibleCount, totalCount, showScopedCounts) {
+    return this.formatCountLabel(visibleCount, 'ref', {
+      totalCount: showScopedCounts ? totalCount : null,
+      scoped: showScopedCounts,
+      includeZero: true
+    });
+  }
+
+  buildReferenceViewState(state, {
     propertyGroups,
     propertyError,
     linkedGroups,
@@ -4489,11 +4643,6 @@ class Plugin extends AppPlugin {
     unlinkedLoading,
     maxResults
   }) {
-    if (!state?.bodyEl || !state?.countEl) return;
-
-    const body = state.bodyEl;
-    body.innerHTML = '';
-
     const query = (state.searchQuery || '').trim();
     const searchMode = this.getSearchMode(query);
     const incompleteQueryDraft = searchMode === 'query' && this.isIncompleteQueryDraft(query);
@@ -4509,7 +4658,7 @@ class Plugin extends AppPlugin {
     const linkedAll = Array.isArray(linkedGroups) ? linkedGroups : [];
     const unlinkedAll = Array.isArray(unlinkedGroups) ? unlinkedGroups : [];
 
-    const totalPropRefCount = propsAll.reduce((n, g) => n + (g?.records?.length || 0), 0);
+    const totalPropRefCount = propsAll.reduce((total, group) => total + (group?.records?.length || 0), 0);
     const totalLinkedRefCount = this.countLinkedReferences(linkedAll);
     const totalUnlinkedRefCount = this.countLinkedReferences(unlinkedAll);
     const collapseMetrics = {
@@ -4532,88 +4681,20 @@ class Plugin extends AppPlugin {
       && state.emptyStateExpanded !== true
       && unlinkedDeferred !== true;
 
-    this.syncFooterCollapsedState(state, this.isFooterCollapsed(state, collapseMetrics));
+    const totalUniquePages = this.collectUniquePageGuids(propsAll, linkedAll, unlinkedAll);
+    const filteredGroups = this.filterReferenceGroupsForRender({
+      propsAll,
+      linkedAll,
+      unlinkedAll,
+      searchMode,
+      textQueryLower,
+      queryFilterState,
+      canApplyScopedQuery,
+      shouldScopeUnlinked
+    });
 
-    if (useCompactEmpty) {
-      state.rootEl?.classList?.add('tlr-empty-compact');
-      this.setFilterMenuOpen(state, false);
-      this.setSortMenuOpen(state, false);
-      state.countEl.textContent = 'No references yet';
-      this.appendCompactEmptyState(body);
-      return;
-    }
-
-    state.rootEl?.classList?.remove('tlr-empty-compact');
-
-    const totalUniquePages = new Set();
-    for (const g of propsAll) {
-      for (const r of g?.records || []) {
-        const guid = r?.guid || null;
-        if (guid) totalUniquePages.add(guid);
-      }
-    }
-    for (const g of linkedAll) {
-      const guid = g?.record?.guid || null;
-      if (guid) totalUniquePages.add(guid);
-    }
-    for (const g of unlinkedAll) {
-      const guid = g?.record?.guid || null;
-      if (guid) totalUniquePages.add(guid);
-    }
-
-    let props = propsAll;
-    let linked = linkedAll;
-    let unlinked = shouldScopeUnlinked ? unlinkedAll : [];
-
-    if (searchMode === 'query') {
-      if (canApplyScopedQuery) {
-        props = this.filterPropertyGroupsByScopedQuery(propsAll, queryFilterState);
-        linked = this.filterLineGroupsByScopedQuery(linkedAll, queryFilterState);
-        unlinked = shouldScopeUnlinked
-          ? this.filterLineGroupsByScopedQuery(unlinkedAll, queryFilterState)
-          : [];
-      }
-    } else if (textQueryLower) {
-      const nextProps = [];
-      for (const g of props) {
-        const propertyName = (g?.propertyName || '').trim();
-        if (!propertyName) continue;
-        const recs = (g?.records || []).filter((r) => {
-          const name = (r?.getName?.() || '').toLowerCase();
-          return name.includes(textQueryLower);
-        });
-        if (recs.length > 0) nextProps.push({ propertyName, records: recs });
-      }
-      props = nextProps;
-
-      const nextLinked = [];
-      for (const g of linked) {
-        const record = g?.record || null;
-        const recordGuid = record?.guid || null;
-        if (!recordGuid) continue;
-        const lines = (g?.lines || []).filter((line) => {
-          const text = this.segmentsToPlainText(line?.segments || []);
-          return text.toLowerCase().includes(textQueryLower);
-        });
-        if (lines.length > 0) nextLinked.push({ record, lines });
-      }
-      linked = nextLinked;
-
-      const nextUnlinked = [];
-      for (const g of unlinked) {
-        const record = g?.record || null;
-        const recordGuid = record?.guid || null;
-        if (!recordGuid) continue;
-        const lines = (g?.lines || []).filter((line) => {
-          const text = this.segmentsToPlainText(line?.segments || []);
-          return text.toLowerCase().includes(textQueryLower);
-        });
-        if (lines.length > 0) nextUnlinked.push({ record, lines });
-      }
-      unlinked = nextUnlinked;
-    }
-
-    const filteredPropRefCount = props.reduce((n, g) => n + (g?.records?.length || 0), 0);
+    let { props, linked, unlinked } = filteredGroups;
+    const filteredPropRefCount = props.reduce((total, group) => total + (group?.records?.length || 0), 0);
     const filteredLinkedRefCount = this.countLinkedReferences(linked);
     const filteredUnlinkedRefCount = this.countLinkedReferences(unlinked);
     const hasScopedView = (searchMode === 'text' && Boolean(textQueryLower)) || (searchMode === 'query' && canApplyScopedQuery);
@@ -4621,25 +4702,7 @@ class Plugin extends AppPlugin {
     const showScopedCounts = hasScopedView || (searchMode === 'query' && canApplyScopedQuery);
     const totalVisibleRefCount = totalPropRefCount + totalLinkedRefCount + (showUnlinkedCounts ? totalUnlinkedRefCount : 0);
     const filteredVisibleRefCount = filteredPropRefCount + filteredLinkedRefCount + (showUnlinkedCounts ? filteredUnlinkedRefCount : 0);
-    const propertySectionCollapsed = this.isSectionCollapsed(state, 'property', collapseMetrics);
-    const linkedSectionCollapsed = this.isSectionCollapsed(state, 'linked', collapseMetrics);
-    const unlinkedSectionCollapsed = this.isSectionCollapsed(state, 'unlinked', collapseMetrics);
-
-    const filteredUniquePages = new Set();
-    for (const g of props) {
-      for (const r of g?.records || []) {
-        const guid = r?.guid || null;
-        if (guid) filteredUniquePages.add(guid);
-      }
-    }
-    for (const g of linked) {
-      const guid = g?.record?.guid || null;
-      if (guid) filteredUniquePages.add(guid);
-    }
-    for (const g of unlinked) {
-      const guid = g?.record?.guid || null;
-      if (guid) filteredUniquePages.add(guid);
-    }
+    const filteredUniquePages = this.collectUniquePageGuids(props, linked, unlinked);
 
     const sortSpec = {
       sortBy: this.normalizeSortBy(state?.sortBy) || this._defaultSortBy,
@@ -4650,148 +4713,216 @@ class Plugin extends AppPlugin {
     linked = this.sortLinkedGroupsForRender(linked, sortSpec, sortMetrics);
     unlinked = this.sortLinkedGroupsForRender(unlinked, sortSpec, sortMetrics);
 
-    const parts = [];
-    if (searchMode === 'query') {
-      if (incompleteQueryDraft) {
-        parts.push('Continue typing...');
-      } else if (queryFilterState?.error) {
-        parts.push('Invalid query');
-      } else if (queryFilterState?.loading === true && canApplyScopedQuery !== true) {
-        parts.push('Applying...');
-      }
+    return {
+      searchMode,
+      incompleteQueryDraft,
+      queryFilterState,
+      canApplyScopedQuery,
+      shouldScopeUnlinked,
+      highlightQuery,
+      props,
+      linked,
+      unlinked,
+      propertyError,
+      linkedError,
+      unlinkedError,
+      unlinkedDeferred,
+      unlinkedLoading,
+      maxResults,
+      totalPropRefCount,
+      totalLinkedRefCount,
+      totalUnlinkedRefCount,
+      filteredPropRefCount,
+      filteredLinkedRefCount,
+      filteredUnlinkedRefCount,
+      totalVisibleRefCount,
+      filteredVisibleRefCount,
+      totalUniquePagesSize: totalUniquePages.size,
+      filteredUniquePagesSize: filteredUniquePages.size,
+      collapseMetrics,
+      useCompactEmpty,
+      hasScopedView,
+      showUnlinkedCounts,
+      showScopedCounts,
+      propertySectionCollapsed: this.isSectionCollapsed(state, 'property', collapseMetrics),
+      linkedSectionCollapsed: this.isSectionCollapsed(state, 'linked', collapseMetrics),
+      unlinkedSectionCollapsed: this.isSectionCollapsed(state, 'unlinked', collapseMetrics),
+      summaryText: this.buildReferenceSummaryParts({
+        searchMode,
+        incompleteQueryDraft,
+        queryFilterState,
+        canApplyScopedQuery,
+        hasScopedView,
+        filteredUniquePagesSize: filteredUniquePages.size,
+        totalUniquePagesSize: totalUniquePages.size,
+        filteredVisibleRefCount,
+        totalVisibleRefCount
+      }).join(' | ')
+    };
+  }
 
-      if (canApplyScopedQuery) {
-        const pageLabel = this.formatCountLabel(filteredUniquePages.size, 'page', {
-          totalCount: totalUniquePages.size,
-          scoped: true
-        });
-        const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
-          totalCount: totalVisibleRefCount,
-          scoped: true
-        });
-        if (pageLabel) parts.push(pageLabel);
-        if (refLabel) parts.push(refLabel);
-      } else {
-        const pageLabel = this.formatCountLabel(totalUniquePages.size, 'page');
-        const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
-        if (pageLabel) parts.push(pageLabel);
-        if (refLabel) parts.push(refLabel);
-      }
-    } else if (hasScopedView) {
-      const pageLabel = this.formatCountLabel(filteredUniquePages.size, 'page', {
-        totalCount: totalUniquePages.size,
-        scoped: true
-      });
-      const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
-        totalCount: totalVisibleRefCount,
-        scoped: true
-      });
-      if (pageLabel) parts.push(pageLabel);
-      if (refLabel) parts.push(refLabel);
-    } else {
-      const pageLabel = this.formatCountLabel(totalUniquePages.size, 'page');
-      const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
-      if (pageLabel) parts.push(pageLabel);
-      if (refLabel) parts.push(refLabel);
-    }
-    state.countEl.textContent = parts.join(' | ');
-
-    if (searchMode === 'query' && incompleteQueryDraft) {
+  appendReferenceStatus(body, viewState) {
+    if (viewState.searchMode === 'query' && viewState.incompleteQueryDraft) {
       this.appendNote(body, 'Finish the query to filter the current backreferences.');
-    } else if (searchMode === 'query' && queryFilterState?.error) {
-      this.appendError(body, queryFilterState.error);
-    } else if (searchMode === 'query' && queryFilterState?.loading === true) {
-      this.appendNote(body, canApplyScopedQuery ? 'Refreshing query results...' : 'Applying query to current backreferences...');
+    } else if (viewState.searchMode === 'query' && viewState.queryFilterState?.error) {
+      this.appendError(body, viewState.queryFilterState.error);
+    } else if (viewState.searchMode === 'query' && viewState.queryFilterState?.loading === true) {
+      this.appendNote(
+        body,
+        viewState.canApplyScopedQuery
+          ? 'Refreshing query results...'
+          : 'Applying query to current backreferences...'
+      );
     }
+  }
 
-    const propertySection = this.appendCollapsibleSection(body, state, {
+  renderPropertyReferenceSection(body, state, viewState) {
+    const section = this.appendCollapsibleSection(body, state, {
       sectionId: 'property',
       title: 'Property References',
-      collapsed: propertySectionCollapsed,
-      meta: this.formatCountLabel(showScopedCounts ? filteredPropRefCount : totalPropRefCount, 'ref', {
-        totalCount: showScopedCounts ? totalPropRefCount : null,
-        scoped: showScopedCounts,
-        includeZero: true
-      })
-    });
-    if (propertyError) {
-      this.appendError(propertySection.bodyEl, propertyError);
-    } else if (props.length === 0) {
-      this.appendEmpty(propertySection.bodyEl, hasScopedView ? 'No matching property references.' : 'No property references.');
-    } else {
-      this.appendPropertyReferenceGroups(propertySection.bodyEl, props, { query: highlightQuery, state });
-    }
-
-    const divider = document.createElement('div');
-    divider.className = 'tlr-divider';
-    body.appendChild(divider);
-    const linkedSection = this.appendCollapsibleSection(body, state, {
-      sectionId: 'linked',
-      title: 'Linked References',
-      collapsed: linkedSectionCollapsed,
-      meta: this.formatCountLabel(showScopedCounts ? filteredLinkedRefCount : totalLinkedRefCount, 'ref', {
-        totalCount: showScopedCounts ? totalLinkedRefCount : null,
-        scoped: showScopedCounts,
-        includeZero: true
-      })
-    });
-
-    if (linkedError) {
-      this.appendError(linkedSection.bodyEl, linkedError);
-    } else {
-      this.appendLinkedReferenceGroups(linkedSection.bodyEl, linked, {
-        groupSectionId: 'linked',
-        state,
-        maxResults,
-        query: highlightQuery,
-        totalLineCount: totalLinkedRefCount,
-        emptyMessage: hasScopedView ? 'No matching linked references.' : 'No linked references.'
-      });
-    }
-
-    const unlinkedDivider = document.createElement('div');
-    unlinkedDivider.className = 'tlr-divider';
-    body.appendChild(unlinkedDivider);
-    const unlinkedSection = this.appendCollapsibleSection(body, state, {
-      sectionId: 'unlinked',
-      title: 'Unlinked References',
-      collapsed: unlinkedSectionCollapsed,
-      meta: this.formatCountLabel(
-        showScopedCounts && showUnlinkedCounts ? filteredUnlinkedRefCount : totalUnlinkedRefCount,
-        'ref',
-        {
-          totalCount: showScopedCounts && showUnlinkedCounts ? totalUnlinkedRefCount : null,
-          scoped: showScopedCounts && showUnlinkedCounts,
-          includeZero: true
-        }
+      collapsed: viewState.propertySectionCollapsed,
+      meta: this.buildReferenceSectionMeta(
+        viewState.showScopedCounts ? viewState.filteredPropRefCount : viewState.totalPropRefCount,
+        viewState.totalPropRefCount,
+        viewState.showScopedCounts
       )
     });
 
-    if (unlinkedLoading) {
-      this.appendNote(unlinkedSection.bodyEl, 'Loading unlinked references...');
+    if (viewState.propertyError) {
+      this.appendError(section.bodyEl, viewState.propertyError);
+    } else if (viewState.props.length === 0) {
+      this.appendEmpty(
+        section.bodyEl,
+        viewState.hasScopedView ? 'No matching property references.' : 'No property references.'
+      );
+    } else {
+      this.appendPropertyReferenceGroups(section.bodyEl, viewState.props, {
+        query: viewState.highlightQuery,
+        state
+      });
+    }
+  }
+
+  renderLinkedReferenceSection(body, state, viewState) {
+    const section = this.appendCollapsibleSection(body, state, {
+      sectionId: 'linked',
+      title: 'Linked References',
+      collapsed: viewState.linkedSectionCollapsed,
+      meta: this.buildReferenceSectionMeta(
+        viewState.showScopedCounts ? viewState.filteredLinkedRefCount : viewState.totalLinkedRefCount,
+        viewState.totalLinkedRefCount,
+        viewState.showScopedCounts
+      )
+    });
+
+    if (viewState.linkedError) {
+      this.appendError(section.bodyEl, viewState.linkedError);
+    } else {
+      this.appendLinkedReferenceGroups(section.bodyEl, viewState.linked, {
+        groupSectionId: 'linked',
+        state,
+        maxResults: viewState.maxResults,
+        query: viewState.highlightQuery,
+        totalLineCount: viewState.totalLinkedRefCount,
+        emptyMessage: viewState.hasScopedView ? 'No matching linked references.' : 'No linked references.'
+      });
+    }
+  }
+
+  renderUnlinkedReferenceSection(body, state, viewState) {
+    const section = this.appendCollapsibleSection(body, state, {
+      sectionId: 'unlinked',
+      title: 'Unlinked References',
+      collapsed: viewState.unlinkedSectionCollapsed,
+      meta: this.buildReferenceSectionMeta(
+        viewState.showScopedCounts && viewState.showUnlinkedCounts
+          ? viewState.filteredUnlinkedRefCount
+          : viewState.totalUnlinkedRefCount,
+        viewState.totalUnlinkedRefCount,
+        viewState.showScopedCounts && viewState.showUnlinkedCounts
+      )
+    });
+
+    if (viewState.unlinkedLoading) {
+      this.appendNote(section.bodyEl, 'Loading unlinked references...');
       return;
     }
 
-    if (unlinkedError) {
-      this.appendError(unlinkedSection.bodyEl, unlinkedError);
+    if (viewState.unlinkedError) {
+      this.appendError(section.bodyEl, viewState.unlinkedError);
       return;
     }
 
-    if (unlinkedDeferred) {
-      if (!unlinkedSectionCollapsed) {
-        this.appendNote(unlinkedSection.bodyEl, 'Loading unlinked references...');
+    if (viewState.unlinkedDeferred) {
+      if (!viewState.unlinkedSectionCollapsed) {
+        this.appendNote(section.bodyEl, 'Loading unlinked references...');
       }
       return;
     }
 
-    this.appendLinkedReferenceGroups(unlinkedSection.bodyEl, unlinked, {
+    this.appendLinkedReferenceGroups(section.bodyEl, viewState.unlinked, {
       groupSectionId: 'unlinked',
       state,
-      maxResults,
-      query: highlightQuery,
-      totalLineCount: totalUnlinkedRefCount,
-      emptyMessage: hasScopedView ? 'No matching unlinked references.' : 'No unlinked references.'
+      maxResults: viewState.maxResults,
+      query: viewState.highlightQuery,
+      totalLineCount: viewState.totalUnlinkedRefCount,
+      emptyMessage: viewState.hasScopedView ? 'No matching unlinked references.' : 'No unlinked references.'
     });
+  }
+
+  appendReferenceDivider(container) {
+    const divider = document.createElement('div');
+    divider.className = 'tlr-divider';
+    container.appendChild(divider);
+  }
+
+  renderReferences(state, {
+    propertyGroups,
+    propertyError,
+    linkedGroups,
+    linkedError,
+    unlinkedGroups,
+    unlinkedError,
+    unlinkedDeferred,
+    unlinkedLoading,
+    maxResults
+  }) {
+    if (!state?.bodyEl || !state?.countEl) return;
+
+    const body = state.bodyEl;
+    body.innerHTML = '';
+
+    const viewState = this.buildReferenceViewState(state, {
+      propertyGroups,
+      propertyError,
+      linkedGroups,
+      linkedError,
+      unlinkedGroups,
+      unlinkedError,
+      unlinkedDeferred,
+      unlinkedLoading,
+      maxResults
+    });
+
+    this.syncFooterCollapsedState(state, this.isFooterCollapsed(state, viewState.collapseMetrics));
+
+    if (viewState.useCompactEmpty) {
+      state.rootEl?.classList?.add('tlr-empty-compact');
+      this.setFilterMenuOpen(state, false);
+      this.setSortMenuOpen(state, false);
+      state.countEl.textContent = 'No references yet';
+      this.appendCompactEmptyState(body);
+      return;
+    }
+
+    state.rootEl?.classList?.remove('tlr-empty-compact');
+    state.countEl.textContent = viewState.summaryText;
+    this.appendReferenceStatus(body, viewState);
+    this.renderPropertyReferenceSection(body, state, viewState);
+    this.appendReferenceDivider(body);
+    this.renderLinkedReferenceSection(body, state, viewState);
+    this.appendReferenceDivider(body);
+    this.renderUnlinkedReferenceSection(body, state, viewState);
   }
 
   buildChevronIcon(collapsed, extraClass) {
