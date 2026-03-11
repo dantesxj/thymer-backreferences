@@ -3103,6 +3103,152 @@ class Plugin extends AppPlugin {
     }
   }
 
+  getRefreshConfig() {
+    const cfg = this.getConfiguration?.() || {};
+    return {
+      maxResults: this.coercePositiveInt(cfg.custom?.maxResults, this._defaultMaxResults),
+      showSelf: cfg.custom?.showSelf === true
+    };
+  }
+
+  isRefreshStateCurrent(panelId, state, seq) {
+    if (!panelId || !state) return false;
+    if (!this._panelStates.has(panelId)) return false;
+    return state.refreshSeq === seq;
+  }
+
+  async runLinkedReferenceSearch(recordGuid, maxResults) {
+    try {
+      return {
+        status: 'fulfilled',
+        value: await this.data.searchByQuery(`@linkto = "${recordGuid}"`, maxResults)
+      };
+    } catch (e) {
+      return {
+        status: 'rejected',
+        reason: e
+      };
+    }
+  }
+
+  resolveLinkedReferenceSearch(searchSettled, recordGuid, { showSelf }) {
+    let linkedError = '';
+    let linkedGroups = [];
+    let propertyCandidateRecords = null;
+
+    if (searchSettled?.status === 'fulfilled') {
+      const result = searchSettled.value;
+      if (result?.error) {
+        linkedError = result.error;
+      } else {
+        const lines = Array.isArray(result?.lines) ? result.lines : [];
+        propertyCandidateRecords = Array.isArray(result?.records) ? result.records : null;
+        linkedGroups = this.groupBacklinkLines(lines, recordGuid, { showSelf });
+      }
+    } else {
+      linkedError = 'Error loading linked references.';
+    }
+
+    return { linkedError, linkedGroups, propertyCandidateRecords };
+  }
+
+  async loadUnlinkedReferenceGroups(recordName, maxResults, { recordGuid, linkedGroups, showSelf }) {
+    try {
+      const result = await this.data.searchByQuery(recordName, maxResults);
+      if (result?.error) {
+        return { unlinkedError: result.error, unlinkedGroups: [] };
+      }
+
+      const lines = Array.isArray(result?.lines) ? result.lines : [];
+      return {
+        unlinkedError: '',
+        unlinkedGroups: this.groupUnlinkedReferenceLines(lines, linkedGroups, recordGuid, recordName, { showSelf })
+      };
+    } catch (e) {
+      return {
+        unlinkedError: 'Error loading unlinked references.',
+        unlinkedGroups: []
+      };
+    }
+  }
+
+  async loadFollowupReferenceResults(state, record, {
+    recordGuid,
+    recordName,
+    maxResults,
+    showSelf,
+    propertyCandidateRecords,
+    linkedGroups
+  }) {
+    const shouldLoadUnlinked = Boolean(recordName) && !this.isSectionCollapsed(state, 'unlinked');
+    const followupPromises = [
+      this.getPropertyBacklinkGroups(record, recordGuid, {
+        showSelf,
+        candidateRecords: propertyCandidateRecords
+      })
+    ];
+
+    if (shouldLoadUnlinked) {
+      followupPromises.push(
+        this.loadUnlinkedReferenceGroups(recordName, maxResults, {
+          recordGuid,
+          linkedGroups,
+          showSelf
+        })
+      );
+    }
+
+    const [propertySettled, unlinkedSettled] = await Promise.allSettled(followupPromises);
+
+    let propertyError = '';
+    let propertyGroups = [];
+    if (propertySettled.status === 'fulfilled') {
+      propertyGroups = Array.isArray(propertySettled.value) ? propertySettled.value : [];
+    } else {
+      propertyError = 'Error loading property references.';
+    }
+
+    const unlinkedDeferred = Boolean(recordName) && !shouldLoadUnlinked;
+    let unlinkedError = '';
+    let unlinkedGroups = [];
+    if (recordName && shouldLoadUnlinked) {
+      if (unlinkedSettled.status === 'fulfilled') {
+        unlinkedError = unlinkedSettled.value?.unlinkedError || '';
+        unlinkedGroups = Array.isArray(unlinkedSettled.value?.unlinkedGroups)
+          ? unlinkedSettled.value.unlinkedGroups
+          : [];
+      } else {
+        unlinkedError = 'Error loading unlinked references.';
+      }
+    }
+
+    return {
+      propertyError,
+      propertyGroups,
+      unlinkedError,
+      unlinkedGroups,
+      unlinkedDeferred,
+      unlinkedLoading: false,
+      maxResults
+    };
+  }
+
+  applyRefreshedResults(state, results, { reason } = {}) {
+    state.filterMetaLoading = false;
+    this.syncFilterControlState(state);
+
+    state.lastResults = results;
+    this.syncScopedQueryWithCurrentInput(state, { immediate: true, reason: reason || 'refresh' });
+    this.applyLiveSnapshot(state, this.buildResultsSnapshot(results.propertyGroups, results.linkedGroups));
+    this.invalidateLinkedContextCache(state);
+    this.renderFromCache(state);
+    if (state.lastResults?.unlinkedDeferred === true && !this.isSectionCollapsed(state, 'unlinked')) {
+      this.ensureDeferredUnlinkedLoaded(state).catch(() => {
+        // ignore
+      });
+    }
+  }
+
   async refreshPanel(panelId, { reason }) {
     const state = this._panelStates.get(panelId) || null;
     const panel = state?.panel || null;
@@ -3126,108 +3272,35 @@ class Plugin extends AppPlugin {
 
     this.setLoadingState(state, true);
 
-    const cfg = this.getConfiguration?.() || {};
-    const maxResults = this.coercePositiveInt(cfg.custom?.maxResults, this._defaultMaxResults);
-    const showSelf = cfg.custom?.showSelf === true;
+    const { maxResults, showSelf } = this.getRefreshConfig();
 
     const recordName = (record?.getName?.() || '').trim();
-    const query = `@linkto = "${recordGuid}"`;
+    const searchSettled = await this.runLinkedReferenceSearch(recordGuid, maxResults);
 
-    let searchSettled;
-    try {
-      searchSettled = {
-        status: 'fulfilled',
-        value: await this.data.searchByQuery(query, maxResults)
-      };
-    } catch (e) {
-      searchSettled = {
-        status: 'rejected',
-        reason: e
-      };
-    }
+    if (!this.isRefreshStateCurrent(panelId, state, seq)) return;
 
-    if (!this._panelStates.has(panelId) || state.refreshSeq !== seq) return;
+    const { linkedError, linkedGroups, propertyCandidateRecords } = this.resolveLinkedReferenceSearch(
+      searchSettled,
+      recordGuid,
+      { showSelf }
+    );
 
-    let linkedError = '';
-    let linkedGroups = [];
-    let propertyCandidateRecords = null;
-    if (searchSettled.status === 'fulfilled') {
-      const result = searchSettled.value;
-      if (result?.error) {
-        linkedError = result.error;
-      } else {
-        const lines = Array.isArray(result?.lines) ? result.lines : [];
-        propertyCandidateRecords = Array.isArray(result?.records) ? result.records : null;
-        linkedGroups = this.groupBacklinkLines(lines, recordGuid, { showSelf });
-      }
-    } else {
-      linkedError = 'Error loading linked references.';
-    }
+    const followupResults = await this.loadFollowupReferenceResults(state, record, {
+      recordGuid,
+      recordName,
+      maxResults,
+      showSelf,
+      propertyCandidateRecords,
+      linkedGroups
+    });
 
-    const shouldLoadUnlinked = Boolean(recordName) && !this.isSectionCollapsed(state, 'unlinked');
-    const followupPromises = [
-      this.getPropertyBacklinkGroups(record, recordGuid, {
-        showSelf,
-        candidateRecords: propertyCandidateRecords
-      })
-    ];
-    if (shouldLoadUnlinked) {
-      followupPromises.push(this.data.searchByQuery(recordName, maxResults));
-    }
-    const [propertySettled, unlinkedSettled] = await Promise.allSettled(followupPromises);
+    if (!this.isRefreshStateCurrent(panelId, state, seq)) return;
 
-    if (!this._panelStates.has(panelId) || state.refreshSeq !== seq) return;
-
-    let propertyError = '';
-    let propertyGroups = [];
-    if (propertySettled.status === 'fulfilled') {
-      propertyGroups = Array.isArray(propertySettled.value) ? propertySettled.value : [];
-    } else {
-      propertyError = 'Error loading property references.';
-    }
-
-    let unlinkedError = '';
-    let unlinkedGroups = [];
-    const unlinkedDeferred = Boolean(recordName) && !shouldLoadUnlinked;
-    if (recordName && shouldLoadUnlinked) {
-      if (unlinkedSettled.status === 'fulfilled') {
-        const result = unlinkedSettled.value;
-        if (result?.error) {
-          unlinkedError = result.error;
-        } else {
-          const lines = Array.isArray(result?.lines) ? result.lines : [];
-          unlinkedGroups = this.groupUnlinkedReferenceLines(lines, linkedGroups, recordGuid, recordName, { showSelf });
-        }
-      } else {
-        unlinkedError = 'Error loading unlinked references.';
-      }
-    }
-
-    if (!this._panelStates.has(panelId) || state.refreshSeq !== seq) return;
-
-    state.filterMetaLoading = false;
-    this.syncFilterControlState(state);
-
-    state.lastResults = {
-      propertyGroups,
-      propertyError,
+    this.applyRefreshedResults(state, {
+      ...followupResults,
       linkedGroups,
-      linkedError,
-      unlinkedGroups,
-      unlinkedError,
-      unlinkedDeferred,
-      unlinkedLoading: false,
-      maxResults
-    };
-    this.syncScopedQueryWithCurrentInput(state, { immediate: true, reason: reason || 'refresh' });
-    this.applyLiveSnapshot(state, this.buildResultsSnapshot(propertyGroups, linkedGroups));
-    this.invalidateLinkedContextCache(state);
-    this.renderFromCache(state);
-    if (state.lastResults?.unlinkedDeferred === true && !this.isSectionCollapsed(state, 'unlinked')) {
-      this.ensureDeferredUnlinkedLoaded(state).catch(() => {
-        // ignore
-      });
-    }
+      linkedError
+    }, { reason: reason || 'refresh' });
     this.setLoadingState(state, false);
     this.syncStatusItem();
   }
@@ -3249,29 +3322,16 @@ class Plugin extends AppPlugin {
     results.unlinkedError = '';
     this.renderFromCache(state);
 
-    const cfg = this.getConfiguration?.() || {};
-    const maxResults = this.coercePositiveInt(cfg.custom?.maxResults, this._defaultMaxResults);
-    const showSelf = cfg.custom?.showSelf === true;
-
-    let nextGroups = [];
-    let nextError = '';
-    try {
-      const result = await this.data.searchByQuery(recordName, maxResults);
-      if (result?.error) {
-        nextError = result.error;
-      } else {
-        const lines = Array.isArray(result?.lines) ? result.lines : [];
-        nextGroups = this.groupUnlinkedReferenceLines(
-          lines,
-          Array.isArray(results.linkedGroups) ? results.linkedGroups : [],
-          recordGuid,
-          recordName,
-          { showSelf }
-        );
+    const { maxResults, showSelf } = this.getRefreshConfig();
+    const { unlinkedGroups: nextGroups, unlinkedError: nextError } = await this.loadUnlinkedReferenceGroups(
+      recordName,
+      maxResults,
+      {
+        recordGuid,
+        linkedGroups: Array.isArray(results.linkedGroups) ? results.linkedGroups : [],
+        showSelf
       }
-    } catch (e) {
-      nextError = 'Error loading unlinked references.';
-    }
+    );
 
     if (!this._panelStates.has(state.panelId)) return;
     if (state.lastResults !== results) return;
