@@ -1,7 +1,7 @@
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
-    this._version = '0.4.38';
+    this._version = '0.4.39';
     this._pluginName = 'Backreferences';
 
     this._panelStates = new Map();
@@ -280,6 +280,7 @@ class Plugin extends AppPlugin {
       sortDir: this._defaultSortDir,
       sortMenuOpen: false,
       sortMenuDismissHandler: null,
+      sortMenuKeyHandler: null,
       queryFilterTimer: null,
       queryFilterSeq: 0,
       queryFilterState: null,
@@ -394,8 +395,11 @@ class Plugin extends AppPlugin {
     root.className = 'tlr-footer form-field-group';
     root.dataset.panelId = state.panelId;
 
+    const headerField = document.createElement('div');
+    headerField.className = 'tlr-header-field form-field';
+
     const header = document.createElement('div');
-    header.className = 'tlr-header';
+    header.className = 'tlr-header form-field-row';
 
     const headerMain = document.createElement('div');
     headerMain.className = 'tlr-header-main';
@@ -429,6 +433,7 @@ class Plugin extends AppPlugin {
     filterToggle.type = 'button';
     filterToggle.dataset.action = 'toggle-search';
     filterToggle.setAttribute('aria-expanded', state.searchOpen === true ? 'true' : 'false');
+    filterToggle.setAttribute('aria-label', 'Filter');
     filterToggle.setAttribute('data-tooltip', 'Filter');
     filterToggle.setAttribute('data-tooltip-dir', 'top');
     try {
@@ -441,7 +446,10 @@ class Plugin extends AppPlugin {
     filterWrap.appendChild(filterToggle);
 
     const searchRow = document.createElement('div');
-    searchRow.className = 'tlr-search-row';
+    searchRow.className = 'tlr-search-row form-field';
+
+    const searchRowInner = document.createElement('div');
+    searchRowInner.className = 'tlr-search-row-inner form-field-row';
 
     const searchWrap = document.createElement('div');
     searchWrap.className = 'tlr-search-wrap tlr-query-input query-input';
@@ -556,6 +564,7 @@ class Plugin extends AppPlugin {
     clearBtn.className = 'tlr-search-clear query-input--clear-btn button-none button-small button-minimal-hover tooltip';
     clearBtn.type = 'button';
     clearBtn.dataset.action = 'clear-search';
+    clearBtn.setAttribute('aria-label', 'Clear search');
     clearBtn.setAttribute('data-tooltip', 'Clear search');
     clearBtn.setAttribute('data-tooltip-dir', 'top');
     try {
@@ -568,6 +577,7 @@ class Plugin extends AppPlugin {
     refreshBtn.className = 'tlr-search-refresh query-input--refresh-btn button-none button-small button-minimal-hover tooltip';
     refreshBtn.type = 'button';
     refreshBtn.dataset.action = 'refresh-search';
+    refreshBtn.setAttribute('aria-label', 'Refresh now');
     refreshBtn.setAttribute('data-tooltip', 'Refresh now');
     refreshBtn.setAttribute('data-tooltip-dir', 'top');
     try {
@@ -594,6 +604,7 @@ class Plugin extends AppPlugin {
     sortToggle.className = 'tlr-btn tlr-sort-toggle button-none button-small button-minimal-hover';
     sortToggle.type = 'button';
     sortToggle.dataset.action = 'toggle-sort-menu';
+    sortToggle.setAttribute('aria-label', 'Sort options');
     sortToggle.setAttribute('aria-haspopup', 'menu');
     sortToggle.setAttribute('aria-expanded', state.sortMenuOpen === true ? 'true' : 'false');
     sortToggle.title = 'Sort options';
@@ -611,6 +622,7 @@ class Plugin extends AppPlugin {
     const sortMenu = document.createElement('div');
     sortMenu.className = 'tlr-sort-menu cmdpal--inline dropdown active focused-component';
     sortMenu.setAttribute('role', 'menu');
+    sortMenu.setAttribute('aria-label', 'Backreferences sort options');
 
     sortWrap.appendChild(sortToggle);
     sortWrap.appendChild(sortMenu);
@@ -624,13 +636,15 @@ class Plugin extends AppPlugin {
 
     header.appendChild(headerMain);
     header.appendChild(headerControls);
+    headerField.appendChild(header);
 
     const body = document.createElement('div');
     body.className = 'tlr-body';
     body.dataset.role = 'body';
 
-    root.appendChild(header);
-    searchRow.appendChild(searchWrap);
+    searchRowInner.appendChild(searchWrap);
+    searchRow.appendChild(searchRowInner);
+    root.appendChild(headerField);
     root.appendChild(searchRow);
     root.appendChild(body);
 
@@ -1091,6 +1105,9 @@ class Plugin extends AppPlugin {
     if (!state?.rootEl) return;
     const nextCollapsed = collapsed === true;
     this.applyCollapsedState(state.rootEl, nextCollapsed);
+    if (state.searchRowEl) {
+      state.searchRowEl.style.display = state.searchOpen === true && nextCollapsed !== true ? 'block' : 'none';
+    }
 
     const btn = state.footerToggleEl || state.rootEl.querySelector?.('[data-action="toggle"]') || null;
     if (!btn) return;
@@ -2062,18 +2079,20 @@ class Plugin extends AppPlugin {
     const open = state.searchOpen === true;
     const active = open || this.hasSearchQuery(state);
     const hasQuery = this.hasSearchQuery(state);
+    const footerCollapsed = state.rootEl?.classList?.contains?.('tlr-collapsed') === true;
 
     if (state.rootEl) {
       state.rootEl.classList.toggle('tlr-search-open', open);
       state.rootEl.classList.toggle('tlr-search-active', active);
     }
     if (state.searchRowEl) {
-      state.searchRowEl.style.display = open ? 'block' : 'none';
+      state.searchRowEl.style.display = open && footerCollapsed !== true ? 'block' : 'none';
     }
     if (state.searchToggleEl) {
       state.searchToggleEl.setAttribute('aria-expanded', open ? 'true' : 'false');
       state.searchToggleEl.classList.toggle('is-active', active);
       const tooltip = open ? 'Hide filter bar' : hasQuery ? 'Filter (active)' : 'Filter';
+      state.searchToggleEl.setAttribute('aria-label', tooltip);
       state.searchToggleEl.setAttribute('data-tooltip', tooltip);
       state.searchToggleEl.title = tooltip;
       const icon = state.searchToggleEl.querySelector?.('.id--filter-icon') || null;
@@ -2190,53 +2209,121 @@ class Plugin extends AppPlugin {
 
     menu.innerHTML = '';
 
+    const list = document.createElement('div');
+    list.className = 'autocomplete clickable';
+
+    const scroll = document.createElement('div');
+    scroll.className = 'vscroll-node';
+
+    const content = document.createElement('div');
+    content.className = 'vcontent';
+
+    const scrollbar = document.createElement('div');
+    scrollbar.className = 'vscrollbar scrollbar';
+
+    const thumb = document.createElement('div');
+    thumb.className = 'vscrollbar-thumb scrollbar-thumb clickable';
+    thumb.innerHTML = '&nbsp;';
+
     const title = document.createElement('div');
     title.className = 'tlr-sort-menu-title text-details';
-    title.textContent = 'Sort By';
-    menu.appendChild(title);
+    title.textContent = 'Sort by';
+    content.appendChild(title);
 
     for (const option of this.getSortOptions()) {
       const row = document.createElement('button');
       row.type = 'button';
-      row.className = 'tlr-sort-option button-normal button-normal-hover';
+      row.className = 'tlr-sort-option autocomplete--option button-none';
       row.dataset.action = 'set-sort-by';
       row.dataset.sortBy = option.id;
-      if (option.id === sortBy) row.classList.add('is-active');
+      row.setAttribute('role', 'menuitemradio');
+      row.setAttribute('aria-checked', option.id === sortBy ? 'true' : 'false');
+      if (option.id === sortBy) row.classList.add('autocomplete--option-selected');
 
       const label = document.createElement('span');
-      label.className = 'tlr-sort-option-label';
+      label.className = 'tlr-sort-option-label autocomplete--option-label';
       label.textContent = option.label;
 
       row.appendChild(label);
-      menu.appendChild(row);
+      content.appendChild(row);
     }
 
     const divider = document.createElement('div');
     divider.className = 'tlr-sort-menu-divider';
-    menu.appendChild(divider);
+    content.appendChild(divider);
 
-    const dirRow = document.createElement('div');
-    dirRow.className = 'tlr-sort-dir-row';
+    const directionTitle = document.createElement('div');
+    directionTitle.className = 'tlr-sort-menu-title text-details';
+    directionTitle.textContent = 'Direction';
+    content.appendChild(directionTitle);
 
     const ascBtn = document.createElement('button');
     ascBtn.type = 'button';
-    ascBtn.className = 'tlr-sort-dir-btn button-normal button-normal-hover button-small';
+    ascBtn.className = 'tlr-sort-option autocomplete--option button-none';
     ascBtn.dataset.action = 'set-sort-dir';
     ascBtn.dataset.sortDir = 'asc';
+    ascBtn.setAttribute('role', 'menuitemradio');
+    ascBtn.setAttribute('aria-checked', sortDir === 'asc' ? 'true' : 'false');
     ascBtn.textContent = 'Ascending';
-    if (sortDir === 'asc') ascBtn.classList.add('is-active');
+    if (sortDir === 'asc') ascBtn.classList.add('autocomplete--option-selected');
 
     const descBtn = document.createElement('button');
     descBtn.type = 'button';
-    descBtn.className = 'tlr-sort-dir-btn button-normal button-normal-hover button-small';
+    descBtn.className = 'tlr-sort-option autocomplete--option button-none';
     descBtn.dataset.action = 'set-sort-dir';
     descBtn.dataset.sortDir = 'desc';
+    descBtn.setAttribute('role', 'menuitemradio');
+    descBtn.setAttribute('aria-checked', sortDir === 'desc' ? 'true' : 'false');
     descBtn.textContent = 'Descending';
-    if (sortDir === 'desc') descBtn.classList.add('is-active');
+    if (sortDir === 'desc') descBtn.classList.add('autocomplete--option-selected');
 
-    dirRow.appendChild(ascBtn);
-    dirRow.appendChild(descBtn);
-    menu.appendChild(dirRow);
+    content.appendChild(ascBtn);
+    content.appendChild(descBtn);
+
+    scroll.appendChild(content);
+    scroll.addEventListener('scroll', () => {
+      this.syncSortMenuScrollbar(state);
+    });
+
+    thumb.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      const startY = e.clientY;
+      const startScrollTop = scroll.scrollTop;
+      const onMouseMove = (moveEvent) => {
+        const trackHeight = scrollbar.clientHeight || scroll.clientHeight || 0;
+        const thumbHeight = thumb.clientHeight || 0;
+        const maxThumbTop = Math.max(1, trackHeight - thumbHeight);
+        const maxScrollTop = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
+        if (maxScrollTop <= 0) return;
+        const deltaRatio = (moveEvent.clientY - startY) / maxThumbTop;
+        scroll.scrollTop = Math.max(0, Math.min(maxScrollTop, startScrollTop + (deltaRatio * maxScrollTop)));
+      };
+
+      const onMouseUp = () => {
+        document.removeEventListener('mousemove', onMouseMove, true);
+        document.removeEventListener('mouseup', onMouseUp, true);
+      };
+
+      document.addEventListener('mousemove', onMouseMove, true);
+      document.addEventListener('mouseup', onMouseUp, true);
+    });
+
+    list.appendChild(scroll);
+    scrollbar.appendChild(thumb);
+    list.appendChild(scrollbar);
+    menu.appendChild(list);
+
+    const sync = () => {
+      this.syncSortMenuScrollbar(state);
+    };
+    sync();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(sync);
+    } else {
+      setTimeout(sync, 0);
+    }
   }
 
   syncSortControlState(state) {
@@ -2251,6 +2338,7 @@ class Plugin extends AppPlugin {
 
     if (state.sortToggleEl) {
       state.sortToggleEl.title = `Sort: ${sortLabel} (${dirLabel})`;
+      state.sortToggleEl.setAttribute('aria-label', `Sort options: ${sortLabel}, ${dirLabel}`);
       state.sortToggleEl.setAttribute('aria-expanded', state.sortMenuOpen === true ? 'true' : 'false');
     }
 
@@ -2264,6 +2352,14 @@ class Plugin extends AppPlugin {
     state.sortMenuOpen = open === true;
 
     this.clearPointerDismissHandler(state, 'sortMenuDismissHandler');
+    if (state.sortMenuKeyHandler) {
+      try {
+        document.removeEventListener('keydown', state.sortMenuKeyHandler, true);
+      } catch (e) {
+        // ignore
+      }
+      state.sortMenuKeyHandler = null;
+    }
 
     this.syncSortControlState(state);
 
@@ -2284,6 +2380,51 @@ class Plugin extends AppPlugin {
     };
 
     this.setPointerDismissHandler(state, 'sortMenuDismissHandler', onOutsideMouseDown);
+
+    const onMenuKeyDown = (ev) => {
+      if (ev.key !== 'Escape') return;
+      ev.preventDefault();
+      this.setSortMenuOpen(state, false);
+      try {
+        state.sortToggleEl?.focus?.();
+      } catch (e) {
+        // ignore
+      }
+    };
+
+    state.sortMenuKeyHandler = onMenuKeyDown;
+    try {
+      document.addEventListener('keydown', onMenuKeyDown, true);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  syncSortMenuScrollbar(state) {
+    const menu = state?.sortMenuEl || null;
+    const scroll = menu?.querySelector?.('.vscroll-node') || null;
+    const scrollbar = menu?.querySelector?.('.vscrollbar') || null;
+    const thumb = menu?.querySelector?.('.vscrollbar-thumb') || null;
+    if (!scroll || !scrollbar || !thumb) return;
+
+    const viewportHeight = scroll.clientHeight || 0;
+    const scrollHeight = scroll.scrollHeight || 0;
+    const trackHeight = scrollbar.clientHeight || viewportHeight;
+    if (!viewportHeight || !scrollHeight || !trackHeight || scrollHeight <= viewportHeight + 1) {
+      scrollbar.classList.remove('has-thumb');
+      thumb.style.height = '0px';
+      thumb.style.transform = 'translateY(0px)';
+      return;
+    }
+
+    const thumbHeight = Math.max(16, Math.round((viewportHeight / scrollHeight) * trackHeight));
+    const maxScrollTop = Math.max(1, scrollHeight - viewportHeight);
+    const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+    const thumbTop = maxThumbTop * (scroll.scrollTop / maxScrollTop);
+
+    scrollbar.classList.add('has-thumb');
+    thumb.style.height = `${thumbHeight}px`;
+    thumb.style.transform = `translateY(${thumbTop}px)`;
   }
 
   renderFromCache(state) {
@@ -4575,11 +4716,11 @@ class Plugin extends AppPlugin {
     const sectionCollapsed = collapsed === true;
 
     const sectionEl = document.createElement('div');
-    sectionEl.className = 'tlr-section';
+    sectionEl.className = 'tlr-section form-field';
     if (sectionCollapsed) sectionEl.classList.add('tlr-section-collapsed');
 
     const headerEl = document.createElement('div');
-    headerEl.className = 'tlr-section-header';
+    headerEl.className = 'tlr-section-header form-field-row';
 
     const toggleBtn = document.createElement('button');
     toggleBtn.type = 'button';
@@ -5252,8 +5393,13 @@ class Plugin extends AppPlugin {
       .tlr-footer {
         --tlr-child-indent: 26px;
         --tlr-context-rail-gap: 8px;
+        --tlr-text-default: var(--text-default, var(--text, inherit));
+        --tlr-text-muted: var(--text-muted, var(--text-secondary, var(--tlr-text-default)));
+        --tlr-border-color: var(--divider-color, var(--cmdpal-border-color, var(--border-subtle, transparent)));
+        --tlr-hover-bg: var(--button-normal-hover-color, var(--bg-hover, transparent));
+        --tlr-selected-bg: var(--bg-selected, var(--tlr-hover-bg));
         margin-top: 14px;
-        color: var(--text, inherit);
+        color: var(--tlr-text-default);
         font-size: 13px;
       }
 
@@ -5263,6 +5409,10 @@ class Plugin extends AppPlugin {
         gap: 6px;
         min-height: 20px;
         margin-bottom: 0;
+      }
+
+      .tlr-header-field {
+        padding-bottom: 0;
       }
 
       .tlr-header-main {
@@ -5288,7 +5438,7 @@ class Plugin extends AppPlugin {
 
       .tlr-count {
         flex: 1 1 auto;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         font-size: 12px;
         line-height: 21px;
         white-space: nowrap;
@@ -5332,9 +5482,9 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-filter-toggle.is-active {
-        background: var(--button-minimal-bg-active-color, var(--bg-selected, rgba(0, 0, 0, 0.06)));
+        background: var(--button-minimal-bg-active-color, var(--tlr-selected-bg));
         border-color: var(--button-minimal-hover-color, var(--button-minimal-border-color, transparent));
-        color: var(--button-minimal-fg-color, var(--text-default, var(--text, inherit)));
+        color: var(--button-minimal-fg-color, var(--tlr-text-default));
       }
 
       .tlr-filter-toggle.is-active .id--filter-icon {
@@ -5416,12 +5566,85 @@ class Plugin extends AppPlugin {
         right: 0;
         min-width: 260px;
         max-width: min(90vw, 340px);
+        z-index: 140;
+      }
+
+      .tlr-sort-menu,
+      .tlr-search-autocomplete {
         padding: 6px;
-        border-radius: 5px;
-        border: 1px solid var(--cmdpal-border-color, var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12))));
-        background: var(--cmdpal-bg-color, var(--panel-bg-color, var(--bg-default, var(--bg-panel, rgba(22, 26, 24, 0.96)))));
+        border-radius: var(--radius-normal, 8px);
+        border: 1px solid var(--cmdpal-border-color, var(--tlr-border-color));
+        background: var(--cmdpal-bg-color, var(--panel-bg-color, var(--bg-default, var(--bg-panel, transparent))));
         box-shadow: var(--cmdpal-box-shadow, 0 12px 34px rgba(0, 0, 0, 0.18));
-        z-index: 120;
+      }
+
+      .tlr-search-autocomplete {
+        display: none;
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 0;
+        width: min(420px, max(260px, 100%));
+        max-width: min(90vw, 420px);
+        z-index: 140;
+      }
+
+      .tlr-search-autocomplete .autocomplete,
+      .tlr-sort-menu .autocomplete {
+        position: relative;
+        overflow: hidden;
+        max-height: 300px;
+      }
+
+      .tlr-search-autocomplete .vscroll-node,
+      .tlr-sort-menu .vscroll-node {
+        max-height: 300px;
+        overflow-y: auto;
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+        touch-action: pan-y;
+      }
+
+      .tlr-search-autocomplete .vscroll-node::-webkit-scrollbar,
+      .tlr-sort-menu .vscroll-node::-webkit-scrollbar {
+        width: 0;
+        height: 0;
+      }
+
+      .tlr-search-autocomplete .vcontent,
+      .tlr-sort-menu .vcontent {
+        position: relative;
+      }
+
+      .tlr-search-autocomplete .vscrollbar,
+      .tlr-sort-menu .vscrollbar {
+        position: absolute;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        width: 15px;
+        user-select: none;
+        display: none;
+      }
+
+      .tlr-search-autocomplete .vscrollbar.has-thumb,
+      .tlr-sort-menu .vscrollbar.has-thumb {
+        display: block;
+      }
+
+      .tlr-search-autocomplete .vscrollbar-thumb,
+      .tlr-sort-menu .vscrollbar-thumb {
+        min-height: 16px;
+      }
+
+      .tlr-search-autocomplete .autocomplete--option,
+      .tlr-sort-menu .autocomplete--option {
+        border-radius: 6px;
+      }
+
+      .tlr-search-autocomplete .autocomplete--option-right,
+      .tlr-sort-menu .autocomplete--option-right {
+        color: var(--tlr-text-muted);
+        font-size: 11px;
       }
 
       .tlr-sort-open .tlr-sort-menu {
@@ -5429,7 +5652,8 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-sort-menu-title {
-        margin: 2px 6px 6px;
+        margin: 0;
+        padding: 8px 10px 4px;
         font-size: 11px;
       }
 
@@ -5439,11 +5663,7 @@ class Plugin extends AppPlugin {
         align-items: center;
         line-height: 1.35;
         text-align: left;
-      }
-
-      .tlr-sort-option.is-active {
-        background: var(--cmdpal-selected-bg-color, var(--bg-hover, rgba(0, 0, 0, 0.04)));
-        color: var(--cmdpal-selected-fg-color, var(--text, inherit));
+        color: var(--tlr-text-default);
       }
 
       .tlr-sort-option-label {
@@ -5451,8 +5671,8 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-sort-menu-divider {
-        margin: 10px 0;
-        border-top: 1px solid var(--cmdpal-border-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        margin: 8px 0;
+        border-top: 1px solid var(--cmdpal-border-color, var(--tlr-border-color));
       }
 
       .tlr-line-jump-highlight {
@@ -5463,7 +5683,7 @@ class Plugin extends AppPlugin {
       @keyframes tlr-line-jump-highlight {
         0% {
           background: var(--bg-selected, rgba(250, 204, 21, 0.28));
-          box-shadow: inset 0 0 0 1px var(--input-border-color, var(--divider-color, rgba(0, 0, 0, 0.18)));
+          box-shadow: inset 0 0 0 1px var(--input-border-color, var(--tlr-border-color));
         }
         100% {
           background: transparent;
@@ -5471,26 +5691,14 @@ class Plugin extends AppPlugin {
         }
       }
 
-      .tlr-sort-dir-row {
-        display: flex;
-        gap: 8px;
-      }
-
-      .tlr-sort-dir-btn {
-        flex: 1 1 auto;
-        justify-content: center;
-      }
-
-      .tlr-sort-dir-btn.is-active {
-        background: var(--cmdpal-selected-bg-color, var(--bg-hover, rgba(0, 0, 0, 0.04)));
-        color: var(--cmdpal-selected-fg-color, var(--text, inherit));
-      }
-
       .tlr-search-row {
         display: none;
         width: 100%;
-        margin-top: 6px;
-        margin-bottom: 8px;
+        padding-top: 0;
+      }
+
+      .tlr-search-row-inner {
+        width: 100%;
       }
 
       .tlr-search-open .tlr-search-row {
@@ -5523,22 +5731,18 @@ class Plugin extends AppPlugin {
         display: none !important;
       }
 
-      .tlr-empty-compact .tlr-header {
-        margin-bottom: 6px;
-      }
-
       .tlr-search-input {
         width: 100%;
         max-width: none;
         min-width: 0;
         position: relative;
         min-height: 34px;
-        border: 1px solid var(--input-border-color, var(--divider-color, var(--cmdpal-border-color, var(--border-subtle, rgba(0, 0, 0, 0.12))))) !important;
+        border: 1px solid var(--input-border-color, var(--tlr-border-color)) !important;
         outline: none !important;
         background: var(--input-bg-color, var(--cmdpal-input-bg-color, var(--bg-panel, transparent))) !important;
-        color: var(--input-fg-color, var(--text-default, var(--text, inherit))) !important;
-        -webkit-text-fill-color: var(--input-fg-color, var(--text-default, var(--text, inherit))) !important;
-        caret-color: var(--input-fg-color, var(--text-default, var(--text, inherit)));
+        color: var(--input-fg-color, var(--tlr-text-default)) !important;
+        -webkit-text-fill-color: var(--input-fg-color, var(--tlr-text-default)) !important;
+        caret-color: var(--input-fg-color, var(--tlr-text-default));
         opacity: 1;
         font-size: 13px;
         line-height: 22px;
@@ -5551,78 +5755,13 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-search-input::placeholder {
-        color: var(--text-xmuted, var(--text-muted, rgba(0, 0, 0, 0.6)));
+        color: var(--text-xmuted, var(--tlr-text-muted));
       }
 
       .tlr-search-input:focus {
-        border: var(--input-border-focus, 1px solid var(--input-border-color, var(--divider-color, rgba(0, 0, 0, 0.12)))) !important;
-        outline: var(--input-border-focus, 1px solid var(--input-border-color, var(--divider-color, rgba(0, 0, 0, 0.12)))) !important;
+        border: var(--input-border-focus, 1px solid var(--input-border-color, var(--tlr-border-color))) !important;
+        outline: var(--input-border-focus, 1px solid var(--input-border-color, var(--tlr-border-color))) !important;
         box-shadow: var(--input-border-shadow, none) !important;
-      }
-
-      .tlr-search-autocomplete {
-        display: none;
-        position: absolute;
-        top: calc(100% + 6px);
-        left: 0;
-        width: min(420px, max(260px, 100%));
-        max-width: min(90vw, 420px);
-        padding: 6px;
-        border-radius: var(--radius-normal, 8px);
-        border: 1px solid var(--cmdpal-border-color, var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12))));
-        background: var(--cmdpal-bg-color, var(--panel-bg-color, var(--bg-default, var(--bg-panel, rgba(22, 26, 24, 0.96)))));
-        box-shadow: var(--cmdpal-box-shadow, 0 12px 34px rgba(0, 0, 0, 0.18));
-        z-index: 140;
-      }
-
-      .tlr-search-autocomplete .autocomplete--option {
-        border-radius: 6px;
-      }
-
-      .tlr-search-autocomplete .autocomplete {
-        position: relative;
-        overflow: hidden;
-        max-height: 300px;
-      }
-
-      .tlr-search-autocomplete .vscroll-node {
-        max-height: 300px;
-        overflow-y: auto;
-        scrollbar-width: none;
-        -ms-overflow-style: none;
-        touch-action: pan-y;
-      }
-
-      .tlr-search-autocomplete .vscroll-node::-webkit-scrollbar {
-        width: 0;
-        height: 0;
-      }
-
-      .tlr-search-autocomplete .vcontent {
-        position: relative;
-      }
-
-      .tlr-search-autocomplete .vscrollbar {
-        position: absolute;
-        right: 0;
-        top: 0;
-        bottom: 0;
-        width: 15px;
-        user-select: none;
-        display: none;
-      }
-
-      .tlr-search-autocomplete .vscrollbar.has-thumb {
-        display: block;
-      }
-
-      .tlr-search-autocomplete .vscrollbar-thumb {
-        min-height: 16px;
-      }
-
-      .tlr-search-autocomplete .autocomplete--option-right {
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
-        font-size: 11px;
       }
 
       .tlr-search-autocomplete-open .tlr-search-autocomplete {
@@ -5646,7 +5785,7 @@ class Plugin extends AppPlugin {
         z-index: 2;
         font-size: 12px;
         line-height: 1;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         opacity: 0.7;
         transition: opacity 0.15s, background 0.15s, color 0.15s;
         align-items: center;
@@ -5656,7 +5795,7 @@ class Plugin extends AppPlugin {
       .tlr-search-clear:hover,
       .tlr-search-refresh:hover {
         opacity: 1;
-        background: var(--bg-hover, rgba(0, 0, 0, 0.05));
+        background: var(--tlr-hover-bg);
       }
 
       .tlr-toggle {
@@ -5664,17 +5803,22 @@ class Plugin extends AppPlugin {
         width: 20px;
         height: 20px;
         padding: 0;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
       }
 
-      .tlr-body { display: block; }
+      .tlr-body {
+        display: block;
+      }
 
-      .tlr-collapsed .tlr-body { display: none; }
+      .tlr-collapsed .tlr-body,
+      .tlr-collapsed .tlr-search-row {
+        display: none;
+      }
 
       .tlr-empty,
       .tlr-note,
       .tlr-error {
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         padding: 6px 0;
         font-size: 12px;
       }
@@ -5702,19 +5846,18 @@ class Plugin extends AppPlugin {
         display: flex;
         align-items: center;
         gap: 8px;
-        margin-top: 14px;
-        margin-bottom: 6px;
+        margin: 0;
       }
 
-      .tlr-section:first-child .tlr-section-header {
-        margin-top: 0;
+      .tlr-section-body {
+        padding-top: 8px;
       }
 
       .tlr-section-toggle {
         width: 20px;
         height: 20px;
         padding: 0;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         flex: 0 0 auto;
       }
 
@@ -5723,14 +5866,14 @@ class Plugin extends AppPlugin {
         min-width: 0;
         font-size: 12px;
         font-weight: 650;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         text-transform: none;
         letter-spacing: 0;
       }
 
       .tlr-section-meta {
         flex: 0 0 auto;
-        color: var(--text-muted, rgba(0, 0, 0, 0.58));
+        color: var(--tlr-text-muted);
         font-size: 11px;
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
@@ -5742,7 +5885,7 @@ class Plugin extends AppPlugin {
 
       .tlr-divider {
         margin: 12px 0 8px;
-        border-top: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        border-top: 1px solid var(--tlr-border-color);
       }
 
       .tlr-prop-group { margin: 10px 0 12px; }
@@ -5759,7 +5902,7 @@ class Plugin extends AppPlugin {
         padding: 0;
         text-align: center;
         font-weight: 700;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         flex: 0 0 auto;
       }
 
@@ -5779,7 +5922,7 @@ class Plugin extends AppPlugin {
         align-items: center;
         justify-content: center;
         flex: 0 0 auto;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         opacity: 0.9;
         font-size: 14px;
         line-height: 1;
@@ -5801,7 +5944,7 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-prop-meta {
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         font-size: 12px;
         margin-left: auto;
         flex: 0 0 auto;
@@ -5811,7 +5954,7 @@ class Plugin extends AppPlugin {
         margin-top: 10px;
         margin-left: var(--tlr-child-indent);
         padding-left: 10px;
-        border-left: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        border-left: 1px solid var(--tlr-border-color);
         display: flex;
         flex-direction: column;
         gap: 4px;
@@ -5848,7 +5991,7 @@ class Plugin extends AppPlugin {
         padding: 0;
         text-align: center;
         font-weight: 700;
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         flex: 0 0 auto;
       }
 
@@ -5877,7 +6020,7 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-group-meta {
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
         font-size: 12px;
         flex: 0 0 auto;
       }
@@ -5886,7 +6029,7 @@ class Plugin extends AppPlugin {
         margin-top: 10px;
         margin-left: var(--tlr-child-indent);
         padding-left: 10px;
-        border-left: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        border-left: 1px solid var(--tlr-border-color);
         display: flex;
         flex-direction: column;
         gap: 8px;
@@ -5910,13 +6053,13 @@ class Plugin extends AppPlugin {
 
       .tlr-line-main:hover,
       .tlr-line-main:focus-within {
-        background: var(--button-normal-hover-color, var(--bg-hover, rgba(0, 0, 0, 0.04)));
-        border-color: var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        background: var(--tlr-hover-bg);
+        border-color: var(--tlr-border-color);
       }
 
       .tlr-line-main.is-context-open {
-        background: var(--bg-selected, var(--bg-hover, rgba(0, 0, 0, 0.05)));
-        border-color: var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        background: var(--tlr-selected-bg);
+        border-color: var(--tlr-border-color);
       }
 
       .tlr-line {
@@ -5925,13 +6068,13 @@ class Plugin extends AppPlugin {
         min-width: 0;
         padding: 8px 10px 8px 12px;
         text-align: left;
-        color: var(--text, inherit);
+        color: var(--tlr-text-default);
         line-height: 1.35;
         border-radius: inherit;
       }
 
       .tlr-prefix {
-        color: var(--text-muted, rgba(0, 0, 0, 0.6));
+        color: var(--tlr-text-muted);
       }
 
       .tlr-line-content {
@@ -5965,13 +6108,13 @@ class Plugin extends AppPlugin {
         height: 24px;
         padding: 0;
         border-radius: 6px;
-        color: var(--text-muted, rgba(0, 0, 0, 0.72));
+        color: var(--tlr-text-muted);
       }
 
       .tlr-context-btn:hover:not(:disabled),
       .tlr-context-btn.is-active {
-        color: var(--text-default, var(--text, inherit));
-        background: var(--bg-selected, var(--bg-hover, rgba(0, 0, 0, 0.06)));
+        color: var(--tlr-text-default);
+        background: var(--tlr-selected-bg);
       }
 
       .tlr-context-btn:disabled {
@@ -6030,16 +6173,16 @@ class Plugin extends AppPlugin {
         width: 100%;
         padding: 5px 10px 5px calc(12px + var(--tlr-context-indent, 0px));
         text-align: left;
-        color: var(--text, inherit);
+        color: var(--tlr-text-default);
         line-height: 1.35;
-        border-left: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
+        border-left: 1px solid var(--tlr-border-color);
         border-radius: 6px;
         transition: background-color 0.15s, border-color 0.15s;
       }
 
       .tlr-context-line:hover,
       .tlr-context-line:focus-visible {
-        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+        background: var(--tlr-hover-bg);
       }
 
       .tlr-context-note {
@@ -6051,15 +6194,15 @@ class Plugin extends AppPlugin {
         align-items: center;
         padding: 1px 6px;
         border-radius: 999px;
-        border: 1px solid var(--divider-color, var(--border-subtle, rgba(0, 0, 0, 0.12)));
-        background: var(--bg-hover, rgba(0, 0, 0, 0.04));
-        color: var(--text-muted, rgba(0, 0, 0, 0.68));
+        border: 1px solid var(--tlr-border-color);
+        background: var(--tlr-hover-bg);
+        color: var(--tlr-text-muted);
         font-size: 11px;
         vertical-align: middle;
       }
 
       .tlr-live-badge.is-new {
-        color: var(--text-default, var(--text, inherit));
+        color: var(--tlr-text-default);
       }
 
       .tlr-live-badge.is-remote {
@@ -6112,10 +6255,6 @@ class Plugin extends AppPlugin {
 
         .tlr-count {
           min-width: 0;
-        }
-
-        .tlr-search-row {
-          margin-top: 10px;
         }
 
         .tlr-sort-menu {
