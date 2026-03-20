@@ -800,6 +800,17 @@ class Plugin extends AppPlugin {
       return;
     }
 
+    if (action === 'link-unlinked') {
+      if (!state) return;
+      const lineGuid = actionEl.dataset.lineGuid || null;
+      if (!lineGuid) return;
+      this.setSortMenuOpen(state, false);
+      this.linkUnlinkedReference(state, lineGuid).catch(() => {
+        // ignore
+      });
+      return;
+    }
+
     const panel = state?.panel || null;
     if (!panel) return;
 
@@ -3894,7 +3905,8 @@ class Plugin extends AppPlugin {
 
     for (const seg of line?.segments || []) {
       if (seg?.type !== 'ref') continue;
-      if ((seg?.text?.guid || '') === targetGuid) return true;
+      const textObj = typeof seg?.text === 'string' ? { guid: seg.text } : (seg?.text || {});
+      if ((textObj.guid || '') === targetGuid) return true;
     }
     return false;
   }
@@ -3928,6 +3940,98 @@ class Plugin extends AppPlugin {
     if (parts.length === 0) return null;
 
     return new RegExp(`(^|[^a-z0-9])${parts.join('\\s+')}(?=$|[^a-z0-9])`, 'i');
+  }
+
+  buildPhraseBoundaryGlobalMatcher(phrase) {
+    const trimmed = typeof phrase === 'string' ? phrase.trim() : '';
+    if (!trimmed) return null;
+
+    const parts = trimmed.split(/\s+/).filter(Boolean).map((part) => this.escapeRegExp(part));
+    if (parts.length === 0) return null;
+
+    return new RegExp(`(^|[^a-z0-9])(${parts.join('\\s+')})(?=$|[^a-z0-9])`, 'ig');
+  }
+
+  findUnlinkedLineByGuid(state, lineGuid) {
+    const target = (lineGuid || '').trim();
+    if (!target || !state?.lastResults) return null;
+
+    for (const group of state.lastResults?.unlinkedGroups || []) {
+      for (const line of group?.lines || []) {
+        if ((line?.guid || '') === target) return line;
+      }
+    }
+
+    return null;
+  }
+
+  buildReplacedSegments(segments, recordName, recordGuid) {
+    if (!Array.isArray(segments) || !recordGuid) return segments;
+
+    const matcher = this.buildPhraseBoundaryGlobalMatcher(recordName);
+    if (!matcher) return segments;
+
+    const result = [];
+    let changed = false;
+
+    for (const seg of segments) {
+      if (!seg || !['text', 'bold', 'italic', 'code'].includes(seg.type) || typeof seg.text !== 'string') {
+        result.push(seg);
+        continue;
+      }
+
+      const text = seg.text;
+      let lastIndex = 0;
+      let matched = false;
+      let match = null;
+      matcher.lastIndex = 0;
+
+      while ((match = matcher.exec(text)) !== null) {
+        matched = true;
+        changed = true;
+
+        const prefix = match[1] || '';
+        const matchedText = match[2] || '';
+        const start = match.index + prefix.length;
+
+        if (start > lastIndex) {
+          result.push({ type: seg.type, text: text.slice(lastIndex, start) });
+        }
+
+        result.push({ type: 'ref', text: { guid: recordGuid, title: matchedText } });
+        lastIndex = start + matchedText.length;
+        matcher.lastIndex = lastIndex;
+      }
+
+      if (!matched) {
+        result.push(seg);
+        continue;
+      }
+
+      if (lastIndex < text.length) {
+        result.push({ type: seg.type, text: text.slice(lastIndex) });
+      }
+    }
+
+    return changed ? result : segments;
+  }
+
+  async linkUnlinkedReference(state, lineGuid) {
+    const panel = state?.panel || null;
+    const record = panel?.getActiveRecord?.() || null;
+    const recordGuid = (record?.guid || '').trim();
+    const recordName = (record?.getName?.() || '').trim();
+    if (!recordGuid || !recordName) return;
+
+    const line = this.findUnlinkedLineByGuid(state, lineGuid);
+    if (!line || typeof line.setSegments !== 'function') return;
+    if (this.lineHasRefToRecord(line, recordGuid)) return;
+
+    const nextSegments = this.buildReplacedSegments(line.segments || [], recordName, recordGuid);
+    if (nextSegments === line.segments) return;
+
+    await line.setSegments(nextSegments);
+    this.refreshAllPanels({ force: true, reason: 'link-unlinked' });
   }
 
   escapeRegExp(value) {
@@ -4802,7 +4906,9 @@ class Plugin extends AppPlugin {
 
         if (state && ctx) {
           if (ctx.showMoreContext === true) mainRowEl.classList.add('is-context-open');
-          mainRowEl.appendChild(this.buildLinkedContextControls(line.guid, ctx));
+          mainRowEl.appendChild(this.buildLinkedContextControls(line.guid, ctx, {
+            showLinkAction: groupSectionId === 'unlinked'
+          }));
 
           if (ctx.loading === true) {
             const loadingEl = document.createElement('div');
@@ -4834,12 +4940,16 @@ class Plugin extends AppPlugin {
     }
   }
 
-  buildLinkedContextControls(lineGuid, ctx) {
+  buildLinkedContextControls(lineGuid, ctx, opts = {}) {
     const controls = document.createElement('div');
     controls.className = 'tlr-line-actions text-details';
 
     const group = document.createElement('div');
     group.className = 'tlr-line-actions-group';
+
+    if (opts.showLinkAction === true) {
+      group.appendChild(this.buildUnlinkedLinkButton(lineGuid));
+    }
 
     if (ctx?.showMoreContext === true) {
       group.appendChild(this.buildLinkedContextButton('toggle-context-above', lineGuid, {
@@ -4865,6 +4975,18 @@ class Plugin extends AppPlugin {
 
     controls.appendChild(group);
     return controls;
+  }
+
+  buildUnlinkedLinkButton(lineGuid) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tlr-unlinked-link-btn button-none button-small button-minimal-hover';
+    btn.dataset.action = 'link-unlinked';
+    btn.dataset.lineGuid = lineGuid || '';
+    btn.title = 'Convert this mention to a linked reference';
+    btn.setAttribute('aria-label', 'Link mention');
+    btn.textContent = 'Link';
+    return btn;
   }
 
   buildLinkedContextButton(action, lineGuid, opts) {
@@ -5900,6 +6022,24 @@ class Plugin extends AppPlugin {
         gap: 4px;
         margin-left: auto;
         flex: 0 0 auto;
+      }
+
+      .tlr-unlinked-link-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 40px;
+        height: 24px;
+        padding: 0 8px;
+        border-radius: 6px;
+        color: var(--tlr-text-muted);
+        font-size: 12px;
+        line-height: 1;
+      }
+
+      .tlr-unlinked-link-btn:hover {
+        color: var(--tlr-text-default);
+        background: var(--tlr-selected-bg);
       }
 
       .tlr-context-btn {
