@@ -4980,12 +4980,29 @@ class Plugin extends AppPlugin {
   buildUnlinkedLinkButton(lineGuid) {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'tlr-unlinked-link-btn button-none button-small button-minimal-hover';
+    btn.className = 'tlr-unlinked-link-btn button-none button-small button-minimal-hover tooltip';
     btn.dataset.action = 'link-unlinked';
     btn.dataset.lineGuid = lineGuid || '';
-    btn.title = 'Convert this mention to a linked reference';
+    btn.title = 'Link mention';
     btn.setAttribute('aria-label', 'Link mention');
-    btn.textContent = 'Link';
+    btn.setAttribute('data-tooltip', 'Link mention');
+    btn.setAttribute('data-tooltip-dir', 'top');
+
+    let iconEl = null;
+    try {
+      iconEl = this.ui.createIcon('ti-link');
+    } catch (e) {
+      iconEl = null;
+    }
+
+    if (iconEl) {
+      iconEl.classList.add('tlr-unlinked-link-icon');
+      btn.appendChild(iconEl);
+    } else {
+      btn.textContent = 'Link';
+      btn.classList.add('tlr-unlinked-link-btn-fallback');
+    }
+
     return btn;
   }
 
@@ -6028,18 +6045,29 @@ class Plugin extends AppPlugin {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        min-width: 40px;
+        width: 24px;
         height: 24px;
-        padding: 0 8px;
+        padding: 0;
         border-radius: 6px;
         color: var(--tlr-text-muted);
-        font-size: 12px;
         line-height: 1;
       }
 
       .tlr-unlinked-link-btn:hover {
         color: var(--tlr-text-default);
         background: var(--tlr-selected-bg);
+      }
+
+      .tlr-unlinked-link-icon {
+        width: 14px;
+        height: 14px;
+      }
+
+      .tlr-unlinked-link-btn-fallback {
+        width: auto;
+        min-width: 40px;
+        padding: 0 8px;
+        font-size: 12px;
       }
 
       .tlr-context-btn {
