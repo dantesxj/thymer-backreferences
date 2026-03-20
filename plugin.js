@@ -830,44 +830,29 @@ class Plugin extends AppPlugin {
   }
 
   navigatePanelToRecord(panel, recordGuid, lineGuid, workspaceGuid) {
-    const fallback = () => {
+    if (!lineGuid) {
       panel.navigateTo({
         type: 'edit_panel',
         rootId: recordGuid,
-        subId: lineGuid || null,
+        subId: null,
         workspaceGuid
       });
-      return false;
-    };
-
-    if (!lineGuid) {
-      fallback();
       return Promise.resolve(true);
     }
 
     try {
       const result = panel.navigateTo({
-        type: 'edit_panel',
-        rootId: recordGuid,
-        subId: lineGuid || null,
-        workspaceGuid,
         itemGuid: lineGuid,
         highlight: true
       });
 
       if (result && typeof result.then === 'function') {
-        return result
-          .then((found) => {
-            if (found === false) return fallback();
-            return true;
-          })
-          .catch(() => fallback());
+        return result.then((found) => found !== false);
       }
 
-      if (result === false) return Promise.resolve(fallback());
-      return Promise.resolve(true);
+      return Promise.resolve(result !== false);
     } catch (_err) {
-      return Promise.resolve(fallback());
+      return Promise.resolve(false);
     }
   }
 
@@ -909,92 +894,6 @@ class Plugin extends AppPlugin {
     });
   }
 
-  getLineElementInPanel(panel, lineGuid) {
-    const panelEl = panel?.getElement?.() || null;
-    if (!panelEl || !lineGuid) return null;
-
-    const lineSelector = `[data-guid="${lineGuid}"]`;
-    if (panelEl.matches?.(lineSelector)) return panelEl;
-
-    return (
-      panelEl.querySelector?.(lineSelector) ||
-      panelEl.querySelector?.(`[dbg-guid="${lineGuid}"]`) ||
-      null
-    );
-  }
-
-  isLineElementVisibleInPanel(panel, lineEl) {
-    const panelEl = panel?.getElement?.() || null;
-    if (!panelEl || !lineEl?.getBoundingClientRect) return false;
-
-    const lineRect = lineEl.getBoundingClientRect();
-    const panelRect = panelEl.getBoundingClientRect();
-    const padding = 20;
-
-    return lineRect.bottom > (panelRect.top + padding) && lineRect.top < (panelRect.bottom - padding);
-  }
-
-  waitForLineElementInPanel(panel, lineGuid, timeoutMs = 1800) {
-    return new Promise((resolve) => {
-      const startedAt = Date.now();
-
-      const check = () => {
-        const lineEl = this.getLineElementInPanel(panel, lineGuid);
-        if (lineEl) {
-          resolve(lineEl);
-          return;
-        }
-
-        if ((Date.now() - startedAt) >= timeoutMs) {
-          resolve(null);
-          return;
-        }
-
-        if (typeof requestAnimationFrame === 'function') {
-          requestAnimationFrame(check);
-          return;
-        }
-
-        setTimeout(check, 16);
-      };
-
-      check();
-    });
-  }
-
-  async assistLineNavigationInPanel(panel, lineGuid, { emphasize = false } = {}) {
-    if (!lineGuid) return false;
-
-    const lineEl = await this.waitForLineElementInPanel(panel, lineGuid);
-    if (!lineEl) return false;
-
-    const targetEl = lineEl.querySelector?.('.line-div') || lineEl;
-    const highlightEls = lineEl === targetEl ? [lineEl] : [lineEl, targetEl];
-
-    if (!this.isLineElementVisibleInPanel(panel, lineEl)) {
-      try {
-        lineEl.scrollIntoView({ block: 'center', inline: 'nearest' });
-      } catch (_err) {
-        // ignore
-      }
-      await this.waitForPanelNavigationFrame();
-    }
-
-    if (emphasize) {
-      highlightEls.forEach((el) => el.classList.add('tlr-line-jump-highlight'));
-      try {
-        this.ui.bounce?.(targetEl);
-      } catch (_err) {
-        // ignore
-      }
-      setTimeout(() => {
-        highlightEls.forEach((el) => el.classList.remove('tlr-line-jump-highlight'));
-      }, 1600);
-    }
-
-    return true;
-  }
-
   async openRecord(panel, recordGuid, lineGuid, e) {
     const workspaceGuid = this.getWorkspaceGuid?.() || null;
     if (!workspaceGuid) return;
@@ -1014,7 +913,6 @@ class Plugin extends AppPlugin {
           await this.navigatePanelToRecord(newPanel, recordGuid, lineGuid, workspaceGuid);
           await this.waitForPanelNavigationFrame();
           await this.waitForPanelNavigationFrame();
-          await this.assistLineNavigationInPanel(newPanel, lineGuid, { emphasize: true });
         }
       } catch (_err) {
         // ignore
@@ -3727,10 +3625,10 @@ class Plugin extends AppPlugin {
         if (groups.length > 0) return groups;
       }
     } catch (e) {
-      // ignore and continue to the full scan fallback
+      // ignore and fall back to the indexed candidate path result
     }
 
-    return this.buildPropertyBacklinkGroupsFromRecords(this.data.getAllRecords?.() || [], targetGuid, { showSelf });
+    return [];
   }
 
   buildPropertyBacklinkGroupsFromRecords(sourceRecords, targetGuid, { showSelf }) {
@@ -5619,22 +5517,6 @@ class Plugin extends AppPlugin {
       .tlr-sort-menu-divider {
         margin: 8px 0;
         border-top: 1px solid var(--cmdpal-border-color, var(--tlr-border-color));
-      }
-
-      .tlr-line-jump-highlight {
-        border-radius: 6px;
-        animation: tlr-line-jump-highlight 1.4s ease-out;
-      }
-
-      @keyframes tlr-line-jump-highlight {
-        0% {
-          background: var(--bg-selected, rgba(250, 204, 21, 0.28));
-          box-shadow: inset 0 0 0 1px var(--input-border-color, var(--tlr-border-color));
-        }
-        100% {
-          background: transparent;
-          box-shadow: none;
-        }
       }
 
       .tlr-search-row {
