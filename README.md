@@ -1,12 +1,18 @@
 # Backreferences for Thymer
 
 ---
-CHANGES FROM ORIGINAL:
-- Added preview drop down to backreferenced files
-- Some styling changes added
-- Removed backreferences from today's journal page (using 'Today's Notes' plugin on daily journal instead)
-- Incorporated one-click unlinked references linking
---- 
+This repository is a fork/customization of the original Backreferences plugin work by harpreetchima.
+
+‼️ In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome! ‼️
+
+## Fork focus (what this repo adds)
+
+- Expandable inline preview for backreferenced records
+- One-click linking flow for unlinked references
+- Journal-page suppression (when using Today's Notes footer for daily pages)
+- Styling and UX refinements to align with the current workspace plugin set
+
+---
 
 When you are writing a note, one of the first questions is: where else is this referenced?
 Backreferences solves that problem by adding an always-available references panel to the active note, so you can quickly see incoming mentions and navigate to context.
@@ -23,7 +29,8 @@ Built for [Thymer](https://thymer.com/) using the [Thymer Plugin SDK](https://gi
 
 ## Credits
 
-- Credit to [@ahpatel](https://github.com/ahpatel) and the fork [ahpatel/thymer-backreferences](https://github.com/ahpatel/thymer-backreferences) for the unlinked references and collapsible header work that informed this plugin.
+- Original Backreferences plugin work by harpreetchima.
+- Credit to [@ahpatel](https://github.com/ahpatel) and the fork [ahpatel/thymer-backreferences](https://github.com/ahpatel/thymer-backreferences) for unlinked-reference and collapsible-header patterns that informed this fork.
 
 ## What It Shows
 
