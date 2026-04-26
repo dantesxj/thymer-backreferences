@@ -5,8 +5,8 @@
  *
  * Edit this file, then from repo root: npm run embed-plugin-settings
  *
- * Debug: console filter `[ThymerExt/PluginBackend]`. To silence:
- *   localStorage.setItem('thymerext_debug_collections', '0'); location.reload();
+ * Debug: console filter `[ThymerExt/PluginBackend]`. Off by default; to enable:
+ *   localStorage.setItem('thymerext_debug_collections', '1'); location.reload();
  *
  * Rows:
  * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
@@ -35,14 +35,16 @@
 
   /**
    * Collection ensure diagnostics (read browser console for `[ThymerExt/PluginBackend]`.
-   * Disable: `localStorage.setItem('thymerext_debug_collections','0')` then reload.
+   * Opt-in: `localStorage.setItem('thymerext_debug_collections','1')` then reload.
+   * Opt-out: remove the key or set to `0` / `off` / `false`.
    */
   const DEBUG_COLLECTIONS = (() => {
     try {
       const o = localStorage.getItem('thymerext_debug_collections');
       if (o === '0' || o === 'off' || o === 'false') return false;
+      return o === '1' || o === 'true' || o === 'on';
     } catch (_) {}
-    return true;
+    return false;
   })();
   const DEBUG_PATHB_ID =
     'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
@@ -810,6 +812,169 @@
     return s;
   }
 
+  /** Configured collection name only (avoids duplicating `collectionDisplayName` fallbacks). */
+  function collectionBackendConfiguredTitle(c) {
+    if (!c) return '';
+    try {
+      return String(c.getConfiguration?.()?.name || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /**
+   * When plugin iframes are opaque (blob/sandbox), `navigator.locks` and `window.top` globals do not
+   * dedupe across realms. First `localStorage` we can reach on the Thymer app origin is shared.
+   */
+  function getSharedThymerLocalStorage() {
+    const seen = new Set();
+    const tryWin = (w) => {
+      if (!w || seen.has(w)) return null;
+      seen.add(w);
+      try {
+        const ls = w.localStorage;
+        void ls.length;
+        return ls;
+      } catch (_) {
+        return null;
+      }
+    };
+    try {
+      const t = tryWin(window.top);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      const t = tryWin(window);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      let w = window;
+      for (let i = 0; i < 10 && w; i++) {
+        const t = tryWin(w);
+        if (t) return t;
+        if (w === w.parent) break;
+        w = w.parent;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  const LS_CREATE_LEASE_KEY = 'thymerext_plugin_backend_create_lease_v1';
+  const LS_RECENT_CREATE_KEY = 'thymerext_plugin_backend_recent_create_v1';
+  const LS_RECENT_CREATE_ATTEMPT_KEY = 'thymerext_plugin_backend_recent_create_attempt_v1';
+
+  /**
+   * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
+   * @returns {{ denied: boolean, release: () => void }}
+   */
+  async function acquirePluginBackendCreationLease(maxWaitMs) {
+    const noop = { denied: false, release() {} };
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return noop;
+    const holder =
+      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    const deadline = Date.now() + (Number(maxWaitMs) > 0 ? maxWaitMs : 12000);
+    let acquired = false;
+    let sawContention = false;
+    while (Date.now() < deadline) {
+      try {
+        const raw = ls.getItem(LS_CREATE_LEASE_KEY);
+        let busy = false;
+        if (raw) {
+          let j = null;
+          try {
+            j = JSON.parse(raw);
+          } catch (_) {
+            j = null;
+          }
+          if (j && typeof j.exp === 'number' && j.h !== holder && j.exp > Date.now()) busy = true;
+        }
+        if (busy) {
+          sawContention = true;
+          await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 70)));
+          continue;
+        }
+        const exp = Date.now() + 45000;
+        const payload = JSON.stringify({ h: holder, exp });
+        ls.setItem(LS_CREATE_LEASE_KEY, payload);
+        await new Promise((r) => setTimeout(r, 0));
+        if (ls.getItem(LS_CREATE_LEASE_KEY) === payload) {
+          acquired = true;
+          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention });
+          break;
+        }
+      } catch (_) {
+        return noop;
+      }
+      await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
+    }
+    if (!acquired) {
+      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention });
+      return { denied: true, release() {} };
+    }
+    return {
+      denied: false,
+      release() {
+        if (!acquired) return;
+        acquired = false;
+        try {
+          const cur = ls.getItem(LS_CREATE_LEASE_KEY);
+          if (!cur) return;
+          let j = null;
+          try {
+            j = JSON.parse(cur);
+          } catch (_) {
+            return;
+          }
+          if (j && j.h === holder) ls.removeItem(LS_CREATE_LEASE_KEY);
+        } catch (_) {}
+      },
+    };
+  }
+
+  function noteRecentPluginBackendCreate() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return;
+    try {
+      ls.setItem(LS_RECENT_CREATE_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAgeMs() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return null;
+    try {
+      const raw = ls.getItem(LS_RECENT_CREATE_KEY);
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function noteRecentPluginBackendCreateAttempt() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return;
+    try {
+      ls.setItem(LS_RECENT_CREATE_ATTEMPT_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAttemptAgeMs() {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) return null;
+    try {
+      const raw = ls.getItem(LS_RECENT_CREATE_ATTEMPT_KEY);
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /** When Thymer omits names on `getAllCollections()` entries, match our Path B schema. */
   function pathBCollectionScore(c) {
     if (!c) return 0;
@@ -846,7 +1011,8 @@
     if (!cands.length) return null;
     const named = cands.find((c) => {
       const n = collectionDisplayName(c);
-      return n === COL_NAME || n === COL_NAME_LEGACY;
+      const cfg = collectionBackendConfiguredTitle(c);
+      return n === COL_NAME || n === COL_NAME_LEGACY || cfg === COL_NAME || cfg === COL_NAME_LEGACY;
     });
     return named || cands[0];
   }
@@ -858,6 +1024,8 @@
         return (
           list.find((c) => collectionDisplayName(c) === COL_NAME) ||
           list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME_LEGACY) ||
           null
         );
       };
@@ -880,6 +1048,8 @@
     for (const c of all) {
       const nm = collectionDisplayName(c);
       if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
     }
     return !!pickPathBCollectionHeuristic(all);
   }
@@ -1023,16 +1193,52 @@
         void 0;
       }
       if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
-      const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
-      if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
-        return;
+      const lease = await acquirePluginBackendCreationLease(14000);
+      if (lease.denied) return;
+      try {
+        if (await findColl(data)) return;
+        if (await hasPluginBackendOnWorkspace(data)) return;
+        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs();
+        if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
+          // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
+          for (let i = 0; i < 10; i++) {
+            await new Promise((r) => setTimeout(r, 130 + i * 70));
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
+          return;
+        }
+        const recentAge = getRecentPluginBackendCreateAgeMs();
+        if (recentAge != null && recentAge >= 0 && recentAge < 90000) {
+          // Another plugin/runtime likely just created it; let collection list/indexing settle first.
+          for (let i = 0; i < 8; i++) {
+            await new Promise((r) => setTimeout(r, 120 + i * 60));
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
+        }
+        noteRecentPluginBackendCreateAttempt();
+        const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
+        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
+          return;
+        }
+        const conf = cloneShape();
+        const base = coll.getConfiguration();
+        if (base && typeof base.ver === 'number') conf.ver = base.ver;
+        let ok = await coll.saveConfiguration(conf);
+        if (ok === false) {
+          // Transient host races can reject the first save; retry before giving up.
+          await new Promise((r) => setTimeout(r, 180));
+          ok = await coll.saveConfiguration(conf);
+        }
+        if (ok === false) return;
+        noteRecentPluginBackendCreate();
+        await new Promise((r) => setTimeout(r, 250));
+      } finally {
+        try {
+          lease.release();
+        } catch (_) {}
       }
-      const conf = cloneShape();
-      const base = coll.getConfiguration();
-      if (base && typeof base.ver === 'number') conf.ver = base.ver;
-      const ok = await coll.saveConfiguration(conf);
-      if (ok === false) return;
-      await new Promise((r) => setTimeout(r, 250));
     } catch (e) {
       console.error('[ThymerPluginSettings] ensure collection', e);
     }
