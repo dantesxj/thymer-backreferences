@@ -41,6 +41,18 @@ class Plugin extends AppPlugin {
     this._propertyIndexBuildSeq = 0;
     this._propertyIndexRebuildTimer = null;
     this._propertyIndexNeedsRebuild = false;
+    /**
+     * Records whose incremental index update was deferred (e.g. because a full
+     * build was in progress, the record wasn't retrievable yet, or the index
+     * was 'idle'). Drained at the end of every successful `buildPropertyIndex`
+     * via `drainPendingRecordReindex`. This replaces the previous behaviour of
+     * scheduling a full workspace rebuild for every deferred record event,
+     * which created a feedback loop: rebuild-in-progress → events deferred →
+     * rebuild-queued → rebuild-finishes → rebuild-starts → repeat. With many
+     * records and many active plugins, that loop pegged the main thread at
+     * ~30% indefinitely (300ms long task every ~600ms).
+     */
+    this._pendingRecordReindex = new Set();
     this._queryAutocompleteCatalog = null;
     this._queryAutocompleteCatalogPromise = null;
     this._queryStandaloneFilters = [
@@ -130,6 +142,7 @@ class Plugin extends AppPlugin {
       clearTimeout(this._propertyIndexRebuildTimer);
       this._propertyIndexRebuildTimer = null;
     }
+    this._pendingRecordReindex?.clear?.();
 
     for (const panelId of Array.from(this._panelStates?.keys?.() || [])) {
       this.disposePanelState(panelId);
@@ -3486,6 +3499,12 @@ class Plugin extends AppPlugin {
       this._propertyIndexStatus = 'ready';
       this._propertyIndexError = '';
       this.notifyPropertyIndexChanged(reason || 'property-index-ready');
+      // Re-apply any record events that arrived while the build was running.
+      // This replaces the old behaviour of scheduling a *new* full rebuild
+      // for every event that came in during the build.
+      try {
+        this.drainPendingRecordReindex(reason || 'property-index-ready-drain');
+      } catch (_) {}
     } catch (e) {
       if (this._propertyIndexBuildSeq !== seq) return;
       this._propertyIndexStatus = 'error';
@@ -3626,15 +3645,32 @@ class Plugin extends AppPlugin {
   updatePropertyIndexForRecord(sourceRecordGuid, sourceRecord) {
     const sourceGuid = ((sourceRecordGuid || sourceRecord?.guid || '') + '').trim();
     if (!sourceGuid) return false;
+    /**
+     * Defer when the index isn't ready (build-in-progress, idle, error). The
+     * record is queued in `_pendingRecordReindex` and re-applied at the end of
+     * the next successful build via `drainPendingRecordReindex`. We deliberately
+     * do NOT schedule a full workspace rebuild here — that's what created the
+     * feedback loop (every record event during a build queued another full
+     * build, looping forever once the workspace was non-trivial).
+     */
     if (this._propertyIndexStatus !== 'ready') {
-      this.schedulePropertyIndexRebuild('record-updated-during-index-build');
-      return false;
+      this._pendingRecordReindex.add(sourceGuid);
+      return true;
     }
 
     const record = sourceRecord || this.data.getRecord?.(sourceGuid) || null;
     if (!record) {
-      this.schedulePropertyIndexRebuild('record-updated-without-record');
-      return false;
+      // Record was deleted (or not yet retrievable). Prune any stale entry from
+      // the index instead of rebuilding the whole workspace — pruning is O(1)
+      // amortised, the prior full rebuild was O(records × properties).
+      this.removeSourceRecordFromPropertyIndex(sourceGuid);
+      this._propertyIndexStats = {
+        ...(this._propertyIndexStats || this.createEmptyPropertyIndexStats()),
+        indexedReferences: this.countPropertyIndexReferences(),
+        indexedTargets: this._propertyIndexByTargetGuid.size
+      };
+      this.notifyPropertyIndexChanged('record-property-index-pruned');
+      return true;
     }
 
     this.removeSourceRecordFromPropertyIndex(sourceGuid);
@@ -3650,6 +3686,50 @@ class Plugin extends AppPlugin {
     };
     this.notifyPropertyIndexChanged('record-property-index-updated');
     return true;
+  }
+
+  /**
+   * Re-apply incremental updates for records that were deferred while the index
+   * was being (re)built. Called from the success path of `buildPropertyIndex`.
+   * We skip notifying per-record (would be O(pending) churn) and emit a single
+   * notification at the end if any records were actually applied.
+   */
+  drainPendingRecordReindex(reason) {
+    const pending = this._pendingRecordReindex;
+    if (!pending || pending.size === 0) return;
+    const guids = Array.from(pending);
+    pending.clear();
+    if (this._propertyIndexStatus !== 'ready') {
+      // The index isn't ready — re-queue and bail. Drain will retry on next
+      // successful build.
+      for (const g of guids) pending.add(g);
+      return;
+    }
+    let applied = 0;
+    for (const guid of guids) {
+      try {
+        const record = this.data.getRecord?.(guid) || null;
+        this.removeSourceRecordFromPropertyIndex(guid);
+        if (record) {
+          this.indexSourceRecordPropertyRefs(
+            record,
+            this._propertyIndexByTargetGuid,
+            this._propertyIndexSourceEntriesByRecordGuid
+          );
+        }
+        applied += 1;
+      } catch (_) {
+        // Ignore individual record failures — drain is best-effort.
+      }
+    }
+    if (applied > 0) {
+      this._propertyIndexStats = {
+        ...(this._propertyIndexStats || this.createEmptyPropertyIndexStats()),
+        indexedReferences: this.countPropertyIndexReferences(),
+        indexedTargets: this._propertyIndexByTargetGuid.size
+      };
+      this.notifyPropertyIndexChanged(reason || 'record-property-index-drained');
+    }
   }
 
   getPropertyBacklinkGroupsFromIndex(targetGuid, { showSelf } = {}) {
@@ -4390,18 +4470,21 @@ class Plugin extends AppPlugin {
 
     const sourceRecordGuid = this.getEventRecordGuid(ev);
     const sourceRecord = sourceRecordGuid ? (this.data.getRecord?.(sourceRecordGuid) || null) : null;
-    if (!this.updatePropertyIndexForRecord(sourceRecordGuid, sourceRecord)) {
-      this.schedulePropertyIndexRebuild('record.updated-property-index-rebuild');
-    }
+    /**
+     * `updatePropertyIndexForRecord` now always returns a useful result: it
+     * either applies the update, prunes the record, or queues the guid for
+     * later drain. We never fall back to scheduling a full workspace rebuild
+     * here — that was the original feedback-loop bug.
+     */
+    this.updatePropertyIndexForRecord(sourceRecordGuid, sourceRecord);
   }
 
   handleRecordCreated(ev) {
     const sourceRecordGuid = this.getEventRecordGuid(ev);
     const sourceRecord = sourceRecordGuid ? (this.data.getRecord?.(sourceRecordGuid) || null) : null;
-    if (sourceRecordGuid && sourceRecord) {
+    if (sourceRecordGuid) {
+      // Same as above: queue or apply incrementally; never schedule a full rebuild.
       this.updatePropertyIndexForRecord(sourceRecordGuid, sourceRecord);
-    } else {
-      this.schedulePropertyIndexRebuild('record.created-property-index-rebuild');
     }
     const refreshed = this.refreshMatchingStates(ev, 'record.created', (state) =>
       this.recordEventAffectsState(state, sourceRecordGuid, sourceRecord)
