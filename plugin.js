@@ -41,6 +41,10 @@ class Plugin extends AppPlugin {
     this._propertyIndexBuildSeq = 0;
     this._propertyIndexRebuildTimer = null;
     this._propertyIndexNeedsRebuild = false;
+    this._propertyIndexInitialDeferHandle = null;
+    this._propertyIndexInitialDeferIsIdle = false;
+    /** null = unknown; true = use record.getBackReferenceRecords(); false = legacy workspace index */
+    this._propertyIndexSdkMode = null;
     /**
      * Records whose incremental index update was deferred (e.g. because a full
      * build was in progress, the record wasn't retrievable yet, or the index
@@ -113,15 +117,100 @@ class Plugin extends AppPlugin {
     this._eventHandlerIds.push(this.events.on('record.updated', (ev) => this.handleRecordUpdated(ev)));
     this._eventHandlerIds.push(this.events.on('record.moved', (ev) => this.handleRecordMoved(ev)));
 
-    const panel = this.ui.getActivePanel();
-    if (panel) this.handlePanelChanged(panel, 'initial');
-    this.rebuildPropertyIndex({ reason: 'initial' }).catch(() => {
-      // The error state is rendered in the footer.
-    });
-    setTimeout(() => {
-      const p = this.ui.getActivePanel();
-      if (p) this.handlePanelChanged(p, 'initial-delayed');
-    }, 250);
+    try {
+      globalThis.thymerExtEnsureMobileLoadGrace?.();
+      globalThis.thymerExtInstallMobileResumeGrace?.();
+    } catch (_) {}
+    const bootRecord = this.ui.getActivePanel?.()?.getActiveRecord?.() || null;
+    if (this.noteSdkPropertyBacklinksFromRecord(bootRecord)) {
+      try {
+        console.info('[Backreferences] property backlinks: SDK (no workspace index)');
+      } catch (_) {}
+    } else {
+      const probeDelayMs = this.preferDeferredHeavyWork() ? 900 : 220;
+      setTimeout(() => {
+        try {
+          const latePanel = this.ui.getActivePanel?.();
+          const lateRecord = latePanel?.getActiveRecord?.() || null;
+          if (this.noteSdkPropertyBacklinksFromRecord(lateRecord)) {
+            try {
+              console.info('[Backreferences] property backlinks: SDK (late probe, no workspace index)');
+            } catch (_) {}
+            return;
+          }
+        } catch (_) {}
+        try {
+          console.info(
+            '[Backreferences] property backlinks: legacy — workspace index starts when a visible backreferences footer opens'
+          );
+        } catch (_) {}
+      }, probeDelayMs);
+    }
+    const kickInitialPanel = () => {
+      try {
+        const p = this.ui.getActivePanel?.();
+        if (p) this.handlePanelChanged(p, 'initial-delayed');
+      } catch (_) {}
+    };
+    if (this.inMobileLoadGrace()) {
+      this._scheduleMobileGraceDrain();
+    } else {
+      const panel = this.ui.getActivePanel?.();
+      if (panel) this.handlePanelChanged(panel, 'initial');
+      setTimeout(kickInitialPanel, 250);
+    }
+  }
+
+  inMobileLoadGrace() {
+    try {
+      if (typeof globalThis.thymerExtInMobileLoadGrace === 'function') {
+        return globalThis.thymerExtInMobileLoadGrace();
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  _scheduleMobileGraceDrain() {
+    if (this._mobileGraceDrainTimer) return;
+    const tick = () => {
+      if (this.inMobileLoadGrace()) {
+        this._mobileGraceDrainTimer = setTimeout(tick, 2000);
+        return;
+      }
+      this._mobileGraceDrainTimer = null;
+      this._drainDeferredWorkAfterMobileGrace();
+    };
+    this._mobileGraceDrainTimer = setTimeout(tick, 2000);
+  }
+
+  _drainDeferredWorkAfterMobileGrace() {
+    const enqueue = typeof globalThis.thymerExtEnqueueHeavyWork === 'function'
+      ? globalThis.thymerExtEnqueueHeavyWork
+      : null;
+    const run = async () => {
+      for (const state of this._panelStates.values()) {
+        if (!state?._backrefsDeferredWork || !state.panel) continue;
+        state._backrefsDeferredWork = false;
+        try {
+          if (!this.isPanelVisible(state.panel)) continue;
+          if (!this.usesSdkPropertyBacklinks()) {
+            this.ensurePropertyIndexStarted('panel-visible-after-grace');
+          }
+          this.scheduleRefreshForPanel(state.panel, {
+            force: true,
+            reason: 'mobile-grace-end',
+          });
+          // Yield between panels to keep navigation responsive.
+          await new Promise((r) => setTimeout(r, 0));
+        } catch (_) {}
+      }
+      try {
+        const p = this.ui.getActivePanel?.();
+        if (p) this.handlePanelChanged(p, 'mobile-grace-end');
+      } catch (_) {}
+    };
+    if (enqueue) enqueue(run, { delayMs: 3500 });
+    else void run();
   }
 
   onUnload() {
@@ -138,10 +227,15 @@ class Plugin extends AppPlugin {
     this._cmdToggleDefaultVisibility?.remove?.();
     this._cmdToggleCollectionVisibility?.remove?.();
 
+    if (this._mobileGraceDrainTimer) {
+      clearTimeout(this._mobileGraceDrainTimer);
+      this._mobileGraceDrainTimer = null;
+    }
     if (this._propertyIndexRebuildTimer) {
       clearTimeout(this._propertyIndexRebuildTimer);
       this._propertyIndexRebuildTimer = null;
     }
+    this.cancelInitialPropertyIndexDefer();
     this._pendingRecordReindex?.clear?.();
 
     for (const panelId of Array.from(this._panelStates?.keys?.() || [])) {
@@ -186,6 +280,11 @@ class Plugin extends AppPlugin {
     }
     const recordChanged = state.recordGuid !== recordGuid;
     state.recordGuid = recordGuid;
+    if (this.inMobileLoadGrace()) {
+      state._backrefsDeferredWork = true;
+      this._scheduleMobileGraceDrain();
+      return;
+    }
     if (recordChanged) {
       const viewPrefs = this.getPageViewPreference(recordGuid);
       state.footerCollapsed = viewPrefs.footerCollapsed;
@@ -217,16 +316,17 @@ class Plugin extends AppPlugin {
 
     if (this.isPanelVisible(panel)) {
       this.mountFooter(panel, state);
+      if (!this.usesSdkPropertyBacklinks()) {
+        this.ensurePropertyIndexStarted('panel-visible');
+      }
+      this.scheduleRefreshForPanel(panel, {
+        force: recordChanged,
+        reason: reason || (recordChanged ? 'record-changed' : 'record-same'),
+      });
     } else {
       this.unmountFooterForHiddenPanel(state);
       return;
     }
-
-    // Always refresh on navigation; on focus we debounce unless already loaded.
-    this.scheduleRefreshForPanel(panel, {
-      force: recordChanged,
-      reason: reason || (recordChanged ? 'record-changed' : 'record-same')
-    });
   }
 
   shouldSuppressInPanel(panel, panelEl) {
@@ -3397,14 +3497,99 @@ class Plugin extends AppPlugin {
   }
 
   notifyPropertyIndexChanged(reason) {
+    const isProgress = typeof reason === 'string' && reason.includes('property-index-progress');
+    if (isProgress && !this._panelStates?.size) return;
     for (const state of this._panelStates?.values?.() || []) {
       if (!state?.lastResults) continue;
       this.syncPropertyIndexResultForState(state);
+      if (isProgress) continue;
       this.renderFromCache(state);
     }
   }
 
+  cancelInitialPropertyIndexDefer() {
+    const handle = this._propertyIndexInitialDeferHandle;
+    this._propertyIndexInitialDeferHandle = null;
+    if (handle == null) return;
+    try {
+      if (this._propertyIndexInitialDeferIsIdle && typeof cancelIdleCallback === 'function') {
+        cancelIdleCallback(handle);
+      } else {
+        clearTimeout(handle);
+      }
+    } catch (e) {
+      // ignore
+    }
+    this._propertyIndexInitialDeferIsIdle = false;
+  }
+
+  usesSdkPropertyBacklinks() {
+    return this._propertyIndexSdkMode === true;
+  }
+
+  /**
+   * When Thymer exposes record.getBackReferenceRecords(), skip the workspace-wide index.
+   * @returns {boolean} true if SDK mode is now active
+   */
+  noteSdkPropertyBacklinksFromRecord(record) {
+    if (this._propertyIndexSdkMode === true) return true;
+    if (typeof record?.getBackReferenceRecords !== 'function') return false;
+    this._propertyIndexSdkMode = true;
+    this.cancelInitialPropertyIndexDefer();
+    return true;
+  }
+
+  scheduleInitialPropertyIndex() {
+    if (this.usesSdkPropertyBacklinks()) return;
+    this.cancelInitialPropertyIndexDefer();
+    const start = () => {
+      this._propertyIndexInitialDeferHandle = null;
+      this._propertyIndexInitialDeferIsIdle = false;
+      if (this._propertyIndexStatus !== 'idle') return;
+      this.rebuildPropertyIndex({ reason: 'initial-idle' }).catch(() => {
+        // The error state is rendered in the footer.
+      });
+    };
+    const idleTimeout = this.preferDeferredHeavyWork() ? 10000 : 5000;
+    try {
+      if (typeof requestIdleCallback === 'function') {
+        this._propertyIndexInitialDeferIsIdle = true;
+        this._propertyIndexInitialDeferHandle = requestIdleCallback(start, { timeout: idleTimeout });
+      } else {
+        this._propertyIndexInitialDeferIsIdle = false;
+        this._propertyIndexInitialDeferHandle = setTimeout(start, this.preferDeferredHeavyWork() ? 3500 : 1500);
+      }
+    } catch (e) {
+      this._propertyIndexInitialDeferIsIdle = false;
+      this._propertyIndexInitialDeferHandle = setTimeout(start, 2000);
+    }
+  }
+
+  ensurePropertyIndexStarted(reason = 'on-demand') {
+    if (this.usesSdkPropertyBacklinks()) return;
+    if (this.inMobileLoadGrace()) return;
+    if (this._propertyIndexStatus === 'ready' || this._propertyIndexStatus === 'indexing') return;
+    this.cancelInitialPropertyIndexDefer();
+    this.rebuildPropertyIndex({ reason: reason || 'on-demand' }).catch(() => {
+      // The error state is rendered in the footer.
+    });
+  }
+
+  preferDeferredHeavyWork() {
+    try {
+      if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) return true;
+    } catch (e) {
+      // ignore
+    }
+    try {
+      return Number(navigator?.maxTouchPoints) > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
   syncPropertyIndexResultForState(state) {
+    if (this.usesSdkPropertyBacklinks()) return false;
     const results = state?.lastResults || null;
     if (!state || !results) return false;
     const { showSelf } = this.getRefreshConfig();
@@ -3475,9 +3660,11 @@ class Plugin extends AppPlugin {
           this._propertyIndexStats.scannedRecords += 1;
 
           const now = Date.now();
+          const progressEveryRecords = this.preferDeferredHeavyWork() ? 800 : 400;
+          const progressEveryMs = this.preferDeferredHeavyWork() ? 2500 : 1200;
           if (
-            this._propertyIndexStats.scannedRecords % 250 === 0 ||
-            now - lastNotifyAt > 300
+            this._propertyIndexStats.scannedRecords % progressEveryRecords === 0 ||
+            now - lastNotifyAt > progressEveryMs
           ) {
             lastNotifyAt = now;
             this.notifyPropertyIndexChanged(reason || 'property-index-progress');
@@ -3523,7 +3710,8 @@ class Plugin extends AppPlugin {
   }
 
   waitForIndexYield() {
-    return new Promise((resolve) => setTimeout(resolve, 0));
+    const delayMs = this.preferDeferredHeavyWork() ? 12 : 0;
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 
   schedulePropertyIndexRebuild(reason, delayMs = 600) {
@@ -3789,6 +3977,77 @@ class Plugin extends AppPlugin {
     };
   }
 
+  getUnavailablePropertyBacklinkMessage() {
+    return 'Property References require a newer Thymer version. Update Thymer, then refresh references.';
+  }
+
+  getPropertyBacklinkErrorMessage(error) {
+    const message = (error?.message || '').trim();
+    if (message === this.getUnavailablePropertyBacklinkMessage()) return message;
+    return 'Property References could not be loaded. Refresh references to try again.';
+  }
+
+  async getPropertyBacklinkCandidateRecords(targetRecord) {
+    if (typeof targetRecord?.getBackReferenceRecords !== 'function') {
+      throw new Error(this.getUnavailablePropertyBacklinkMessage());
+    }
+    const records = await targetRecord.getBackReferenceRecords();
+    return Array.isArray(records) ? records : [];
+  }
+
+  async loadPropertyBacklinkResult(targetRecord, targetGuid, { showSelf } = {}) {
+    const guid = (targetGuid || targetRecord?.guid || '').trim();
+    if (!this.noteSdkPropertyBacklinksFromRecord(targetRecord)) {
+      return this.getPropertyBacklinkResult(guid, { showSelf });
+    }
+
+    const startedAt = new Date();
+    const stats = {
+      ...this.createEmptyPropertyIndexStats(),
+      reason: 'sdk-backreferences',
+      startedAt,
+      finishedAt: null
+    };
+
+    if (!guid) {
+      return {
+        propertyGroups: [],
+        propertyError: '',
+        propertyIndexStatus: 'ready',
+        propertyIndexStats: { ...stats, finishedAt: new Date() },
+        propertyIndexError: ''
+      };
+    }
+
+    try {
+      const candidateRecords = await this.getPropertyBacklinkCandidateRecords(targetRecord);
+      stats.scannedRecords = candidateRecords.length;
+      const propertyGroups = this.buildPropertyBacklinkGroupsFromRecords(candidateRecords, guid, { showSelf });
+      stats.indexedReferences = propertyGroups.reduce(
+        (total, group) => total + (group?.records?.length || 0),
+        0
+      );
+      stats.indexedTargets = stats.indexedReferences > 0 ? 1 : 0;
+      stats.finishedAt = new Date();
+      return {
+        propertyGroups,
+        propertyError: '',
+        propertyIndexStatus: 'ready',
+        propertyIndexStats: stats,
+        propertyIndexError: ''
+      };
+    } catch (e) {
+      stats.finishedAt = new Date();
+      return {
+        propertyGroups: [],
+        propertyError: '',
+        propertyIndexStatus: 'error',
+        propertyIndexStats: stats,
+        propertyIndexError: this.getPropertyBacklinkErrorMessage(e)
+      };
+    }
+  }
+
   snapshotIncludesSourceRecord(state, recordGuid) {
     const guid = (recordGuid || '').trim();
     if (!guid) return false;
@@ -3800,6 +4059,14 @@ class Plugin extends AppPlugin {
   scheduleRefreshForPanel(panel, { force, reason } = {}) {
     const panelId = panel?.getId?.() || null;
     if (!panelId) return;
+    if (this.inMobileLoadGrace() && force !== true) {
+      const state = this._panelStates.get(panelId) || this.getOrCreatePanelState(panel);
+      if (state) {
+        state._backrefsDeferredWork = true;
+        this._scheduleMobileGraceDrain();
+      }
+      return;
+    }
     if (!this.isPanelVisible(panel)) {
       const hiddenState = this._panelStates.get(panelId) || null;
       if (hiddenState) this.unmountFooterForHiddenPanel(hiddenState);
@@ -4132,7 +4399,7 @@ class Plugin extends AppPlugin {
     linkedGroups
   }) {
     const shouldLoadUnlinked = Boolean(recordName) && !this.isSectionCollapsed(state, 'unlinked');
-    const propertyResult = this.getPropertyBacklinkResult(recordGuid, { showSelf });
+    const propertyResult = await this.loadPropertyBacklinkResult(record, recordGuid, { showSelf });
     const followupPromises = [
       Promise.resolve(propertyResult)
     ];
@@ -4273,6 +4540,8 @@ class Plugin extends AppPlugin {
     const record = panel.getActiveRecord?.() || null;
     const recordGuid = record?.guid || null;
     if (!recordGuid) return;
+
+    this.noteSdkPropertyBacklinksFromRecord(record);
 
     // Keep state in sync in case of churn.
     state.recordGuid = recordGuid;
@@ -4470,6 +4739,12 @@ class Plugin extends AppPlugin {
 
     const sourceRecordGuid = this.getEventRecordGuid(ev);
     const sourceRecord = sourceRecordGuid ? (this.data.getRecord?.(sourceRecordGuid) || null) : null;
+    if (this.usesSdkPropertyBacklinks()) {
+      this.refreshMatchingStates(ev, 'record.updated', (state) =>
+        this.recordEventAffectsState(state, sourceRecordGuid, sourceRecord)
+      );
+      return;
+    }
     /**
      * `updatePropertyIndexForRecord` now always returns a useful result: it
      * either applies the update, prunes the record, or queues the guid for
@@ -4482,6 +4757,15 @@ class Plugin extends AppPlugin {
   handleRecordCreated(ev) {
     const sourceRecordGuid = this.getEventRecordGuid(ev);
     const sourceRecord = sourceRecordGuid ? (this.data.getRecord?.(sourceRecordGuid) || null) : null;
+    if (this.usesSdkPropertyBacklinks()) {
+      const refreshed = this.refreshMatchingStates(ev, 'record.created', (state) =>
+        this.recordEventAffectsState(state, sourceRecordGuid, sourceRecord)
+      );
+      if (refreshed === 0 && !sourceRecordGuid) {
+        this.handleWorkspaceInvalidation(ev, 'record.created');
+      }
+      return;
+    }
     if (sourceRecordGuid) {
       // Same as above: queue or apply incrementally; never schedule a full rebuild.
       this.updatePropertyIndexForRecord(sourceRecordGuid, sourceRecord);
@@ -5053,6 +5337,10 @@ class Plugin extends AppPlugin {
   // ---------- Grouping + rendering ----------
 
   async getPropertyBacklinkGroups(targetRecord, targetGuid, { showSelf } = {}) {
+    if (this.noteSdkPropertyBacklinksFromRecord(targetRecord)) {
+      const candidateRecords = await this.getPropertyBacklinkCandidateRecords(targetRecord);
+      return this.buildPropertyBacklinkGroupsFromRecords(candidateRecords, targetGuid, { showSelf });
+    }
     return this.getPropertyBacklinkGroupsFromIndex(targetGuid, { showSelf });
   }
 
