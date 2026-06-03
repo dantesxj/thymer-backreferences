@@ -4715,7 +4715,9 @@ class Plugin extends AppPlugin {
   lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids } = {}) {
     const targetGuid = (state?.recordGuid || '').trim();
     if (!targetGuid) return false;
-    if (sourceRecordGuid && sourceRecordGuid === targetGuid) return true;
+    // Body/format edits on the open record cannot change who backlinks *to* this page.
+    // Refreshing here caused editor caret jumps (typing, Cmd+I, etc.) — see docs/EXPANDABLE_PREVIEW_PATTERN.md §7.
+    if (sourceRecordGuid && sourceRecordGuid === targetGuid) return false;
     if (sourceRecordGuid && this.snapshotIncludesSourceRecord(state, sourceRecordGuid)) return true;
     if (referencedGuids instanceof Set && referencedGuids.has(targetGuid)) return true;
 
