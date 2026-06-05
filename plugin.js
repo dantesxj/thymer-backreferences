@@ -754,15 +754,21 @@ class Plugin extends AppPlugin {
     this.renderSortMenu(state);
     this.syncSortControlState(state);
 
-    // If the container/panel DOM churns, remount when our root disappears.
+    // Remount only when our footer node is removed from the mount container — not on every
+    // editor line DOM tick (subtree:true on the panel caused occasional caret fights).
     if (!state.observer) {
+      const observedContainer = container;
       state.observer = new MutationObserver(() => {
         if (state.rootEl && !state.rootEl.isConnected) {
-          // Remount on next tick so we don't fight Thymer's own DOM updates.
           setTimeout(() => this.mountFooter(panel, state), 0);
         }
       });
-      state.observer.observe(panelEl, { childList: true, subtree: true });
+      try {
+        state.observer.observe(observedContainer, { childList: true });
+      } catch (_) {
+        try { state.observer.disconnect(); } catch (_) {}
+        state.observer = null;
+      }
     }
   }
 
@@ -1276,6 +1282,21 @@ class Plugin extends AppPlugin {
     const panel = state?.panel || null;
     if (!panel) return;
 
+    if (action === 'open-here' || action === 'open-side') {
+      const guid = actionEl.dataset.recordGuid || null;
+      const lineGuid = actionEl.dataset.lineGuid || null;
+      if (!guid) return;
+      e.stopPropagation();
+      this.setSortMenuOpen(state, false);
+      this.openRecord(
+        panel,
+        guid,
+        lineGuid || null,
+        action === 'open-side' ? { openInSide: true } : { openInSide: false }
+      );
+      return;
+    }
+
     if (action === 'open-record') {
       const guid = actionEl.dataset.recordGuid || null;
       if (!guid) return;
@@ -1300,6 +1321,13 @@ class Plugin extends AppPlugin {
       this.openRecord(panel, guid, null, e);
       return;
     }
+  }
+
+  wantsSidePanelOpen(e) {
+    if (!e || typeof e !== 'object') return false;
+    if (e.openInSide === true) return true;
+    if (e.openInSide === false) return false;
+    return !!(e.metaKey || e.ctrlKey);
   }
 
   navigatePanelToRecord(panel, recordGuid, lineGuid, workspaceGuid) {
@@ -1371,7 +1399,7 @@ class Plugin extends AppPlugin {
     const workspaceGuid = this.getWorkspaceGuid?.() || null;
     if (!workspaceGuid) return;
 
-    const openInNew = e?.metaKey || e?.ctrlKey;
+    const openInNew = this.wantsSidePanelOpen(e);
 
     if (openInNew) {
       try {
@@ -1395,6 +1423,42 @@ class Plugin extends AppPlugin {
 
     this.navigatePanelToRecord(panel, recordGuid, lineGuid || null, workspaceGuid);
     this.ui.setActivePanel(panel);
+  }
+
+  panelNavSvg(kind) {
+    const n = 14;
+    if (kind === 'side') {
+      return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="1.5" opacity="0.35"/><path d="M14 5v14"/><path d="M7 12h4"/><path d="m9 10 2 2-2 2"/></svg>';
+    }
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>';
+  }
+
+  buildPanelNavButton(action, recordGuid, lineGuid, label, kind) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tlr-panel-nav-btn button-none button-small button-minimal-hover tooltip';
+    btn.dataset.action = action;
+    btn.dataset.recordGuid = recordGuid || '';
+    if (lineGuid) btn.dataset.lineGuid = lineGuid;
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    btn.setAttribute('data-tooltip', label);
+    btn.setAttribute('data-tooltip-dir', 'top');
+
+    const wrap = document.createElement('span');
+    wrap.className = 'tlr-panel-nav-icon';
+    wrap.innerHTML = this.panelNavSvg(kind);
+    btn.appendChild(wrap);
+
+    return btn;
+  }
+
+  buildPanelNavActions(recordGuid, lineGuid = '') {
+    const wrap = document.createElement('div');
+    wrap.className = 'tlr-panel-nav-actions';
+    wrap.appendChild(this.buildPanelNavButton('open-here', recordGuid, lineGuid, 'Open in this panel', 'here'));
+    wrap.appendChild(this.buildPanelNavButton('open-side', recordGuid, lineGuid, 'Open in side panel', 'side'));
+    return wrap;
   }
 
   applyCollapsedState(root, collapsed) {
@@ -4706,7 +4770,8 @@ class Plugin extends AppPlugin {
   recordEventAffectsState(state, sourceRecordGuid, sourceRecord) {
     const targetGuid = (state?.recordGuid || '').trim();
     if (!targetGuid) return false;
-    if (sourceRecordGuid && sourceRecordGuid === targetGuid) return true;
+    // Same as lineitem: body/property saves on the open page do not change incoming backlinks.
+    if (sourceRecordGuid && sourceRecordGuid === targetGuid) return false;
     if (sourceRecordGuid && this.snapshotIncludesSourceRecord(state, sourceRecordGuid)) return true;
     if (sourceRecord && this.recordReferencesGuid(sourceRecord, targetGuid)) return true;
     return false;
@@ -4797,24 +4862,18 @@ class Plugin extends AppPlugin {
     const sourceRecordGuid = this.getEventRecordGuid(ev);
     const segments = this.getEventLineSegments(ev);
     const referencedGuids = this.extractReferencedRecordGuids(segments);
-    const refreshed = this.refreshMatchingStates(ev, 'lineitem.updated', (state) =>
+    this.refreshMatchingStates(ev, 'lineitem.updated', (state) =>
       this.lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids })
     );
-    if (refreshed === 0 && !sourceRecordGuid && segments.length === 0) {
-      this.handleWorkspaceInvalidation(ev, 'lineitem.updated');
-    }
   }
 
   handleLineItemCreated(ev) {
     const sourceRecordGuid = this.getEventRecordGuid(ev);
     const segments = this.getEventLineSegments(ev);
     const referencedGuids = this.extractReferencedRecordGuids(segments);
-    const refreshed = this.refreshMatchingStates(ev, 'lineitem.created', (state) =>
+    this.refreshMatchingStates(ev, 'lineitem.created', (state) =>
       this.lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids })
     );
-    if (refreshed === 0 && !sourceRecordGuid && segments.length === 0) {
-      this.handleWorkspaceInvalidation(ev, 'lineitem.created');
-    }
   }
 
   handleLineItemMoved(ev) {
@@ -6936,10 +6995,15 @@ class Plugin extends AppPlugin {
         this.appendHighlightedText(btn, name, query);
         this.appendLiveBadges(btn, state, this.getPropertySnapshotKey(propName, guid));
 
+        const titleCluster = document.createElement('div');
+        titleCluster.className = 'tlr-row-title-cluster';
+        titleCluster.appendChild(btn);
+        titleCluster.appendChild(this.buildPanelNavActions(guid));
+
         const btnRow = document.createElement('div');
         btnRow.className = 'tlr-prop-record-row';
         btnRow.appendChild(this.buildExpandRecordBtn(guid, state));
-        btnRow.appendChild(btn);
+        btnRow.appendChild(titleCluster);
         recWrap.appendChild(btnRow);
         recWrap.appendChild(this.buildRecordPreviewEl(guid, state));
         recsEl.appendChild(recWrap);
@@ -7019,7 +7083,12 @@ class Plugin extends AppPlugin {
       meta.className = 'tlr-group-meta text-details';
       meta.textContent = `${lines.length}`;
 
-      header.appendChild(title);
+      const titleCluster = document.createElement('div');
+      titleCluster.className = 'tlr-row-title-cluster';
+      titleCluster.appendChild(title);
+      titleCluster.appendChild(this.buildPanelNavActions(recordGuid));
+
+      header.appendChild(titleCluster);
       header.appendChild(meta);
 
       rowEl.appendChild(toggleBtn);
@@ -7049,9 +7118,14 @@ class Plugin extends AppPlugin {
         lineEl.dataset.lineGuid = line.guid;
         this.appendLineText(lineEl, line, query);
         this.appendLiveBadges(lineEl, state, this.getLinkedSnapshotKey(line.guid));
+        const lineCluster = document.createElement('div');
+        lineCluster.className = 'tlr-line-title-cluster';
+        lineCluster.appendChild(lineEl);
+        lineCluster.appendChild(this.buildPanelNavActions(recordGuid, line.guid));
+
         const mainRowEl = document.createElement('div');
         mainRowEl.className = 'tlr-line-main';
-        mainRowEl.appendChild(lineEl);
+        mainRowEl.appendChild(lineCluster);
         entryEl.appendChild(mainRowEl);
 
         if (state && ctx) {
@@ -8319,10 +8393,95 @@ class Plugin extends AppPlugin {
         flex: 0 0 auto;
       }
 
+      .tlr-prop-record-row .tlr-row-title-cluster {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
       .tlr-prop-record-row .tlr-prop-record {
         flex: 1 1 auto;
         min-width: 0;
         width: auto;
+      }
+
+      .tlr-row-title-cluster {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .tlr-group-title {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .tlr-line-title-cluster {
+        display: flex;
+        align-items: flex-start;
+        gap: 4px;
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .tlr-line-title-cluster .tlr-line {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .tlr-panel-nav-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        flex: 0 0 auto;
+        opacity: 0.72;
+        transition: opacity 120ms ease;
+      }
+
+      .tlr-group-row:hover .tlr-panel-nav-actions,
+      .tlr-group-row:focus-within .tlr-panel-nav-actions,
+      .tlr-prop-record-row:hover .tlr-panel-nav-actions,
+      .tlr-prop-record-row:focus-within .tlr-panel-nav-actions,
+      .tlr-line-main:hover .tlr-panel-nav-actions,
+      .tlr-line-main:focus-within .tlr-panel-nav-actions,
+      .tlr-group-header:hover .tlr-panel-nav-actions,
+      .tlr-group-header:focus-within .tlr-panel-nav-actions {
+        opacity: 1;
+      }
+
+      .tlr-panel-nav-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        border-radius: 5px;
+        color: var(--tlr-text-muted);
+        line-height: 1;
+      }
+
+      .tlr-panel-nav-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+      }
+
+      .tlr-panel-nav-icon svg {
+        display: block;
+        width: 14px;
+        height: 14px;
+      }
+
+      .tlr-panel-nav-btn:hover {
+        color: var(--tlr-text-default);
+        background: var(--tlr-selected-bg);
       }
 
       .tlr-footer .tlr-prop-record-wrap .tlr-record-preview {
