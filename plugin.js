@@ -30,6 +30,9 @@ class Plugin extends AppPlugin {
 
     this._defaultMaxResults = 200;
     this._refreshDebounceMs = 350;
+    /** Known backlink sources: content-only edits cannot change the backlink list. */
+    this._knownSourceRefreshDebounceMs = 8000;
+    this._typingIdleRefreshMs = 1400;
     this._queryFilterDebounceMs = 180;
     this._defaultQueryFilterMaxResults = 1000;
     this._propertyIndexStatus = 'idle';
@@ -319,10 +322,15 @@ class Plugin extends AppPlugin {
       if (!this.usesSdkPropertyBacklinks()) {
         this.ensurePropertyIndexStarted('panel-visible');
       }
-      this.scheduleRefreshForPanel(panel, {
-        force: recordChanged,
-        reason: reason || (recordChanged ? 'record-changed' : 'record-same'),
-      });
+      // Do not full-refresh on panel.focused / panel.navigated when the record is unchanged —
+      // that fought the editor during typing and Cmd+I (see docs/EXPANDABLE_PREVIEW_PATTERN.md §7).
+      const needsDataRefresh = recordChanged || !state.lastResults;
+      if (needsDataRefresh) {
+        this.scheduleRefreshForPanel(panel, {
+          force: recordChanged,
+          reason: reason || (recordChanged ? 'record-changed' : 'initial-load'),
+        });
+      }
     } else {
       this.unmountFooterForHiddenPanel(state);
       return;
@@ -4120,7 +4128,31 @@ class Plugin extends AppPlugin {
 
   // ---------- Refresh orchestration ----------
 
-  scheduleRefreshForPanel(panel, { force, reason } = {}) {
+  isUserEditingRecordBody(panel) {
+    if (!panel) return false;
+    try {
+      const panelEl = panel.getElement?.() || null;
+      if (!panelEl || typeof document === 'undefined') return false;
+      const active = document.activeElement;
+      if (!active || active === document.body) return false;
+      if (!panelEl.contains(active)) return false;
+      if (active.isContentEditable === true) return true;
+      const tag = active.tagName;
+      if (tag === 'TEXTAREA') return true;
+      if (tag === 'INPUT') {
+        const type = String(active.type || '').toLowerCase();
+        if (type === 'checkbox' || type === 'radio' || type === 'button' || type === 'submit' || type === 'reset' || type === 'file') {
+          return false;
+        }
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  scheduleRefreshForPanel(panel, { force, reason, debounceMs } = {}) {
     const panelId = panel?.getId?.() || null;
     if (!panelId) return;
     if (this.inMobileLoadGrace() && force !== true) {
@@ -4145,10 +4177,20 @@ class Plugin extends AppPlugin {
       state.refreshTimer = null;
     }
 
-    const delay = force ? 0 : this._refreshDebounceMs;
+    const delay = force
+      ? 0
+      : (Number.isFinite(debounceMs) && debounceMs >= 0 ? debounceMs : this._refreshDebounceMs);
     state.refreshTimer = setTimeout(() => {
       state.refreshTimer = null;
-      this.refreshPanel(panelId, { reason: reason || 'scheduled' }).catch(() => {
+      if (!force && this.isUserEditingRecordBody(panel)) {
+        this.scheduleRefreshForPanel(panel, {
+          force: false,
+          reason: reason || 'deferred-while-typing',
+          debounceMs: this._typingIdleRefreshMs,
+        });
+        return;
+      }
+      this.refreshPanel(panelId, { reason: reason || 'scheduled', force }).catch(() => {
         // ignore
       });
     }, delay);
@@ -4596,7 +4638,7 @@ class Plugin extends AppPlugin {
     }
   }
 
-  async refreshPanel(panelId, { reason } = {}) {
+  async refreshPanel(panelId, { reason, force } = {}) {
     const state = this._panelStates.get(panelId) || null;
     const panel = state?.panel || null;
     if (!state || !panel) return;
@@ -4604,6 +4646,15 @@ class Plugin extends AppPlugin {
     const record = panel.getActiveRecord?.() || null;
     const recordGuid = record?.guid || null;
     if (!recordGuid) return;
+
+    if (!force && this.isUserEditingRecordBody(panel)) {
+      this.scheduleRefreshForPanel(panel, {
+        force: false,
+        reason: reason || 'deferred-while-typing',
+        debounceMs: this._typingIdleRefreshMs,
+      });
+      return;
+    }
 
     this.noteSdkPropertyBacklinksFromRecord(record);
 
@@ -4624,7 +4675,8 @@ class Plugin extends AppPlugin {
     const seq = (state.refreshSeq || 0) + 1;
     state.refreshSeq = seq;
 
-    this.setLoadingState(state, true);
+    const showLoading = force === true || !this.isUserEditingRecordBody(panel);
+    if (showLoading) this.setLoadingState(state, true);
 
     try {
       const { maxResults, showSelf } = this.getRefreshConfig();
@@ -4656,9 +4708,39 @@ class Plugin extends AppPlugin {
         linkedError
       }, { reason: reason || 'refresh' });
     } finally {
-      if (this.isRefreshStateCurrent(panelId, state, seq)) {
+      if (showLoading && this.isRefreshStateCurrent(panelId, state, seq)) {
         this.setLoadingState(state, false);
       }
+    }
+  }
+
+  /**
+   * Per-panel lineitem scheduling — see docs/EXPANDABLE_PREVIEW_PATTERN.md §7.
+   * Skips the open record; debounces known sources lightly; only fast-refreshes when a new [[ref]] hits this page.
+   */
+  filterAndScheduleLineEvent(ev, segments, reason) {
+    const editedRecordGuid = this.getEventRecordGuid(ev);
+    const referencedGuids = this.extractReferencedRecordGuids(segments);
+
+    for (const state of this._panelStates.values()) {
+      const panel = state?.panel || null;
+      if (!panel || !state?.recordGuid) continue;
+
+      const targetGuid = (state.recordGuid || '').trim();
+      if (!targetGuid) continue;
+      if (editedRecordGuid && editedRecordGuid === targetGuid) continue;
+
+      const hitsTargetRecord = referencedGuids instanceof Set && referencedGuids.has(targetGuid);
+      const hitsKnownSource = editedRecordGuid
+        ? this.snapshotIncludesSourceRecord(state, editedRecordGuid)
+        : false;
+      if (!hitsTargetRecord && !hitsKnownSource) continue;
+
+      this.markStatePendingRemote(state, ev);
+      const debounceMs = hitsTargetRecord
+        ? this._refreshDebounceMs
+        : this._knownSourceRefreshDebounceMs;
+      this.scheduleRefreshForPanel(panel, { force: false, reason: reason || 'lineitem', debounceMs });
     }
   }
 
@@ -4858,58 +4940,28 @@ class Plugin extends AppPlugin {
 
   handleLineItemUpdated(ev) {
     if (!ev) return;
-
-    const sourceRecordGuid = this.getEventRecordGuid(ev);
-    const segments = this.getEventLineSegments(ev);
-    const referencedGuids = this.extractReferencedRecordGuids(segments);
-    this.refreshMatchingStates(ev, 'lineitem.updated', (state) =>
-      this.lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids })
-    );
+    this.filterAndScheduleLineEvent(ev, this.getEventLineSegments(ev), 'lineitem.updated');
   }
 
   handleLineItemCreated(ev) {
-    const sourceRecordGuid = this.getEventRecordGuid(ev);
-    const segments = this.getEventLineSegments(ev);
-    const referencedGuids = this.extractReferencedRecordGuids(segments);
-    this.refreshMatchingStates(ev, 'lineitem.created', (state) =>
-      this.lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids })
-    );
+    if (!ev) return;
+    this.filterAndScheduleLineEvent(ev, this.getEventLineSegments(ev), 'lineitem.created');
   }
 
   handleLineItemMoved(ev) {
-    const sourceRecordGuid = this.getEventRecordGuid(ev);
-    const segments = this.getEventLineSegments(ev);
-    const referencedGuids = this.extractReferencedRecordGuids(segments);
-    const refreshed = this.refreshMatchingStates(ev, 'lineitem.moved', (state) =>
-      this.lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids })
-    );
-    if (refreshed === 0 && !sourceRecordGuid && segments.length === 0) {
-      this.handleWorkspaceInvalidation(ev, 'lineitem.moved');
-    }
+    if (!ev) return;
+    this.filterAndScheduleLineEvent(ev, this.getEventLineSegments(ev), 'lineitem.moved');
   }
 
   handleLineItemUndeleted(ev) {
-    const sourceRecordGuid = this.getEventRecordGuid(ev);
-    const segments = this.getEventLineSegments(ev);
-    const referencedGuids = this.extractReferencedRecordGuids(segments);
-    const refreshed = this.refreshMatchingStates(ev, 'lineitem.undeleted', (state) =>
-      this.lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids })
-    );
-    if (refreshed === 0 && !sourceRecordGuid && segments.length === 0) {
-      this.handleWorkspaceInvalidation(ev, 'lineitem.undeleted');
-    }
+    if (!ev) return;
+    this.filterAndScheduleLineEvent(ev, this.getEventLineSegments(ev), 'lineitem.undeleted');
   }
 
   handleLineItemDeleted(ev) {
-    const sourceRecordGuid = this.getEventRecordGuid(ev);
-    const segments = this.getEventLineSegments(ev);
-    const referencedGuids = this.extractReferencedRecordGuids(segments);
-    const refreshed = this.refreshMatchingStates(ev, 'lineitem.deleted', (state) =>
-      this.lineEventAffectsState(state, { sourceRecordGuid, segments, referencedGuids })
-    );
-    if (refreshed === 0 && !sourceRecordGuid && segments.length === 0) {
-      this.handleWorkspaceInvalidation(ev, 'lineitem.deleted');
-    }
+    if (!ev) return;
+    // Segments are often unavailable on delete — filter by source record guid only.
+    this.filterAndScheduleLineEvent(ev, [], 'lineitem.deleted');
   }
 
   countLinkedReferences(groups) {
