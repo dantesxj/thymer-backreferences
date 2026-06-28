@@ -1,3 +1,2524 @@
+// @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
+/**
+ * ThymerPluginSettings — workspace **Plugin Backend** collection + optional localStorage mirror
+ * for global plugins that do not own a collection. (Legacy name **Plugin Settings** is still found until renamed.)
+ *
+ * Edit this file, then from repo root: npm run embed-plugin-settings
+ *
+ * Debug: console filter `[ThymerExt/PluginBackend]`. Off by default; to enable:
+ *   localStorage.setItem('thymerext_debug_collections', '1'); location.reload();
+ *
+ * Create dedupe: Web Locks + **per-workspace** localStorage lease/recent-create keys (workspaceGuid from
+ * `data.getActiveUsers()[0]`), plus abort if an exact-named Plugin Backend collection already exists.
+ *
+ * Rows:
+ * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
+ * - **Other rows** (`record_kind` = `log`, `config`, …): same **Plugin** field (`plugin`) for filtering;
+ *   use a **distinct** `plugin_id` per row (e.g. `habit-tracker:log:2026-04-24`) so vault lookup stays unambiguous.
+ *
+ * API: ThymerPluginSettings.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerPluginSettings.scheduleFlush(plugin, mirrorKeys)
+ *      ThymerPluginSettings.flushNow(data, pluginId, mirrorKeys)
+ *      ThymerPluginSettings.openStorageDialog({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerPluginSettings.listRows(data, { pluginSlug, recordKind? })
+ *      ThymerPluginSettings.createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle?, settingsDoc? })
+ *      ThymerPluginSettings.upgradeCollectionSchema(data) — merge missing `plugin` / `record_kind` fields into existing collection
+ *      ThymerPluginSettings.registerPluginSlug(data, { slug, label? }) — ensure `plugin` choice includes this slug (call once per plugin)
+ */
+(function pluginSettingsRuntime(g) {
+  if (g.ThymerPluginSettings) return;
+
+  const COL_NAME = 'Plugin Backend';
+  const COL_NAME_LEGACY = 'Plugin Settings';
+  const KIND_VAULT = 'vault';
+  const FIELD_PLUGIN = 'plugin';
+  const FIELD_KIND = 'record_kind';
+  const q = [];
+  let busy = false;
+
+  /**
+   * Collection ensure diagnostics (read browser console for `[ThymerExt/PluginBackend]`.
+   * Opt-in: `localStorage.setItem('thymerext_debug_collections','1')` then reload.
+   * Opt-out: remove the key or set to `0` / `off` / `false`.
+   */
+  const DEBUG_COLLECTIONS = (() => {
+    try {
+      const o = localStorage.getItem('thymerext_debug_collections');
+      if (o === '0' || o === 'off' || o === 'false') return false;
+      return o === '1' || o === 'true' || o === 'on';
+    } catch (_) {}
+    return false;
+  })();
+  const DEBUG_PATHB_ID =
+    'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
+
+  /** In-flight dedupe: parallel plugin `init()` calls share one `getAllCollections()` snapshot. */
+  const DATA_GET_ALL_P = '__thymerExtGetAllCollectionsInflight';
+
+  function preferDeferredHeavyWork() {
+    try {
+      if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) return true;
+    } catch (_) {}
+    try {
+      return Number(navigator?.maxTouchPoints) > 0;
+    } catch (_) {}
+    return false;
+  }
+
+  const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
+  const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
+  const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
+  /** Mobile: brief bootstrap — end early on first user interaction (see endMobileLoadGrace). */
+  const MOBILE_GRACE_MS = 6000;
+  const MOBILE_RESUME_GRACE_MS = 6000;
+  const MOBILE_RESUME_AWAY_MS = 15000;
+  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE. */
+  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 5000;
+  /** Desktop: brief heavy-work pause after first click during startup storm. */
+  const DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS = 6000;
+  const MOBILE_INTERACTION_THROTTLE_MS = 2500;
+  const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
+
+  /** Cross-platform: defer vault scans / footer data populate while Thymer syncs; shells may still mount. */
+  const STARTUP_STORM_UNTIL_KEY = '__thymerExtStartupStormUntil';
+  const STARTUP_STORM_MOBILE_MS = 14000;
+  const STARTUP_STORM_DESKTOP_MS = 14000;
+
+  // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
+  // Running them concurrently causes long-task storms that block navigation.
+  const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
+  const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
+
+  function ensureStartupStormWindow(extraMs) {
+    const ms =
+      extraMs > 0
+        ? extraMs
+        : preferDeferredHeavyWork()
+          ? STARTUP_STORM_MOBILE_MS
+          : STARTUP_STORM_DESKTOP_MS;
+    const until = Date.now() + ms;
+    try {
+      if (!g[STARTUP_STORM_UNTIL_KEY] || g[STARTUP_STORM_UNTIL_KEY] < until) {
+        g[STARTUP_STORM_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+    installStartupStormInteractionListener();
+  }
+
+  function inStartupStormWindow() {
+    try {
+      return Date.now() < (g[STARTUP_STORM_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function endStartupStormWindow() {
+    try {
+      g[STARTUP_STORM_UNTIL_KEY] = 0;
+    } catch (_) {}
+  }
+
+  function scheduleAfterStartupStorm(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!inStartupStormWindow()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 400);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 120000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inStartupStormWindow() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
+  }
+
+  function endMobileLoadGrace() {
+    try {
+      g[MOBILE_GRACE_UNTIL_KEY] = 0;
+    } catch (_) {}
+  }
+
+  function installStartupStormInteractionListener() {
+    g.__thymerExtStormOnInteract = () => {
+      try {
+        endStartupStormWindow();
+        endMobileLoadGrace();
+        pauseHeavyWorkQueue(
+          preferDeferredHeavyWork() ? MOBILE_HEAVY_PAUSE_ON_INTERACT_MS : DESKTOP_HEAVY_PAUSE_ON_INTERACT_MS
+        );
+      } catch (_) {}
+    };
+    if (g.__thymerExtStormInteractInstalled) return;
+    g.__thymerExtStormInteractInstalled = true;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    const onInteract = () => {
+      try {
+        g.__thymerExtStormOnInteract?.();
+      } catch (_) {}
+    };
+    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+      try {
+        document.addEventListener(ev, onInteract, { passive: true, capture: true });
+      } catch (_) {}
+    }
+  }
+
+  function ensureMobileLoadGraceStarted(extraMs) {
+    if (!preferDeferredHeavyWork()) return;
+    ensureStartupStormWindow();
+    const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
+    try {
+      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
+        g[MOBILE_GRACE_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+    installStartupStormInteractionListener();
+    installMobileInteractionGraceListener();
+  }
+
+  function inMobileLoadGrace() {
+    if (!preferDeferredHeavyWork()) return false;
+    try {
+      return Date.now() < (g[MOBILE_GRACE_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function bumpMobileLoadGrace(ms) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (ms > 0 ? ms : MOBILE_RESUME_GRACE_MS);
+    try {
+      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
+        g[MOBILE_GRACE_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function installMobileResumeGraceListener() {
+    if (g.__thymerExtMobileGraceListenerInstalled) return;
+    g.__thymerExtMobileGraceListenerInstalled = true;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    document.addEventListener(
+      'visibilitychange',
+      () => {
+        try {
+          if (document.visibilityState === 'hidden') {
+            g[MOBILE_HIDDEN_AT_KEY] = Date.now();
+          } else if (document.visibilityState === 'visible') {
+            const hiddenAt = g[MOBILE_HIDDEN_AT_KEY] || 0;
+            const away = hiddenAt ? Date.now() - hiddenAt : 0;
+            if (away >= MOBILE_RESUME_AWAY_MS) bumpMobileLoadGrace(MOBILE_RESUME_GRACE_MS);
+          }
+        } catch (_) {}
+      },
+      { passive: true }
+    );
+  }
+
+  function pauseHeavyWorkQueue(ms) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (ms > 0 ? ms : MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
+    try {
+      if (!g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] < until) {
+        g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function isHeavyWorkQueuePaused() {
+    try {
+      return Date.now() < (g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * True during the brief startup window — use only to skip *background* sync scans,
+   * not user-initiated panel.navigated mounts (those should still schedule with debounce).
+   */
+  function shouldDeferPanelFooterWork() {
+    return inMobileLoadGrace();
+  }
+
+  /** Run `fn` now, or poll until mobile load grace ends (for one-shot startup scans that must not be dropped). */
+  function scheduleAfterMobileLoadGrace(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!preferDeferredHeavyWork() || !inMobileLoadGrace()) {
+      try {
+        run();
+      } catch (_) {}
+      return;
+    }
+    const pollMs = Math.max(120, Number(opts?.pollMs) || 350);
+    const maxWaitMs = Math.max(pollMs, Number(opts?.maxWaitMs) || 90000);
+    const started = Date.now();
+    const tick = () => {
+      if (!inMobileLoadGrace() || Date.now() - started >= maxWaitMs) {
+        try {
+          run();
+        } catch (_) {}
+        return;
+      }
+      setTimeout(tick, pollMs);
+    };
+    setTimeout(tick, pollMs);
+  }
+
+  function installMobileInteractionGraceListener() {
+    if (g.__thymerExtMobileInteractGraceInstalled) return;
+    g.__thymerExtMobileInteractGraceInstalled = true;
+    if (!preferDeferredHeavyWork()) return;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+
+    const onInteract = () => {
+      try {
+        const now = Date.now();
+        const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
+        if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
+        g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
+        endStartupStormWindow();
+        endMobileLoadGrace();
+        pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
+      } catch (_) {}
+    };
+
+    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+      try {
+        document.addEventListener(ev, onInteract, { passive: true, capture: true });
+      } catch (_) {}
+    }
+  }
+
+  async function yieldToHostOneTick() {
+    await new Promise((r) => {
+      try {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      } catch (_) {
+        setTimeout(r, 0);
+      }
+    });
+  }
+
+  async function runNextHeavyWork() {
+    if (g[HEAVY_BUSY_KEY]) return;
+    const q = g[HEAVY_Q_KEY];
+    if (!Array.isArray(q) || q.length === 0) return;
+    g[HEAVY_BUSY_KEY] = true;
+    try {
+      while (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
+        if (inMobileLoadGrace() || isHeavyWorkQueuePaused()) break;
+        const job = g[HEAVY_Q_KEY].shift();
+        if (!job || typeof job.run !== 'function') continue;
+        try {
+          await yieldToHostOneTick();
+        } catch (_) {}
+        // Prefer running during idle; fallback is still serialized.
+        try {
+          if (typeof requestIdleCallback === 'function') {
+            await new Promise((resolve) => requestIdleCallback(resolve, { timeout: 1200 }));
+          }
+        } catch (_) {}
+        try {
+          await job.run();
+        } catch (_) {}
+        // Yield after each heavy job so navigation events can be processed.
+        try {
+          await yieldToHostOneTick();
+        } catch (_) {}
+      }
+    } finally {
+      g[HEAVY_BUSY_KEY] = false;
+      // If we stopped due to grace, try again later.
+      if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
+        setTimeout(() => runNextHeavyWork(), inMobileLoadGrace() ? 450 : 200);
+      }
+    }
+  }
+
+  function enqueueHeavyWork(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!g[HEAVY_Q_KEY]) g[HEAVY_Q_KEY] = [];
+    const delayMs = Math.max(0, Number(opts?.delayMs) || 0);
+    const push = () => {
+      try {
+        g[HEAVY_Q_KEY].push({ run });
+      } catch (_) {}
+      setTimeout(() => runNextHeavyWork(), 0);
+    };
+    if (delayMs > 0) setTimeout(push, delayMs);
+    else push();
+  }
+
+  async function yieldToHostBeforePathB() {
+    await new Promise((r) => {
+      try {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      } catch (_) {
+        r();
+      }
+    });
+    await new Promise((resolve) => {
+      try {
+        if (typeof requestIdleCallback === 'function') {
+          requestIdleCallback(() => resolve(), {
+            timeout: preferDeferredHeavyWork() ? 8000 : 1500,
+          });
+        } else {
+          setTimeout(resolve, preferDeferredHeavyWork() ? 48 : 16);
+        }
+      } catch (_) {
+        setTimeout(resolve, 32);
+      }
+    });
+  }
+
+  async function getAllCollectionsDeduped(data) {
+    if (!data || typeof data.getAllCollections !== 'function') return [];
+    const inflight = data[DATA_GET_ALL_P];
+    if (inflight && typeof inflight.then === 'function') {
+      try {
+        return await inflight;
+      } catch (_) {
+        // fall through to fresh fetch
+      }
+    }
+    const p = Promise.resolve()
+      .then(() => data.getAllCollections())
+      .then((all) => (Array.isArray(all) ? all : []))
+      .finally(() => {
+        try {
+          if (data[DATA_GET_ALL_P] === p) delete data[DATA_GET_ALL_P];
+        } catch (_) {}
+      });
+    data[DATA_GET_ALL_P] = p;
+    return p;
+  }
+
+  /** If true, Thymer ignores programmatic field updates — force off on every schema save. */
+  const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
+
+  /**
+   * Ensure Plugin Backend collection without duplicate `createCollection` calls.
+   * Sibling **plugin iframes** are often not `window` siblings — walking `parent` can stop at
+   * each plugin’s *own* frame, so a promise on “hierarchy best” is **not** one shared object.
+   * **`window.top` is the same** for all same-tab iframes and, when not cross-origin, is the
+   * one place to attach a cross-iframe lock. Fallback: walk the parent chain for opaque frames.
+   */
+  function getSharedDeduplicationWindow() {
+    try {
+      if (typeof window === 'undefined') return g;
+      const t = window.top;
+      if (t) {
+        void t.document;
+        return t;
+      }
+    } catch (_) {
+      /* cross-origin top */
+    }
+    try {
+      let w = typeof window !== 'undefined' ? window : null;
+      let best = w || g;
+      while (w) {
+        try {
+          void w.document;
+          best = w;
+        } catch (_) {
+          break;
+        }
+        if (w === w.top) break;
+        w = w.parent;
+      }
+      return best;
+    } catch (_) {
+      return typeof window !== 'undefined' ? window : g;
+    }
+  }
+
+  const PB_ENSURE_GLOBAL_P = '__thymerPluginBackendEnsureGlobalP';
+  const SERIAL_DATA_CREATE_P = '__thymerExtSerializedDataCreateP_v1';
+  /** `getAllCollections` can briefly return [] (host UI / race) after a valid non-empty read — refuse create in that window. */
+  const GETALL_COLLECTIONS_SANITY = '__thymerExtGetAllCollectionsSanityV1';
+  function touchGetAllSanityFromCount(len) {
+    const n = Number(len) || 0;
+    const h = getSharedDeduplicationWindow();
+    if (!h[GETALL_COLLECTIONS_SANITY]) h[GETALL_COLLECTIONS_SANITY] = { nLast: 0, tLast: 0 };
+    const s = h[GETALL_COLLECTIONS_SANITY];
+    if (n > 0) {
+      s.nLast = n;
+      s.tLast = Date.now();
+    }
+  }
+  function isSuspiciousEmptyAfterRecentNonEmptyList(currentLen) {
+    const c = Number(currentLen) || 0;
+    if (c > 0) {
+      touchGetAllSanityFromCount(c);
+      return false;
+    }
+    const h = getSharedDeduplicationWindow();
+    const s = h[GETALL_COLLECTIONS_SANITY];
+    if (!s || s.nLast <= 0 || !s.tLast) return false;
+    return Date.now() - s.tLast < 60_000;
+  }
+
+  function chainPluginBackendEnsure(data, work) {
+    const root = getSharedDeduplicationWindow();
+    try {
+      if (!root[PB_ENSURE_GLOBAL_P]) root[PB_ENSURE_GLOBAL_P] = Promise.resolve();
+    } catch (_) {
+      return Promise.resolve().then(work);
+    }
+    root[PB_ENSURE_GLOBAL_P] = root[PB_ENSURE_GLOBAL_P].catch(() => {}).then(work);
+    return root[PB_ENSURE_GLOBAL_P];
+  }
+
+  function withUnlockedManaged(base) {
+    return { ...(base && typeof base === 'object' ? base : {}), managed: MANAGED_UNLOCK };
+  }
+
+  /** Index of the “Plugin” column (`id` **plugin**, or legacy label match). */
+  function findPluginColumnFieldIndex(fields) {
+    const arr = Array.isArray(fields) ? fields : [];
+    let i = arr.findIndex((f) => f && f.id === FIELD_PLUGIN);
+    if (i >= 0) return i;
+    i = arr.findIndex(
+      (f) =>
+        f &&
+        String(f.label || '')
+          .trim()
+          .toLowerCase() === 'plugin' &&
+        (f.type === 'text' || f.type === 'plaintext' || f.type === 'string')
+    );
+    return i;
+  }
+
+  /** Keep internal column identity when replacing field shape (text → choice). */
+  function copyStableFieldKeys(prev, next) {
+    if (!prev || !next || typeof prev !== 'object' || typeof next !== 'object') return;
+    for (const k of ['guid', 'colguid', 'colGuid', 'field_guid']) {
+      if (prev[k] != null && next[k] == null) next[k] = prev[k];
+    }
+  }
+
+  function getPluginFieldDef(coll) {
+    if (!coll || typeof coll.getConfiguration !== 'function') return null;
+    try {
+      const fields = coll.getConfiguration()?.fields || [];
+      const i = findPluginColumnFieldIndex(fields);
+      return i >= 0 ? fields[i] : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function pluginColumnPropId(coll, requestedId) {
+    if (requestedId !== FIELD_PLUGIN || !coll) return requestedId;
+    const f = getPluginFieldDef(coll);
+    return (f && f.id) || FIELD_PLUGIN;
+  }
+
+  function cloneFieldDef(f) {
+    if (!f || typeof f !== 'object') return f;
+    try {
+      return structuredClone(f);
+    } catch (_) {
+      try {
+        return JSON.parse(JSON.stringify(f));
+      } catch (__) {
+        return { ...f };
+      }
+    }
+  }
+
+  const PLUGIN_SETTINGS_SHAPE = {
+    ver: 1,
+    name: COL_NAME,
+    icon: 'ti-adjustments',
+    color: null,
+    home: false,
+    page_field_ids: [FIELD_PLUGIN, FIELD_KIND, 'plugin_id', 'created_at', 'updated_at', 'settings_json'],
+    item_name: 'Setting, Config, or Log',
+    description: 'Workspace storage for plugins: Use the Plugin column to filter by plugin.',
+    show_sidebar_items: true,
+    show_cmdpal_items: false,
+    fields: [
+      {
+        icon: 'ti-apps',
+        id: FIELD_PLUGIN,
+        label: 'Plugin',
+        type: 'choice',
+        read_only: false,
+        active: true,
+        many: false,
+        choices: [
+          { id: 'quick-notes', label: 'quick-notes', color: '0', active: true },
+          { id: 'habit-tracker', label: 'Habit Tracker', color: '0', active: true },
+          { id: 'ynab', label: 'ynab', color: '0', active: true },
+        ],
+      },
+      {
+        icon: 'ti-category',
+        id: FIELD_KIND,
+        label: 'Record kind',
+        type: 'text',
+        read_only: false,
+        active: true,
+        many: false,
+      },
+      {
+        icon: 'ti-id',
+        id: 'plugin_id',
+        label: 'Plugin ID',
+        type: 'text',
+        read_only: false,
+        active: true,
+        many: false,
+      },
+      {
+        icon: 'ti-clock-plus',
+        id: 'created_at',
+        label: 'Created',
+        many: false,
+        read_only: true,
+        active: true,
+        type: 'datetime',
+      },
+      {
+        icon: 'ti-clock-edit',
+        id: 'updated_at',
+        label: 'Modified',
+        many: false,
+        read_only: true,
+        active: true,
+        type: 'datetime',
+      },
+      {
+        icon: 'ti-code',
+        id: 'settings_json',
+        label: 'Settings JSON',
+        type: 'text',
+        read_only: false,
+        active: true,
+        many: false,
+      },
+      {
+        icon: 'ti-abc',
+        id: 'title',
+        label: 'Title',
+        many: false,
+        read_only: false,
+        active: true,
+        type: 'text',
+      },
+      {
+        icon: 'ti-photo',
+        id: 'banner',
+        label: 'Banner',
+        many: false,
+        read_only: false,
+        active: true,
+        type: 'banner',
+      },
+      {
+        icon: 'ti-align-left',
+        id: 'icon',
+        label: 'Icon',
+        many: false,
+        read_only: false,
+        active: true,
+        type: 'text',
+      },
+    ],
+    sidebar_record_sort_dir: 'desc',
+    sidebar_record_sort_field_id: 'updated_at',
+    managed: { fields: false, views: false, sidebar: false },
+    custom: {},
+    views: [
+      {
+        id: 'V0YBPGDDZ0MHRSQ',
+        shown: true,
+        icon: 'ti-table',
+        label: 'All',
+        description: '',
+        field_ids: ['title', FIELD_PLUGIN, FIELD_KIND, 'plugin_id', 'created_at', 'updated_at'],
+        type: 'table',
+        read_only: false,
+        group_by_field_id: null,
+        sort_dir: 'desc',
+        sort_field_id: 'updated_at',
+        opts: {},
+      },
+      {
+        id: 'VPGAWVGVKZD57C9',
+        shown: true,
+        icon: 'ti-layout-kanban',
+        label: 'By Plugin...',
+        description: '',
+        field_ids: ['title', FIELD_KIND, 'created_at', 'updated_at'],
+        type: 'board',
+        read_only: false,
+        group_by_field_id: FIELD_PLUGIN,
+        sort_dir: 'desc',
+        sort_field_id: 'updated_at',
+        opts: {},
+      },
+    ],
+  };
+
+  function cloneShape() {
+    try {
+      return structuredClone(PLUGIN_SETTINGS_SHAPE);
+    } catch (_) {
+      return JSON.parse(JSON.stringify(PLUGIN_SETTINGS_SHAPE));
+    }
+  }
+
+  /** Append default views from the canonical shape when the workspace collection is missing them (by view `id`). */
+  function mergeViewsArray(baseViews, desiredViews) {
+    const desired = Array.isArray(desiredViews) ? desiredViews.map((v) => cloneFieldDef(v)) : [];
+    const cur = Array.isArray(baseViews) ? baseViews.map((v) => cloneFieldDef(v)) : [];
+    if (cur.length === 0) {
+      return { views: desired, changed: desired.length > 0 };
+    }
+    const ids = new Set(cur.map((v) => v && v.id).filter(Boolean));
+    let changed = false;
+    for (const v of desired) {
+      if (v && v.id && !ids.has(v.id)) {
+        cur.push(cloneFieldDef(v));
+        ids.add(v.id);
+        changed = true;
+      }
+    }
+    return { views: cur, changed };
+  }
+
+  /** Slug before first colon, else whole id (e.g. `habit-tracker:log:2026-04-24` → `habit-tracker`). */
+  function inferPluginSlugFromPid(pid) {
+    if (!pid) return '';
+    const s = String(pid).trim();
+    const i = s.indexOf(':');
+    if (i <= 0) return s;
+    return s.slice(0, i);
+  }
+
+  function inferRecordKindFromPid(pid, slug) {
+    if (!pid || !slug) return '';
+    const p = String(pid);
+    if (p === slug) return KIND_VAULT;
+    if (p === `${slug}:config`) return 'config';
+    if (p.startsWith(`${slug}:log:`)) return 'log';
+    return '';
+  }
+
+  function colorForSlug(slug) {
+    const colors = ['0', '1', '2', '3', '4', '5', '6', '7'];
+    let h = 0;
+    const s = String(slug || '');
+    for (let i = 0; i < s.length; i++) h = (h + s.charCodeAt(i) * (i + 1)) % colors.length;
+    return colors[h];
+  }
+
+  /** Normalize Thymer choice option (object or legacy string). */
+  function normalizeChoiceOption(c) {
+    if (c == null) return null;
+    if (typeof c === 'string') {
+      const s = c.trim();
+      if (!s) return null;
+      return { id: s, label: s, color: colorForSlug(s), active: true };
+    }
+    const id = String(c.id ?? c.label ?? '')
+      .trim();
+    if (!id) return null;
+    return {
+      id,
+      label: String(c.label ?? id).trim() || id,
+      color: String(c.color != null ? c.color : colorForSlug(id)),
+      active: c.active !== false,
+    };
+  }
+
+  /**
+   * Fresh choice field object (no legacy keys). Thymer often ignores `type` changes when merging
+   * onto an existing text field’s full config — same pattern as markdown importer choice fields.
+   */
+  function cleanPluginChoiceField(prev, desiredPlugin, choicesList) {
+    const fieldId = (prev && prev.id) || FIELD_PLUGIN;
+    const next = {
+      id: fieldId,
+      label: (prev && prev.label) || desiredPlugin.label || 'Plugin',
+      icon: (prev && prev.icon) || desiredPlugin.icon || 'ti-apps',
+      type: 'choice',
+      many: false,
+      read_only: false,
+      active: prev ? prev.active !== false : true,
+      choices: Array.isArray(choicesList) ? choicesList : [],
+    };
+    copyStableFieldKeys(prev, next);
+    return next;
+  }
+
+  /**
+   * Ensure the `plugin` field is a choice field and its options cover every slug
+   * already present on rows (migrates legacy `type: 'text'` definitions).
+   */
+  async function reconcilePluginFieldAsChoice(coll, curFields, desired) {
+    const desiredPlugin = desired.fields.find((f) => f && f.id === FIELD_PLUGIN);
+    if (!desiredPlugin) return { fields: curFields, changed: false };
+
+    const idx = findPluginColumnFieldIndex(curFields);
+    const prev = idx >= 0 ? curFields[idx] : null;
+
+    const choices = [];
+    const seen = new Set();
+    const pushOpt = (opt) => {
+      const n = normalizeChoiceOption(opt);
+      if (!n || seen.has(n.id)) return;
+      seen.add(n.id);
+      choices.push(n);
+    };
+
+    if (prev && prev.type === 'choice' && Array.isArray(prev.choices)) {
+      for (const c of prev.choices) pushOpt(c);
+    }
+
+    let records = [];
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {}
+
+    const plugCol = pluginColumnPropId(coll, FIELD_PLUGIN);
+    const slugSet = new Set();
+    for (const r of records) {
+      const a = rowField(r, plugCol);
+      if (a) slugSet.add(a.trim());
+      const inf = inferPluginSlugFromPid(rowField(r, 'plugin_id'));
+      if (inf) slugSet.add(inf);
+    }
+    for (const slug of [...slugSet].sort()) {
+      if (!slug) continue;
+      pushOpt({ id: slug, label: slug, color: colorForSlug(slug), active: true });
+    }
+
+    const useClean = !prev || prev.type !== 'choice';
+    const nextPluginField = useClean
+      ? cleanPluginChoiceField(prev, desiredPlugin, choices)
+      : (() => {
+          const merged = {
+            ...desiredPlugin,
+            type: 'choice',
+            choices,
+            icon: (prev && prev.icon) || desiredPlugin.icon,
+            label: (prev && prev.label) || desiredPlugin.label,
+            id: (prev && prev.id) || desiredPlugin.id || FIELD_PLUGIN,
+          };
+          copyStableFieldKeys(prev, merged);
+          return merged;
+        })();
+
+    let changed = false;
+    if (idx < 0) {
+      curFields.push(nextPluginField);
+      changed = true;
+    } else if (JSON.stringify(prev) !== JSON.stringify(nextPluginField)) {
+      curFields[idx] = nextPluginField;
+      changed = true;
+    }
+
+    return { fields: curFields, changed };
+  }
+
+  async function registerPluginSlug(data, { slug, label } = {}) {
+    const id = (slug || '').trim();
+    if (!id || !data) return;
+    await ensurePluginSettingsCollection(data);
+    const coll = await findColl(data);
+    if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
+    await upgradePluginSettingsSchema(data, coll);
+    let slugRegisterSavedOk = false;
+    try {
+      const base = coll.getConfiguration() || {};
+      const fields = Array.isArray(base.fields) ? [...base.fields] : [];
+      const idx = findPluginColumnFieldIndex(fields);
+      if (idx < 0) {
+        await rewritePluginChoiceCells(coll);
+        return;
+      }
+      const prev = fields[idx];
+      if (prev.type !== 'choice') {
+        await rewritePluginChoiceCells(coll);
+        return;
+      }
+      const prevChoices = Array.isArray(prev.choices) ? prev.choices : [];
+      const normalized = prevChoices.map((c) => normalizeChoiceOption(c)).filter(Boolean);
+      const byId = new Map(normalized.map((c) => [c.id, c]));
+      const existing = byId.get(id);
+      if (existing) {
+        if (label && String(existing.label) !== String(label)) {
+          byId.set(id, { ...existing, label: String(label) });
+        } else {
+          await rewritePluginChoiceCells(coll);
+          return;
+        }
+      } else {
+        byId.set(id, { id, label: label || id, color: colorForSlug(id), active: true });
+      }
+      const prevOrder = normalized.map((c) => c.id);
+      const out = [];
+      const used = new Set();
+      for (const pid of prevOrder) {
+        if (byId.has(pid) && !used.has(pid)) {
+          out.push(byId.get(pid));
+          used.add(pid);
+        }
+      }
+      for (const [pid, opt] of byId) {
+        if (!used.has(pid)) {
+          out.push(opt);
+          used.add(pid);
+        }
+      }
+      const next = { ...prev, type: 'choice', choices: out };
+      if (JSON.stringify(prev) !== JSON.stringify(next)) {
+        fields[idx] = next;
+        const ok = await coll.saveConfiguration(withUnlockedManaged({ ...base, fields }));
+        if (ok === false) console.warn('[ThymerPluginSettings] registerPluginSlug: saveConfiguration returned false');
+        else slugRegisterSavedOk = true;
+      }
+    } catch (e) {
+      console.error('[ThymerPluginSettings] registerPluginSlug', e);
+    }
+    if (slugRegisterSavedOk) await rewritePluginChoiceCells(coll);
+  }
+
+  /**
+   * Merge missing field definitions into the Plugin Backend collection
+   * (e.g. after Thymer auto-created a minimal schema, or older two-field configs).
+   */
+  async function upgradePluginSettingsSchema(data, collOpt) {
+    await ensurePluginSettingsCollection(data);
+    const coll = collOpt || (await findColl(data));
+    if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
+    try {
+      let base = coll.getConfiguration() || {};
+      try {
+        if (typeof coll.getExistingCodeAndConfig === 'function') {
+          const pack = coll.getExistingCodeAndConfig();
+          if (pack && pack.json && typeof pack.json === 'object') {
+            base = { ...base, ...pack.json };
+          }
+        }
+      } catch (_) {}
+      const desired = cloneShape();
+      const curFields = Array.isArray(base.fields) ? base.fields.map((f) => cloneFieldDef(f)) : [];
+      const curIds = new Set(curFields.map((f) => (f && f.id ? f.id : null)).filter(Boolean));
+      let changed = false;
+      for (const f of desired.fields) {
+        if (!f || !f.id || curIds.has(f.id)) continue;
+        if (f.id === FIELD_PLUGIN && findPluginColumnFieldIndex(curFields) >= 0) continue;
+        curFields.push(cloneFieldDef(f));
+        curIds.add(f.id);
+        changed = true;
+      }
+      const rec = await reconcilePluginFieldAsChoice(coll, curFields, desired);
+      if (rec.changed) changed = true;
+      const finalFields = rec.fields;
+
+      const vMerge = mergeViewsArray(base.views, desired.views);
+      if (vMerge.changed) changed = true;
+      const finalViews = vMerge.views;
+
+      const curPages = [...(base.page_field_ids || [])];
+      const wantPages = [...(desired.page_field_ids || [])];
+      const mergedPages = [...new Set([...wantPages, ...curPages])];
+      if (JSON.stringify(curPages) !== JSON.stringify(mergedPages)) changed = true;
+      if ((base.description || '') !== desired.description) changed = true;
+      if ((base.item_name || '') !== (desired.item_name || '')) changed = true;
+      if (String(base.name || '').trim() !== COL_NAME) changed = true;
+      if (changed) {
+        const merged = withUnlockedManaged({
+          ...base,
+          name: COL_NAME,
+          description: desired.description,
+          fields: finalFields,
+          page_field_ids: mergedPages.length ? mergedPages : wantPages,
+          item_name: desired.item_name || base.item_name,
+          icon: desired.icon || base.icon,
+          color: desired.color !== undefined ? desired.color : base.color,
+          home: desired.home !== undefined ? desired.home : base.home,
+          views: finalViews,
+          sidebar_record_sort_field_id: desired.sidebar_record_sort_field_id || base.sidebar_record_sort_field_id,
+          sidebar_record_sort_dir: desired.sidebar_record_sort_dir || base.sidebar_record_sort_dir,
+        });
+        const ok = await coll.saveConfiguration(merged);
+        if (ok === false) console.warn('[ThymerPluginSettings] saveConfiguration returned false (schema not applied?)');
+        else {
+          try {
+            const pf = getPluginFieldDef(coll);
+            if (pf && pf.type !== 'choice') {
+              console.error(
+                '[ThymerPluginSettings] saveConfiguration succeeded but "plugin" field is still type',
+                pf.type,
+                '— check collection General tab or re-import plugins/public repo/plugin-settings/Plugin Backend.json.'
+              );
+            }
+          } catch (_) {}
+        }
+      }
+      if (changed) await rewritePluginChoiceCells(coll);
+    } catch (e) {
+      console.error('[ThymerPluginSettings] upgrade schema', e);
+    }
+  }
+
+  /** Re-apply `plugin` via setChoice so rows are not stuck as “(Other)” after text→choice migration. */
+  async function rewritePluginChoiceCells(coll) {
+    if (!coll || typeof coll.getAllRecords !== 'function') return;
+    try {
+      const pluginField = getPluginFieldDef(coll);
+      if (!pluginField || pluginField.type !== 'choice') return;
+    } catch (_) {
+      return;
+    }
+    let records = [];
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return;
+    }
+    for (const r of records) {
+      let slug = inferPluginSlugFromPid(rowField(r, 'plugin_id'));
+      if (!slug) slug = rowField(r, pluginColumnPropId(coll, FIELD_PLUGIN));
+      if (!slug) continue;
+      setRowField(r, FIELD_PLUGIN, slug, coll);
+      // Rows written while setRowField wrongly skipped p.set() for plugin_id (setChoice branch).
+      const pidNow = rowField(r, 'plugin_id').trim();
+      if (!pidNow) {
+        const kind = (rowField(r, FIELD_KIND) || '').trim();
+        let legacyVault = false;
+        if (!kind) {
+          try {
+            const raw = rowField(r, 'settings_json');
+            if (raw && String(raw).includes('"storageMode"')) legacyVault = true;
+          } catch (_) {}
+        }
+        if (kind === KIND_VAULT || legacyVault) {
+          setRowField(r, 'plugin_id', slug, coll);
+        } else if (kind === 'config') {
+          setRowField(r, 'plugin_id', `${slug}:config`, coll);
+        } else if (kind === 'log') {
+          let ds = '';
+          try {
+            const raw = rowField(r, 'settings_json');
+            if (raw) {
+              const j = JSON.parse(raw);
+              if (j && j.date) ds = String(j.date).trim();
+            }
+          } catch (_) {}
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(ds) && typeof r.getName === 'function') {
+            ds = String(r.getName() || '').trim();
+          }
+          if (/^\d{4}-\d{2}-\d{2}$/.test(ds)) {
+            setRowField(r, 'plugin_id', `${slug}:log:${ds}`, coll);
+          }
+        }
+      }
+    }
+  }
+
+  function rowField(r, id) {
+    if (!r) return '';
+    try {
+      const p = r.prop?.(id);
+      if (p && typeof p.choice === 'function') {
+        const c = p.choice();
+        if (c != null && String(c).trim() !== '') return String(c).trim();
+      }
+    } catch (_) {}
+    let v = '';
+    try {
+      v = r.text?.(id);
+    } catch (_) {}
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+    try {
+      const p = r.prop?.(id);
+      if (p && typeof p.get === 'function') {
+        const g = p.get();
+        return g == null ? '' : String(g).trim();
+      }
+      if (p && typeof p.text === 'function') {
+        const t = p.text();
+        return t == null ? '' : String(t).trim();
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  /** Thymer `setChoice` matches option **label** (see YNAB plugins); return label for slug `id`, else slug. */
+  function pluginChoiceSetName(coll, slug) {
+    const s = String(slug || '').trim();
+    if (!s || !coll || typeof coll.getConfiguration !== 'function') return s;
+    try {
+      const f = getPluginFieldDef(coll);
+      if (!f || f.type !== 'choice' || !Array.isArray(f.choices)) return s;
+      const opt = f.choices.find((c) => c && String(c.id || '').trim() === s);
+      if (opt && opt.label != null && String(opt.label).trim() !== '') return String(opt.label).trim();
+    } catch (_) {}
+    return s;
+  }
+
+  /**
+   * @param coll Optional collection — pass when writing `plugin` so setChoice uses the correct option **label**.
+   */
+  function setRowField(r, id, value, coll = null) {
+    if (!r) return;
+    const raw = value == null ? '' : String(value);
+    const s = raw.trim();
+    const propId = pluginColumnPropId(coll, id);
+    try {
+      const p = r.prop?.(propId);
+      if (!p) return;
+      // Thymer exposes setChoice on many property types; it returns false for non-choice fields.
+      // Only use setChoice for the Plugin **slug** column — otherwise we return early and never p.set().
+      const isPluginChoiceCol = id === FIELD_PLUGIN;
+      if (isPluginChoiceCol && typeof p.setChoice === 'function') {
+        if (!s) {
+          if (typeof p.set === 'function') p.set('');
+          return;
+        }
+        const nameTry = coll != null ? pluginChoiceSetName(coll, s) : s;
+        if (p.setChoice(nameTry)) return;
+        if (nameTry !== s && p.setChoice(s)) return;
+        if (typeof p.set === 'function') {
+          try {
+            p.set(s);
+            return;
+          } catch (_) {
+            /* continue to warn */
+          }
+        }
+        console.warn('[ThymerPluginSettings] setChoice: no option matched field', id, 'slug', s, 'tried', nameTry);
+        return;
+      }
+      if (typeof p.set === 'function') p.set(raw);
+    } catch (e) {
+      console.warn('[ThymerPluginSettings] setRowField', id, e);
+    }
+  }
+
+  /** True for the single mirror row per logical plugin (plugin_id === pluginId and kind vault or legacy). */
+  function isVaultRow(r, pluginId) {
+    const pid = rowField(r, 'plugin_id');
+    if (pid !== pluginId) return false;
+    const kind = rowField(r, FIELD_KIND);
+    if (kind === KIND_VAULT) return true;
+    if (!kind) return true;
+    return false;
+  }
+
+  /** Parse ISO-ish timestamps for vault row scoring (duplicates: pick freshest, not first in list). */
+  function parseVaultIsoMs(s) {
+    const n = Date.parse(String(s || ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function vaultRowFreshnessScore(r) {
+    let score = 0;
+    let raw = '';
+    try {
+      raw = rowField(r, 'settings_json');
+    } catch (_) {}
+    if (raw && String(raw).trim()) {
+      try {
+        const j = JSON.parse(raw);
+        if (j && typeof j.updatedAt === 'string') {
+          const ms = parseVaultIsoMs(j.updatedAt);
+          if (ms > score) score = ms;
+        }
+      } catch (_) {}
+    }
+    try {
+      const ua = rowField(r, 'updated_at');
+      if (ua) {
+        const ms = parseVaultIsoMs(ua);
+        if (ms > score) score = ms;
+      }
+    } catch (_) {}
+    return score;
+  }
+
+  function settingsJsonPayloadLen(r) {
+    try {
+      return String(rowField(r, 'settings_json') || '').length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /**
+   * Prefer the **newest** vault row when duplicates exist (same `plugin_id`, multiple vault-shaped rows).
+   * Previously the first list match could be stale while a newer row held the real payload.
+   */
+  function findVaultRecord(records, pluginId) {
+    if (!records) return null;
+    let best = null;
+    let bestScore = -1;
+    for (const x of records) {
+      if (!isVaultRow(x, pluginId)) continue;
+      const sc = vaultRowFreshnessScore(x);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = x;
+      } else if (sc === bestScore && best) {
+        const lenX = settingsJsonPayloadLen(x);
+        const lenB = settingsJsonPayloadLen(best);
+        if (lenX > lenB) best = x;
+      }
+    }
+    return best;
+  }
+
+  function applyVaultRowMeta(r, pluginId, coll) {
+    setRowField(r, 'plugin_id', pluginId);
+    setRowField(r, FIELD_PLUGIN, pluginId, coll);
+    setRowField(r, FIELD_KIND, KIND_VAULT);
+  }
+
+  function drain() {
+    if (busy || !q.length) return;
+    busy = true;
+    const job = q.shift();
+    Promise.resolve(typeof job === 'function' ? job() : job)
+      .catch((e) => console.error('[ThymerPluginSettings]', e))
+      .finally(() => {
+        busy = false;
+        if (q.length) setTimeout(drain, 450);
+      });
+  }
+
+  function enqueue(job) {
+    q.push(job);
+    drain();
+  }
+
+  /** Sidebar / command palette title may be `getName()` or only `getConfiguration().name`. */
+  function collectionDisplayName(c) {
+    if (!c) return '';
+    let s = '';
+    try {
+      s = String(c.getName?.() || '').trim();
+    } catch (_) {}
+    if (s) return s;
+    try {
+      s = String(c.getConfiguration?.()?.name || '').trim();
+    } catch (_) {}
+    return s;
+  }
+
+  /** Configured collection name only (avoids duplicating `collectionDisplayName` fallbacks). */
+  function collectionBackendConfiguredTitle(c) {
+    if (!c) return '';
+    try {
+      return String(c.getConfiguration?.()?.name || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /**
+   * When plugin iframes are opaque (blob/sandbox), `navigator.locks` and `window.top` globals do not
+   * dedupe across realms. First `localStorage` we can reach on the Thymer app origin is shared.
+   */
+  function getSharedThymerLocalStorage() {
+    const seen = new Set();
+    const tryWin = (w) => {
+      if (!w || seen.has(w)) return null;
+      seen.add(w);
+      try {
+        const ls = w.localStorage;
+        void ls.length;
+        return ls;
+      } catch (_) {
+        return null;
+      }
+    };
+    try {
+      const t = tryWin(window.top);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      const t = tryWin(window);
+      if (t) return t;
+    } catch (_) {}
+    try {
+      let w = window;
+      for (let i = 0; i < 10 && w; i++) {
+        const t = tryWin(w);
+        if (t) return t;
+        if (w === w.parent) break;
+        w = w.parent;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /** Unscoped keys (legacy); runtime uses {@link scopedPbLsKey} per workspace. */
+  const LS_CREATE_LEASE_BASE = 'thymerext_plugin_backend_create_lease_v1';
+  const LS_RECENT_CREATE_BASE = 'thymerext_plugin_backend_recent_create_v1';
+  const LS_RECENT_CREATE_ATTEMPT_BASE = 'thymerext_plugin_backend_recent_create_attempt_v1';
+
+  function workspaceSlugFromData(data) {
+    try {
+      const u = data && typeof data.getActiveUsers === 'function' ? data.getActiveUsers() : null;
+      const g = u && u[0] && u[0].workspaceGuid;
+      const s = g != null ? String(g).trim() : '';
+      if (s) return s.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 120);
+    } catch (_) {}
+    return '_unknown_ws';
+  }
+
+  function scopedPbLsKey(base, data) {
+    return `${base}__${workspaceSlugFromData(data)}`;
+  }
+
+  /** Count collections whose sidebar/title name is exactly Plugin Backend (or legacy). */
+  async function countExactPluginBackendNamedCollections(data) {
+    let all;
+    try {
+      all = await getAllCollectionsDeduped(data);
+    } catch (_) {
+      return 0;
+    }
+    if (!Array.isArray(all)) return 0;
+    let n = 0;
+    for (const c of all) {
+      try {
+        const nm = collectionDisplayName(c);
+        if (nm === COL_NAME || nm === COL_NAME_LEGACY) n += 1;
+      } catch (_) {}
+    }
+    return n;
+  }
+
+  /**
+   * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
+   * Lease keys are **per workspace** so switching workspaces does not inherit another vault’s lease / cooldown.
+   * @returns {{ denied: boolean, release: () => void }}
+   */
+  async function acquirePluginBackendCreationLease(maxWaitMs, data) {
+    const locksOk =
+      typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function';
+    const noop = { denied: false, release() {} };
+    const ls = getSharedThymerLocalStorage();
+    if (!ls) {
+      if (locksOk) return noop;
+      if (DEBUG_COLLECTIONS) {
+        dlogPathB('lease_denied_no_localstorage_no_locks', { ws: workspaceSlugFromData(data) });
+      }
+      return { denied: true, release() {} };
+    }
+    const leaseKey = scopedPbLsKey(LS_CREATE_LEASE_BASE, data);
+    const holder =
+      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    const deadline = Date.now() + (Number(maxWaitMs) > 0 ? maxWaitMs : 12000);
+    let acquired = false;
+    let sawContention = false;
+    while (Date.now() < deadline) {
+      try {
+        const raw = ls.getItem(leaseKey);
+        let busy = false;
+        if (raw) {
+          let j = null;
+          try {
+            j = JSON.parse(raw);
+          } catch (_) {
+            j = null;
+          }
+          if (j && typeof j.exp === 'number' && j.h !== holder && j.exp > Date.now()) busy = true;
+        }
+        if (busy) {
+          sawContention = true;
+          await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 70)));
+          continue;
+        }
+        const exp = Date.now() + 45000;
+        const payload = JSON.stringify({ h: holder, exp });
+        ls.setItem(leaseKey, payload);
+        await new Promise((r) => setTimeout(r, 0));
+        if (ls.getItem(leaseKey) === payload) {
+          acquired = true;
+          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention, leaseKey });
+          break;
+        }
+      } catch (_) {
+        return locksOk ? noop : { denied: true, release() {} };
+      }
+      await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
+    }
+    if (!acquired) {
+      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention, leaseKey });
+      return { denied: true, release() {} };
+    }
+    return {
+      denied: false,
+      release() {
+        if (!acquired) return;
+        acquired = false;
+        try {
+          const cur = ls.getItem(leaseKey);
+          if (!cur) return;
+          let j = null;
+          try {
+            j = JSON.parse(cur);
+          } catch (_) {
+            return;
+          }
+          if (j && j.h === holder) ls.removeItem(leaseKey);
+        } catch (_) {}
+      },
+    };
+  }
+
+  function noteRecentPluginBackendCreate(data) {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls || !data) return;
+    try {
+      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data), String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAgeMs(data) {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls || !data) return null;
+    try {
+      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data));
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function noteRecentPluginBackendCreateAttempt(data) {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls || !data) return;
+    try {
+      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data), String(Date.now()));
+    } catch (_) {}
+  }
+
+  function getRecentPluginBackendCreateAttemptAgeMs(data) {
+    const ls = getSharedThymerLocalStorage();
+    if (!ls || !data) return null;
+    try {
+      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data));
+      const ts = Number(raw);
+      if (!Number.isFinite(ts) || ts <= 0) return null;
+      return Date.now() - ts;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** When Thymer omits names on `getAllCollections()` entries, match our Path B schema. */
+  function pathBCollectionScore(c) {
+    if (!c) return 0;
+    try {
+      const conf = c.getConfiguration?.() || {};
+      const fields = Array.isArray(conf.fields) ? conf.fields : [];
+      const ids = new Set(fields.map((f) => f && f.id).filter(Boolean));
+      if (!ids.has('plugin_id') || !ids.has('settings_json')) return 0;
+      let s = 2;
+      if (ids.has(FIELD_PLUGIN)) s += 2;
+      if (ids.has(FIELD_KIND)) s += 1;
+      const nm = collectionDisplayName(c).toLowerCase();
+      if (nm && (nm.includes('plugin') && (nm.includes('backend') || nm.includes('setting')))) s += 1;
+      return s;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function pickPathBCollectionHeuristic(all) {
+    const list = Array.isArray(all) ? all : [];
+    const cands = [];
+    let bestS = 0;
+    for (const c of list) {
+      const sc = pathBCollectionScore(c);
+      if (sc > bestS) {
+        bestS = sc;
+        cands.length = 0;
+        cands.push(c);
+      } else if (sc === bestS && sc >= 2) {
+        cands.push(c);
+      }
+    }
+    if (!cands.length) return null;
+    const named = cands.find((c) => {
+      const n = collectionDisplayName(c);
+      const cfg = collectionBackendConfiguredTitle(c);
+      return n === COL_NAME || n === COL_NAME_LEGACY || cfg === COL_NAME || cfg === COL_NAME_LEGACY;
+    });
+    return named || cands[0];
+  }
+
+  function pickCollFromAll(all) {
+    try {
+      const pick = (allIn) => {
+        const list = Array.isArray(allIn) ? allIn : [];
+        return (
+          list.find((c) => collectionDisplayName(c) === COL_NAME) ||
+          list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME) ||
+          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME_LEGACY) ||
+          null
+        );
+      };
+      return pick(all) || pickPathBCollectionHeuristic(all) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function hasPluginBackendInAll(all) {
+    if (!Array.isArray(all) || all.length === 0) return false;
+    for (const c of all) {
+      const nm = collectionDisplayName(c);
+      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
+    }
+    return !!pickPathBCollectionHeuristic(all);
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await getAllCollectionsDeduped(data);
+      return pickCollFromAll(all);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** Brute list scan — catches a Backend another iframe just created if `findColl` lags. */
+  async function hasPluginBackendOnWorkspace(data) {
+    try {
+      const all = await getAllCollectionsDeduped(data);
+      return hasPluginBackendInAll(all);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
+  const DATA_ENSURE_P = '__thymerExtDataPluginBackendEnsureP';
+  /** Per-workspace: Plugin Backend already ensured — skip repeat bodies (avoids getAllCollections / lock storms). */
+  const WS_ENSURE_OK_MAP = '__thymerExtPbWorkspaceEnsureOkMap_v1';
+
+  function markWorkspacePluginBackendEnsureDone(data) {
+    try {
+      const slug = workspaceSlugFromData(data);
+      const h = getSharedDeduplicationWindow();
+      if (!h[WS_ENSURE_OK_MAP] || typeof h[WS_ENSURE_OK_MAP] !== 'object') h[WS_ENSURE_OK_MAP] = Object.create(null);
+      h[WS_ENSURE_OK_MAP][slug] = true;
+    } catch (_) {}
+  }
+
+  function isWorkspacePluginBackendEnsureDone(data) {
+    try {
+      const slug = workspaceSlugFromData(data);
+      const h = getSharedDeduplicationWindow();
+      const m = h[WS_ENSURE_OK_MAP];
+      return !!(m && m[slug]);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function dlogPathB(phase, extra) {
+    if (!DEBUG_COLLECTIONS) return;
+    try {
+      const row = { runId: DEBUG_PATHB_ID, phase, t: (typeof performance !== 'undefined' && performance.now) ? +performance.now().toFixed(1) : 0, ...extra };
+      console.info('[ThymerExt/PluginBackend]', row);
+    } catch (_) {
+      void 0;
+    }
+  }
+
+  function pathBWindowSnapshot() {
+    const snap = { runId: DEBUG_PATHB_ID, topReadable: null, hasLocks: null };
+    try {
+      if (typeof window !== 'undefined' && window.top) {
+        void window.top.document;
+        snap.topReadable = true;
+      }
+    } catch (e) {
+      snap.topReadable = false;
+      try {
+        snap.topErr = String((e && e.name) || e) || 'top-doc-threw';
+      } catch (_) {
+        snap.topErr = 'top-doc-threw';
+      }
+    }
+    const host = getSharedDeduplicationWindow();
+    try {
+      snap.hasLocks = !!(typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request);
+    } catch (_) {
+      snap.hasLocks = 'err';
+    }
+    try {
+      snap.locationHref = typeof location !== 'undefined' ? String(location.href) : '';
+    } catch (_) {
+      snap.locationHref = '';
+    }
+    try {
+      snap.hasSelf = typeof self !== 'undefined' && self === window;
+      snap.selfIsTop = typeof window !== 'undefined' && window === window.top;
+      snap.hostIsTop = host === (typeof window !== 'undefined' ? window.top : null);
+      snap.hostIsSelf = host === (typeof window !== 'undefined' ? window : null);
+      snap.hostType = (host && host.constructor && host.constructor.name) || '';
+    } catch (_) {
+      void 0;
+    }
+    try {
+      snap.gHasPbP = host && host[PB_ENSURE_GLOBAL_P] != null;
+      snap.gHasCreateQ = host && host[SERIAL_DATA_CREATE_P] != null;
+    } catch (_) {
+      void 0;
+    }
+    return snap;
+  }
+
+  function queueDataCreateOnSharedWindow(factory) {
+    const host = getSharedDeduplicationWindow();
+    if (DEBUG_COLLECTIONS) {
+      dlogPathB('queueDataCreate_enter', { ...pathBWindowSnapshot() });
+    }
+    try {
+      if (!host[SERIAL_DATA_CREATE_P] || typeof host[SERIAL_DATA_CREATE_P].then !== 'function') {
+        host[SERIAL_DATA_CREATE_P] = Promise.resolve();
+      }
+      const out = (host[SERIAL_DATA_CREATE_P] = host[SERIAL_DATA_CREATE_P].catch(() => {}).then(factory));
+      if (DEBUG_COLLECTIONS) dlogPathB('queueDataCreate_chained', { gHasCreateQ: !!host[SERIAL_DATA_CREATE_P] });
+      return out;
+    } catch (e) {
+      if (DEBUG_COLLECTIONS) dlogPathB('queueDataCreate_fallback', { err: String((e && e.message) || e) });
+      return factory();
+    }
+  }
+
+  async function runPluginBackendEnsureBody(data) {
+    if (data && isWorkspacePluginBackendEnsureDone(data)) return;
+    if (DEBUG_COLLECTIONS) {
+      dlogPathB('ensureBody_start', { pathB: pathBWindowSnapshot() });
+      try {
+        if (data && data.getAllCollections) {
+          const a = await getAllCollectionsDeduped(data);
+          const list = Array.isArray(a) ? a : [];
+          const collNames = list.map((c) => {
+            try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; }
+          });
+          dlogPathB('ensureBody_collections', { count: (collNames && collNames.length) || 0, names: (collNames || []).slice(0, 40) });
+          if (data && data.getAllCollections) touchGetAllSanityFromCount((collNames && collNames.length) || 0);
+          const dupExact = list.filter((c) => {
+            try {
+              const nm = collectionDisplayName(c);
+              return nm === COL_NAME || nm === COL_NAME_LEGACY;
+            } catch (__) {
+              return false;
+            }
+          });
+          if (dupExact.length > 1) {
+            dlogPathB('duplicate_plugin_backend_named_collections', {
+              count: dupExact.length,
+              guids: dupExact.map((c) => {
+                try {
+                  return c.getGuid?.() || null;
+                } catch (__) {
+                  return null;
+                }
+              }),
+              doc: 'docs/PLUGIN_BACKEND_DUPLICATE_HYGIENE.md',
+            });
+          }
+        }
+      } catch (e) {
+        dlogPathB('ensureBody_getAll_failed', { err: String((e && e.message) || e) });
+      }
+    }
+    try {
+      const markPbOk = () => markWorkspacePluginBackendEnsureDone(data);
+      let existing = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        let allAttempt;
+        try {
+          allAttempt = await getAllCollectionsDeduped(data);
+        } catch (_) {
+          allAttempt = null;
+        }
+        if (allAttempt != null) {
+          existing = pickCollFromAll(allAttempt);
+          if (existing) {
+            markPbOk();
+            return;
+          }
+          if (hasPluginBackendInAll(allAttempt)) {
+            markPbOk();
+            return;
+          }
+        } else {
+          existing = await findColl(data);
+          if (existing) {
+            markPbOk();
+            return;
+          }
+          if (await hasPluginBackendOnWorkspace(data)) {
+            markPbOk();
+            return;
+          }
+        }
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
+      }
+      let allPost;
+      try {
+        allPost = await getAllCollectionsDeduped(data);
+      } catch (_) {
+        allPost = null;
+      }
+      if (allPost != null) {
+        existing = pickCollFromAll(allPost);
+        if (existing) {
+          markPbOk();
+          return;
+        }
+        if (hasPluginBackendInAll(allPost)) {
+          markPbOk();
+          return;
+        }
+      } else {
+        existing = await findColl(data);
+        if (existing) {
+          markPbOk();
+          return;
+        }
+        if (await hasPluginBackendOnWorkspace(data)) {
+          markPbOk();
+          return;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 120));
+      let allAfterWait;
+      try {
+        allAfterWait = await getAllCollectionsDeduped(data);
+      } catch (_) {
+        allAfterWait = null;
+      }
+      if (allAfterWait != null) {
+        if (pickCollFromAll(allAfterWait)) {
+          markPbOk();
+          return;
+        }
+        if (hasPluginBackendInAll(allAfterWait)) {
+          markPbOk();
+          return;
+        }
+      } else {
+        if (await findColl(data)) {
+          markPbOk();
+          return;
+        }
+        if (await hasPluginBackendOnWorkspace(data)) {
+          markPbOk();
+          return;
+        }
+      }
+      let preCreateLen = 0;
+      try {
+        if (data && data.getAllCollections) {
+          const all0 = await getAllCollectionsDeduped(data);
+          preCreateLen = Array.isArray(all0) ? all0.length : 0;
+          if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
+        }
+        if (preCreateLen === 0) {
+          await new Promise((r) => setTimeout(r, 150));
+          if (data && data.getAllCollections) {
+            const all1 = await getAllCollectionsDeduped(data);
+            preCreateLen = Array.isArray(all1) ? all1.length : 0;
+            if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
+          }
+        }
+        if (preCreateLen > 0) {
+          let allPre;
+          try {
+            allPre = await getAllCollectionsDeduped(data);
+          } catch (_) {
+            allPre = null;
+          }
+          if (allPre != null) {
+            if (pickCollFromAll(allPre)) {
+              markPbOk();
+              return;
+            }
+            if (hasPluginBackendInAll(allPre)) {
+              markPbOk();
+              return;
+            }
+          } else {
+            if (await findColl(data)) {
+              markPbOk();
+              return;
+            }
+            if (await hasPluginBackendOnWorkspace(data)) {
+              markPbOk();
+              return;
+            }
+          }
+        }
+        if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
+          if (DEBUG_COLLECTIONS) {
+            try {
+              const h = getSharedDeduplicationWindow();
+              dlogPathB('refuse_create_flaky_getall_empty', { pathB: pathBWindowSnapshot(), s: h[GETALL_COLLECTIONS_SANITY] || null });
+            } catch (_) {
+              dlogPathB('refuse_create_flaky_getall_empty', { pathB: pathBWindowSnapshot() });
+            }
+          }
+          return;
+        }
+      } catch (_) {
+        void 0;
+      }
+      if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
+      const lease = await acquirePluginBackendCreationLease(14000, data);
+      if (lease.denied) return;
+      try {
+        let allLease;
+        try {
+          allLease = await getAllCollectionsDeduped(data);
+        } catch (_) {
+          allLease = null;
+        }
+        if (allLease != null) {
+          if (pickCollFromAll(allLease)) {
+            markPbOk();
+            return;
+          }
+          if (hasPluginBackendInAll(allLease)) {
+            markPbOk();
+            return;
+          }
+        } else {
+          if (await findColl(data)) {
+            markPbOk();
+            return;
+          }
+          if (await hasPluginBackendOnWorkspace(data)) {
+            markPbOk();
+            return;
+          }
+        }
+        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
+        if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
+          // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
+          for (let i = 0; i < 10; i++) {
+            await new Promise((r) => setTimeout(r, 130 + i * 70));
+            let allCont;
+            try {
+              allCont = await getAllCollectionsDeduped(data);
+            } catch (_) {
+              allCont = null;
+            }
+            if (allCont != null) {
+              if (pickCollFromAll(allCont)) {
+                markPbOk();
+                return;
+              }
+              if (hasPluginBackendInAll(allCont)) {
+                markPbOk();
+                return;
+              }
+            } else {
+              if (await findColl(data)) {
+                markPbOk();
+                return;
+              }
+              if (await hasPluginBackendOnWorkspace(data)) {
+                markPbOk();
+                return;
+              }
+            }
+          }
+          return;
+        }
+        const recentAge = getRecentPluginBackendCreateAgeMs(data);
+        if (recentAge != null && recentAge >= 0 && recentAge < 90000) {
+          // Another plugin/runtime likely just created it; let collection list/indexing settle first.
+          for (let i = 0; i < 8; i++) {
+            await new Promise((r) => setTimeout(r, 120 + i * 60));
+            let allSettle;
+            try {
+              allSettle = await getAllCollectionsDeduped(data);
+            } catch (_) {
+              allSettle = null;
+            }
+            if (allSettle != null) {
+              if (pickCollFromAll(allSettle)) {
+                markPbOk();
+                return;
+              }
+              if (hasPluginBackendInAll(allSettle)) {
+                markPbOk();
+                return;
+              }
+            } else {
+              if (await findColl(data)) {
+                markPbOk();
+                return;
+              }
+              if (await hasPluginBackendOnWorkspace(data)) {
+                markPbOk();
+                return;
+              }
+            }
+          }
+        }
+        noteRecentPluginBackendCreateAttempt(data);
+        const exactN = await countExactPluginBackendNamedCollections(data);
+        if (exactN >= 1) {
+          if (DEBUG_COLLECTIONS) {
+            dlogPathB('abort_create_exact_backend_name_exists', { exactN, ws: workspaceSlugFromData(data) });
+          }
+          markPbOk();
+          return;
+        }
+        const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
+        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
+          return;
+        }
+        const conf = cloneShape();
+        const base = coll.getConfiguration();
+        if (base && typeof base.ver === 'number') conf.ver = base.ver;
+        let ok = await coll.saveConfiguration(conf);
+        if (ok === false) {
+          // Transient host races can reject the first save; retry before giving up.
+          await new Promise((r) => setTimeout(r, 180));
+          ok = await coll.saveConfiguration(conf);
+        }
+        if (ok === false) return;
+        noteRecentPluginBackendCreate(data);
+        markPbOk();
+        await new Promise((r) => setTimeout(r, 250));
+      } finally {
+        try {
+          lease.release();
+        } catch (_) {}
+      }
+    } catch (e) {
+      console.error('[ThymerPluginSettings] ensure collection', e);
+    }
+  }
+
+  function runPluginBackendEnsureWithLocksOrChain(data) {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
+        if (DEBUG_COLLECTIONS) dlogPathB('ensure_route', { via: 'locks', lockName: PB_LOCK_NAME, pathB: pathBWindowSnapshot() });
+        return navigator.locks.request(PB_LOCK_NAME, () => runPluginBackendEnsureBody(data));
+      }
+    } catch (e) {
+      if (DEBUG_COLLECTIONS) dlogPathB('ensure_locks_threw', { err: String((e && e.message) || e) });
+    }
+    if (DEBUG_COLLECTIONS) dlogPathB('ensure_route', { via: 'hierarchyChain', pathB: pathBWindowSnapshot() });
+    return chainPluginBackendEnsure(data, () => runPluginBackendEnsureBody(data));
+  }
+
+  function ensurePluginSettingsCollection(data) {
+    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
+      return Promise.resolve();
+    }
+    if (isWorkspacePluginBackendEnsureDone(data)) {
+      return Promise.resolve();
+    }
+    if (DEBUG_COLLECTIONS) {
+      let dHint = 'no-data';
+      try {
+        dHint = data
+          ? `ctor=${(data && data.constructor && data.constructor.name) || '?'},eqPrev=${(data && data === g.__th_lastDataPb) || false},keys=${
+            Object.keys(data).filter((k) => k && (k.includes('thymer') || k.includes('__'))).length
+          }`
+          : 'null';
+        g.__th_lastDataPb = data;
+      } catch (_) {
+        dHint = 'err';
+      }
+      dlogPathB('ensurePluginSettingsCollection', { dataHint: dHint, dataExpand: (() => { try { if (!data) return { ok: false }; return { hasDataEnsure: !!data[DATA_ENSURE_P] }; } catch (_) { return { ok: 'throw' }; } })(), pathB: pathBWindowSnapshot() });
+    }
+    try {
+      if (!data[DATA_ENSURE_P] || typeof data[DATA_ENSURE_P].then !== 'function') {
+        data[DATA_ENSURE_P] = Promise.resolve();
+      }
+      if (DEBUG_COLLECTIONS) dlogPathB('data_ensure_p_chained', { hasPriorTail: true });
+      const next = data[DATA_ENSURE_P]
+        .catch(() => {})
+        .then(() => runPluginBackendEnsureWithLocksOrChain(data));
+      data[DATA_ENSURE_P] = next;
+      return next;
+    } catch (e) {
+      if (DEBUG_COLLECTIONS) dlogPathB('data_ensure_p_throw', { err: String((e && e.message) || e) });
+      return runPluginBackendEnsureWithLocksOrChain(data);
+    }
+  }
+
+  async function readDoc(data, pluginId) {
+    const coll = await findColl(data);
+    if (!coll) return null;
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return null;
+    }
+    const r = findVaultRecord(records, pluginId);
+    if (!r) return null;
+    let raw = '';
+    try {
+      raw = r.text?.('settings_json') || '';
+    } catch (_) {}
+    if (!raw || !String(raw).trim()) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function writeDoc(data, pluginId, doc) {
+    const coll = await findColl(data);
+    if (!coll) return;
+    await upgradePluginSettingsSchema(data, coll);
+    const json = JSON.stringify(doc);
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return;
+    }
+    let r = findVaultRecord(records, pluginId);
+    if (!r) {
+      let guid = null;
+      try {
+        guid = coll.createRecord?.(pluginId);
+      } catch (_) {}
+      if (guid) {
+        for (let i = 0; i < 30; i++) {
+          await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
+          try {
+            const again = await coll.getAllRecords();
+            r = again.find((x) => x.guid === guid) || findVaultRecord(again, pluginId);
+            if (r) break;
+          } catch (_) {}
+        }
+      }
+    }
+    if (!r) return;
+    applyVaultRowMeta(r, pluginId, coll);
+    try {
+      const pj = r.prop?.('settings_json');
+      if (pj && typeof pj.set === 'function') pj.set(json);
+    } catch (_) {}
+  }
+
+  const LOCAL_MIRROR_META_PREFIX = 'thymerext_ps_local_meta_v1:';
+
+  function localMirrorMetaKey(pluginId) {
+    return LOCAL_MIRROR_META_PREFIX + encodeURIComponent(String(pluginId || 'unknown'));
+  }
+
+  function parseIsoMs(s) {
+    const n = Date.parse(String(s || ''));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function readLocalMirrorMeta(pluginId) {
+    try {
+      const raw = localStorage.getItem(localMirrorMetaKey(pluginId));
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch (_) {}
+    return {};
+  }
+
+  function writeLocalMirrorMeta(pluginId, meta) {
+    try {
+      localStorage.setItem(localMirrorMetaKey(pluginId), JSON.stringify(meta || {}));
+    } catch (_) {}
+  }
+
+  function markLocalMirrorKeys(pluginId, keys, updatedAt) {
+    if (!pluginId || !Array.isArray(keys)) return;
+    const meta = readLocalMirrorMeta(pluginId);
+    const ts = updatedAt || new Date().toISOString();
+    let changed = false;
+    for (const k of keys) {
+      if (!k) continue;
+      let exists = false;
+      try {
+        exists = localStorage.getItem(k) !== null;
+      } catch (_) {}
+      if (!exists) continue;
+      meta[k] = { updatedAt: ts };
+      changed = true;
+    }
+    if (changed) writeLocalMirrorMeta(pluginId, meta);
+  }
+
+  function collectLocalMirrorPayload(keys) {
+    const payload = {};
+    if (!Array.isArray(keys)) return payload;
+    for (const k of keys) {
+      if (!k) continue;
+      try {
+        const v = localStorage.getItem(k);
+        if (v !== null) payload[k] = v;
+      } catch (_) {}
+    }
+    return payload;
+  }
+
+  function localPayloadMatchesRemote(keys, remote) {
+    if (!remote || !remote.payload || typeof remote.payload !== 'object') return false;
+    if (!Array.isArray(keys)) return true;
+    for (const k of keys) {
+      if (!k) continue;
+      let localValue = null;
+      try {
+        localValue = localStorage.getItem(k);
+      } catch (_) {}
+      const remoteValue = remote.payload[k];
+      if (localValue === null && typeof remoteValue !== 'string') continue;
+      if (localValue !== remoteValue) return false;
+    }
+    return true;
+  }
+
+  function applyRemoteMirrorPayload(pluginId, keys, remote) {
+    const result = { needsFlush: false };
+    if (!remote || !remote.payload || typeof remote.payload !== 'object') return result;
+    const meta = readLocalMirrorMeta(pluginId);
+    const remoteUpdatedAt = String(remote.updatedAt || '');
+    const remoteMs = parseIsoMs(remoteUpdatedAt);
+    let metaChanged = false;
+    for (const k of keys) {
+      if (!k) continue;
+      const remoteValue = remote.payload[k];
+      if (typeof remoteValue !== 'string') continue;
+
+      let localValue = null;
+      try {
+        localValue = localStorage.getItem(k);
+      } catch (_) {}
+
+      if (localValue === remoteValue) {
+        if (remoteUpdatedAt && (!meta[k] || !meta[k].updatedAt)) {
+          meta[k] = { updatedAt: remoteUpdatedAt };
+          metaChanged = true;
+        }
+        continue;
+      }
+
+      if (localValue === null) {
+        try {
+          localStorage.setItem(k, remoteValue);
+          if (remoteUpdatedAt) {
+            meta[k] = { updatedAt: remoteUpdatedAt };
+            metaChanged = true;
+          }
+        } catch (_) {}
+        continue;
+      }
+
+      const localMs = parseIsoMs(meta[k]?.updatedAt);
+      if (localMs && remoteMs && remoteMs > localMs + 1000) {
+        try {
+          localStorage.setItem(k, remoteValue);
+          meta[k] = { updatedAt: remoteUpdatedAt };
+          metaChanged = true;
+        } catch (_) {}
+        continue;
+      }
+
+      // When freshness is ambiguous, preserve the browser's current settings and let flushNow repair the vault row.
+      result.needsFlush = true;
+      if (!localMs) {
+        meta[k] = { updatedAt: new Date().toISOString() };
+        metaChanged = true;
+      }
+      console.warn('[ThymerPluginSettings] Kept local settings instead of overwriting with older/ambiguous synced payload', {
+        pluginId,
+        key: k,
+        localUpdatedAt: meta[k]?.updatedAt || null,
+        remoteUpdatedAt: remoteUpdatedAt || null,
+      });
+    }
+    if (metaChanged) writeLocalMirrorMeta(pluginId, meta);
+    return result;
+  }
+
+  function shouldFlushMirrorOnInit(keys, remote, applyResult) {
+    if (applyResult?.needsFlush) return true;
+    if (remote && remote.payload && typeof remote.payload === 'object') {
+      return !localPayloadMatchesRemote(keys, remote);
+    }
+    return Object.keys(collectLocalMirrorPayload(keys)).length > 0;
+  }
+
+  async function listRows(data, { pluginSlug, recordKind } = {}) {
+    const slug = (pluginSlug || '').trim();
+    if (!slug) return [];
+    const coll = await findColl(data);
+    if (!coll) return [];
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return [];
+    }
+    const plugCol = pluginColumnPropId(coll, FIELD_PLUGIN);
+    return records.filter((r) => {
+      const pid = rowField(r, 'plugin_id');
+      let rowSlug = rowField(r, plugCol);
+      if (!rowSlug) rowSlug = inferPluginSlugFromPid(pid);
+      if (rowSlug !== slug) return false;
+      if (recordKind != null && String(recordKind) !== '') {
+        const rk = rowField(r, FIELD_KIND) || inferRecordKindFromPid(pid, slug);
+        return rk === String(recordKind);
+      }
+      return true;
+    });
+  }
+
+  async function createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle, settingsDoc } = {}) {
+    const ps = (pluginSlug || '').trim();
+    const rid = (rowPluginId || '').trim();
+    const kind = (recordKind || '').trim();
+    if (!ps || !rid || !kind) {
+      console.warn('[ThymerPluginSettings] createDataRow: pluginSlug, recordKind, and rowPluginId are required');
+      return null;
+    }
+    if (rid === ps && kind !== KIND_VAULT) {
+      console.warn('[ThymerPluginSettings] createDataRow: rowPluginId must differ from plugin slug unless record_kind is vault');
+    }
+    await ensurePluginSettingsCollection(data);
+    const coll = await findColl(data);
+    if (!coll) return null;
+    await upgradePluginSettingsSchema(data, coll);
+    const title = (recordTitle || rid).trim() || rid;
+    let guid = null;
+    try {
+      guid = coll.createRecord?.(title);
+    } catch (e) {
+      console.error('[ThymerPluginSettings] createDataRow createRecord', e);
+      return null;
+    }
+    if (!guid) return null;
+    let r = null;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
+      try {
+        const again = await coll.getAllRecords();
+        r = again.find((x) => x.guid === guid) || again.find((x) => rowField(x, 'plugin_id') === rid);
+        if (r) break;
+      } catch (_) {}
+    }
+    if (!r) return null;
+    setRowField(r, 'plugin_id', rid);
+    setRowField(r, FIELD_PLUGIN, ps, coll);
+    setRowField(r, FIELD_KIND, kind);
+    const json =
+      settingsDoc !== undefined && settingsDoc !== null
+        ? typeof settingsDoc === 'string'
+          ? settingsDoc
+          : JSON.stringify(settingsDoc)
+        : '{}';
+    try {
+      const pj = r.prop?.('settings_json');
+      if (pj && typeof pj.set === 'function') pj.set(json);
+    } catch (_) {}
+    return r;
+  }
+
+  function showFirstRunDialog(ui, label, preferred, onPick) {
+    const id = 'thymerext-ps-first-' + Math.random().toString(36).slice(2);
+    const box = document.createElement('div');
+    box.id = id;
+    box.style.cssText =
+      'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+    const card = document.createElement('div');
+    card.style.cssText =
+      'max-width:420px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+    const title = document.createElement('div');
+    title.textContent = label + ' — where to store settings?';
+    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
+    const hint = document.createElement('div');
+    hint.textContent = 'Change later via Command Palette → “Storage location…”';
+    hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
+    const mk = (t, sub, prim) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.cssText =
+        'display:block;width:100%;text-align:left;padding:12px 14px;margin-bottom:10px;border-radius:8px;cursor:pointer;font-size:14px;border:1px solid var(--border-default,#3f3f46);background:' +
+        (prim ? 'rgba(167,139,250,0.25)' : 'transparent') +
+        ';color:inherit;';
+      const x = document.createElement('div');
+      x.textContent = t;
+      x.style.fontWeight = '600';
+      b.appendChild(x);
+      if (sub) {
+        const s = document.createElement('div');
+        s.textContent = sub;
+        s.style.cssText = 'font-size:11px;opacity:0.75;margin-top:4px;line-height:1.35;';
+        b.appendChild(s);
+      }
+      return b;
+    };
+    const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
+    const bSyn = mk(
+      'Sync across devices',
+      'Store in the workspace “' + COL_NAME + '” collection (same account on any browser).',
+      preferred === 'synced'
+    );
+    const fin = (m) => {
+      try {
+        box.remove();
+      } catch (_) {}
+      onPick(m);
+    };
+    bLoc.addEventListener('click', () => fin('local'));
+    bSyn.addEventListener('click', () => fin('synced'));
+    card.appendChild(title);
+    card.appendChild(hint);
+    card.appendChild(bLoc);
+    card.appendChild(bSyn);
+    box.appendChild(card);
+    document.body.appendChild(box);
+  }
+
+  g.ThymerPluginSettings = {
+    COL_NAME,
+    COL_NAME_LEGACY,
+    FIELD_PLUGIN,
+    FIELD_RECORD_KIND: FIELD_KIND,
+    RECORD_KIND_VAULT: KIND_VAULT,
+    enqueue,
+    rowField,
+    findVaultRecord,
+    listRows,
+    createDataRow,
+    upgradeCollectionSchema: (data) => upgradePluginSettingsSchema(data),
+    registerPluginSlug,
+    preferDeferredHeavyWork,
+    yieldToHostBeforePathB,
+    ensureMobileLoadGraceStarted,
+    inMobileLoadGrace,
+    bumpMobileLoadGrace,
+    installMobileResumeGraceListener,
+
+    async init(opts) {
+      ensureStartupStormWindow();
+      installMobileResumeGraceListener();
+      installMobileInteractionGraceListener();
+      await yieldToHostBeforePathB();
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+
+      let mode = null;
+      try {
+        mode = localStorage.getItem(modeKey);
+      } catch (_) {}
+
+      const remote = await readDoc(data, pluginId);
+      if (!mode && remote && (remote.storageMode === 'synced' || remote.storageMode === 'local')) {
+        mode = remote.storageMode;
+        try {
+          localStorage.setItem(modeKey, mode);
+        } catch (_) {}
+      }
+
+      if (!mode) {
+        const coll = await findColl(data);
+        const preferred = coll ? 'synced' : 'local';
+        await new Promise((r) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => r()));
+        });
+        await new Promise((outerResolve) => {
+          enqueue(async () => {
+            const picked = await new Promise((r) => {
+              showFirstRunDialog(ui, label, preferred, r);
+            });
+            try {
+              localStorage.setItem(modeKey, picked);
+            } catch (_) {}
+            outerResolve(picked);
+          });
+        });
+        try {
+          mode = localStorage.getItem(modeKey);
+        } catch (_) {}
+      }
+
+      plugin._pluginSettingsSyncMode = mode === 'synced' ? 'synced' : 'local';
+      plugin._pluginSettingsPluginId = pluginId;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      let initFlushNeeded = false;
+
+      if (plugin._pluginSettingsSyncMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
+        const applyResult = applyRemoteMirrorPayload(pluginId, keys, remote);
+        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, applyResult);
+      } else if (plugin._pluginSettingsSyncMode === 'synced') {
+        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, null);
+      }
+
+      if (plugin._pluginSettingsSyncMode === 'synced' && initFlushNeeded) {
+        try {
+          markLocalMirrorKeys(pluginId, keys);
+          await g.ThymerPluginSettings.flushNow(data, pluginId, keys);
+        } catch (_) {}
+      }
+    },
+
+    scheduleFlush(plugin, mirrorKeys) {
+      if (plugin._pluginSettingsSyncMode !== 'synced') return;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      markLocalMirrorKeys(plugin._pluginSettingsPluginId, keys);
+      if (plugin._pluginSettingsFlushTimer) clearTimeout(plugin._pluginSettingsFlushTimer);
+      plugin._pluginSettingsFlushTimer = setTimeout(() => {
+        plugin._pluginSettingsFlushTimer = null;
+        const pdata = plugin.data;
+        const pid = plugin._pluginSettingsPluginId;
+        if (!pid || !pdata) return;
+        g.ThymerPluginSettings.flushNow(pdata, pid, keys).catch((e) => console.error('[ThymerPluginSettings] flush', e));
+      }, 500);
+    },
+
+    async flushNow(data, pluginId, mirrorKeys) {
+      await ensurePluginSettingsCollection(data);
+      await upgradePluginSettingsSchema(data);
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      const payload = {};
+      for (const k of keys) {
+        try {
+          const v = localStorage.getItem(k);
+          if (v !== null) payload[k] = v;
+        } catch (_) {}
+      }
+      const doc = {
+        v: 1,
+        storageMode: 'synced',
+        updatedAt: new Date().toISOString(),
+        payload,
+      };
+      await writeDoc(data, pluginId, doc);
+    },
+
+    async openStorageDialog(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      const cur = plugin._pluginSettingsSyncMode === 'synced' ? 'synced' : 'local';
+      const pick = await new Promise((resolve) => {
+        const close = (v) => {
+          try {
+            box.remove();
+          } catch (_) {}
+          resolve(v);
+        };
+        const box = document.createElement('div');
+        box.style.cssText =
+          'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+        box.addEventListener('click', (e) => {
+          if (e.target === box) close(null);
+        });
+        const card = document.createElement('div');
+        card.style.cssText =
+          'max-width:400px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:18px;';
+        card.addEventListener('click', (e) => e.stopPropagation());
+        const t = document.createElement('div');
+        t.textContent = label + ' — storage';
+        t.style.cssText = 'font-weight:700;margin-bottom:12px;';
+        const b1 = document.createElement('button');
+        b1.type = 'button';
+        b1.textContent = 'This device only';
+        const b2 = document.createElement('button');
+        b2.type = 'button';
+        b2.textContent = 'Sync across devices';
+        [b1, b2].forEach((b) => {
+          b.style.cssText =
+            'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
+        });
+        b1.addEventListener('click', () => close('local'));
+        b2.addEventListener('click', () => close('synced'));
+        const bx = document.createElement('button');
+        bx.type = 'button';
+        bx.textContent = 'Cancel';
+        bx.style.cssText =
+          'margin-top:8px;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;';
+        bx.addEventListener('click', () => close(null));
+        card.appendChild(t);
+        card.appendChild(b1);
+        card.appendChild(b2);
+        card.appendChild(bx);
+        box.appendChild(card);
+        document.body.appendChild(box);
+      });
+      if (!pick || pick === cur) return;
+      try {
+        localStorage.setItem(modeKey, pick);
+      } catch (_) {}
+      plugin._pluginSettingsSyncMode = pick === 'synced' ? 'synced' : 'local';
+      const keyList = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (pick === 'synced') {
+        markLocalMirrorKeys(pluginId, keyList);
+        await g.ThymerPluginSettings.flushNow(data, pluginId, keyList);
+      }
+      ui.addToaster?.({
+        title: label,
+        message: pick === 'synced' ? 'Settings will sync across devices.' : 'Settings stay on this device only.',
+        dismissible: true,
+        autoDestroyTime: 3500,
+      });
+    },
+  };
+
+  g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
+  g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
+  g.thymerExtEndMobileLoadGrace = endMobileLoadGrace;
+  g.thymerExtPreferDeferredHeavyWork = preferDeferredHeavyWork;
+  g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
+  g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
+  g.thymerExtPauseHeavyWorkQueue = pauseHeavyWorkQueue;
+  g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
+  g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
+  g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
+  g.thymerExtScheduleAfterMobileLoadGrace = scheduleAfterMobileLoadGrace;
+  g.thymerExtEnsureStartupStormWindow = ensureStartupStormWindow;
+  g.thymerExtInStartupStormWindow = inStartupStormWindow;
+  g.thymerExtEndStartupStormWindow = endStartupStormWindow;
+  g.thymerExtScheduleAfterStartupStorm = scheduleAfterStartupStorm;
+})(typeof globalThis !== 'undefined' ? globalThis : window);
+// @generated END thymer-plugin-settings
+
+const BACKREFS_PLUGIN_ID = 'backreferences';
+const BACKREFS_MODE_KEY = 'thymerext_ps_mode_backreferences';
+const BACKREFS_PLUGIN_LABEL = 'Backreferences';
+
 class Plugin extends AppPlugin {
   onLoad() {
     // NOTE: Thymer strips top-level code outside the Plugin class.
@@ -96,6 +2617,25 @@ class Plugin extends AppPlugin {
       icon: 'eye',
       onSelected: () => this.toggleVisibilityForActiveCollection()
     });
+    this._cmdStorage = this.ui.addCommandPaletteCommand({
+      label: 'Backreferences: Storage location…',
+      icon: 'ti-database',
+      onSelected: () => {
+        void this._backrefsEnsurePathBReady().then(() => {
+          globalThis.ThymerPluginSettings?.openStorageDialog?.({
+            plugin: this,
+            pluginId: BACKREFS_PLUGIN_ID,
+            modeKey: BACKREFS_MODE_KEY,
+            mirrorKeys: () => this._backrefsMirrorKeys(),
+            label: BACKREFS_PLUGIN_LABEL,
+            data: this.data,
+            ui: this.ui,
+          });
+        });
+      },
+    });
+
+    this._backrefsPathBReadyPromise = null;
 
     this._eventHandlerIds.push(
       this.events.on('panel.navigated', (ev) => this.handlePanelChanged(ev.panel, 'panel.navigated'))
@@ -123,6 +2663,7 @@ class Plugin extends AppPlugin {
     try {
       globalThis.thymerExtEnsureMobileLoadGrace?.();
       globalThis.thymerExtInstallMobileResumeGrace?.();
+      globalThis.thymerExtEnsureStartupStormWindow?.();
     } catch (_) {}
     const bootRecord = this.ui.getActivePanel?.()?.getActiveRecord?.() || null;
     if (this.noteSdkPropertyBacklinksFromRecord(bootRecord)) {
@@ -173,17 +2714,87 @@ class Plugin extends AppPlugin {
     return false;
   }
 
+  _backrefsMirrorKeys() {
+    const keys = [
+      this._storageKeyVisibility,
+      this._storageKeyPageViewByRecord,
+      this._storageKeyPropGroupCollapsed,
+      this._storageKeyRecordGroupCollapsed,
+      this._storageKeySortByRecord,
+    ];
+    if (this._legacyStorageKeySortByRecord) keys.push(this._legacyStorageKeySortByRecord);
+    return keys;
+  }
+
+  _backrefsScheduleSettingsFlush() {
+    globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._backrefsMirrorKeys());
+  }
+
+  /** Path B / Plugin Backend init on demand — not on journal startup. */
+  _backrefsEnsurePathBReady() {
+    if (this._backrefsPathBReadyPromise) return this._backrefsPathBReadyPromise;
+    this._backrefsPathBReadyPromise = this._backrefsDeferredPathBBoot().catch(() => {});
+    return this._backrefsPathBReadyPromise;
+  }
+
+  async _backrefsDeferredPathBBoot() {
+    await (globalThis.ThymerPluginSettings?.yieldToHostBeforePathB?.() ?? Promise.resolve());
+    await (globalThis.ThymerPluginSettings?.init?.({
+      plugin: this,
+      pluginId: BACKREFS_PLUGIN_ID,
+      modeKey: BACKREFS_MODE_KEY,
+      mirrorKeys: () => this._backrefsMirrorKeys(),
+      label: BACKREFS_PLUGIN_LABEL,
+      data: this.data,
+      ui: this.ui,
+    }) ?? Promise.resolve());
+    try {
+      await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, {
+        slug: BACKREFS_PLUGIN_ID,
+        label: BACKREFS_PLUGIN_LABEL,
+      });
+    } catch (_) {}
+    this._visibilityConfig = this.loadVisibilityConfig();
+    this._pageViewByRecord = this.loadPageViewByRecordSetting();
+    this._propGroupCollapsed = this.loadPropGroupCollapsedSetting();
+    this._recordGroupCollapsed = this.loadRecordGroupCollapsedSetting();
+    this._sortByRecord = this.loadSortByRecordSetting();
+  }
+
+  _shouldLoadBackrefsData(state, metrics) {
+    if (!state) return false;
+    const m = metrics || this.getCollapseMetrics(state.lastResults);
+    return !this.isFooterCollapsed(state, m);
+  }
+
+  _loadBackrefsDataForPanel(panel, state, reason) {
+    if (!panel || !state) return;
+    if (state._backrefsDataLoaded === true && reason !== 'footer-expanded' && reason !== 'record-changed') {
+      return;
+    }
+    state._backrefsDataLoaded = true;
+    if (!this.usesSdkPropertyBacklinks()) {
+      this.ensurePropertyIndexStarted(reason || 'panel-visible');
+    }
+    const recordChanged = reason === 'record-changed';
+    this.scheduleRefreshForPanel(panel, {
+      force: recordChanged || reason === 'mobile-grace-end' || reason === 'footer-expanded',
+      reason: reason || 'load-data',
+    });
+  }
+
   _scheduleMobileGraceDrain() {
+    const pollMs = 350;
     if (this._mobileGraceDrainTimer) return;
     const tick = () => {
       if (this.inMobileLoadGrace()) {
-        this._mobileGraceDrainTimer = setTimeout(tick, 2000);
+        this._mobileGraceDrainTimer = setTimeout(tick, pollMs);
         return;
       }
       this._mobileGraceDrainTimer = null;
       this._drainDeferredWorkAfterMobileGrace();
     };
-    this._mobileGraceDrainTimer = setTimeout(tick, 2000);
+    this._mobileGraceDrainTimer = setTimeout(tick, pollMs);
   }
 
   _drainDeferredWorkAfterMobileGrace() {
@@ -196,13 +2807,8 @@ class Plugin extends AppPlugin {
         state._backrefsDeferredWork = false;
         try {
           if (!this.isPanelVisible(state.panel)) continue;
-          if (!this.usesSdkPropertyBacklinks()) {
-            this.ensurePropertyIndexStarted('panel-visible-after-grace');
-          }
-          this.scheduleRefreshForPanel(state.panel, {
-            force: true,
-            reason: 'mobile-grace-end',
-          });
+          if (!this._shouldLoadBackrefsData(state)) continue;
+          this._loadBackrefsDataForPanel(state.panel, state, 'mobile-grace-end');
           // Yield between panels to keep navigation responsive.
           await new Promise((r) => setTimeout(r, 0));
         } catch (_) {}
@@ -229,6 +2835,8 @@ class Plugin extends AppPlugin {
     this._cmdRebuildIndex?.remove?.();
     this._cmdToggleDefaultVisibility?.remove?.();
     this._cmdToggleCollectionVisibility?.remove?.();
+    this._cmdStorage?.remove?.();
+    this._backrefsPathBReadyPromise = null;
 
     if (this._mobileGraceDrainTimer) {
       clearTimeout(this._mobileGraceDrainTimer);
@@ -285,6 +2893,9 @@ class Plugin extends AppPlugin {
     state.recordGuid = recordGuid;
     if (this.inMobileLoadGrace()) {
       state._backrefsDeferredWork = true;
+      if (this.isPanelVisible(panel)) {
+        this.mountFooter(panel, state);
+      }
       this._scheduleMobileGraceDrain();
       return;
     }
@@ -292,6 +2903,10 @@ class Plugin extends AppPlugin {
       const viewPrefs = this.getPageViewPreference(recordGuid);
       state.footerCollapsed = viewPrefs.footerCollapsed;
       state.sectionCollapsed = this.cloneSectionCollapsedState(viewPrefs.sections);
+    }
+
+    if (recordChanged) {
+      state._backrefsDataLoaded = false;
     }
 
     if (recordChanged || !this.isValidSortBy(state.sortBy) || !this.isValidSortDir(state.sortDir)) {
@@ -319,17 +2934,18 @@ class Plugin extends AppPlugin {
 
     if (this.isPanelVisible(panel)) {
       this.mountFooter(panel, state);
-      if (!this.usesSdkPropertyBacklinks()) {
-        this.ensurePropertyIndexStarted('panel-visible');
+      if (!this._shouldLoadBackrefsData(state)) {
+        return;
       }
       // Do not full-refresh on panel.focused / panel.navigated when the record is unchanged —
       // that fought the editor during typing and Cmd+I (see docs/EXPANDABLE_PREVIEW_PATTERN.md §7).
       const needsDataRefresh = recordChanged || !state.lastResults;
       if (needsDataRefresh) {
-        this.scheduleRefreshForPanel(panel, {
-          force: recordChanged,
-          reason: reason || (recordChanged ? 'record-changed' : 'initial-load'),
-        });
+        this._loadBackrefsDataForPanel(
+          panel,
+          state,
+          reason || (recordChanged ? 'record-changed' : 'initial-load')
+        );
       }
     } else {
       this.unmountFooterForHiddenPanel(state);
@@ -1121,6 +3737,10 @@ class Plugin extends AppPlugin {
       if (!state) return;
       const nextCollapsed = !this.isFooterCollapsed(state, this.getCollapseMetrics(state.lastResults));
       this.applyFooterCollapsedPreferenceForRecord(state.recordGuid, nextCollapsed);
+      if (!nextCollapsed) {
+        const panel = state.panel || this.ui.getActivePanel?.() || null;
+        if (panel) this._loadBackrefsDataForPanel(panel, state, 'footer-expanded');
+      }
       return;
     }
 
@@ -1521,7 +4141,7 @@ class Plugin extends AppPlugin {
   }
 
   getDefaultFooterCollapsed(metrics) {
-    if (!metrics?.ready) return false;
+    if (!metrics?.ready) return this.preferDeferredHeavyWork();
     if (metrics.propertyError || metrics.linkedError || metrics.propertyIndexPending || metrics.propertyIndexError) return false;
     return (metrics.propertyCount + metrics.linkedCount) === 0;
   }
@@ -2917,6 +5537,7 @@ class Plugin extends AppPlugin {
     } catch (e) {
       // ignore
     }
+    this._backrefsScheduleSettingsFlush();
   }
 
   normalizeTouchedAt(value) {
@@ -4171,6 +6792,9 @@ class Plugin extends AppPlugin {
     let state = this._panelStates.get(panelId) || null;
     if (!state) state = this.getOrCreatePanelState(panel);
     if (!state) return;
+    if (force !== true && !this._shouldLoadBackrefsData(state)) {
+      return;
+    }
 
     if (state.refreshTimer) {
       clearTimeout(state.refreshTimer);
