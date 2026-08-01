@@ -2543,11 +2543,21 @@ class Plugin extends AppPlugin {
     this._legacyStorageKeyRecordGroupCollapsed = null;
     this._recordGroupCollapsed = this.loadRecordGroupCollapsedSetting();
 
-    this._defaultSortBy = 'page_last_edited';
+    this._defaultSortBy = 'journal_page';
     this._defaultSortDir = 'desc';
     this._storageKeySortByRecord = 'thymer_backreferences_sort_by_record_v1';
     this._legacyStorageKeySortByRecord = 'thymer_backlinks_sort_by_record_v1';
     this._sortByRecord = this.loadSortByRecordSetting();
+
+    // Layout grouping for the unified backlinks list — remembered per collection
+    // (all People pages share one setting; all journal days share another).
+    this._defaultGroupBy = 'none';
+    this._storageKeyGroupByScope = 'thymer_backreferences_group_by_scope_v1';
+    this._legacyStorageKeyGroupByRecord = 'thymer_backreferences_group_by_record_v1';
+    this._groupByScope = this.loadGroupByScopeSetting();
+
+    this._storageKeyTimeMachine = 'thymer_backreferences_timemachine_v1';
+    this._timeMachineSettings = this.loadTimeMachineSettings();
 
     this._defaultMaxResults = 200;
     this._refreshDebounceMs = 350;
@@ -2617,6 +2627,11 @@ class Plugin extends AppPlugin {
       icon: 'eye',
       onSelected: () => this.toggleVisibilityForActiveCollection()
     });
+    this._cmdTimeMachineSettings = this.ui.addCommandPaletteCommand({
+      label: 'Backreferences: Time Machine settings…',
+      icon: 'ti-hourglass',
+      onSelected: () => this.openTimeMachineSettings()
+    });
     this._cmdStorage = this.ui.addCommandPaletteCommand({
       label: 'Backreferences: Storage location…',
       icon: 'ti-database',
@@ -2636,6 +2651,20 @@ class Plugin extends AppPlugin {
     });
 
     this._backrefsPathBReadyPromise = null;
+
+    // Hydrate/sync prefs (group-by scope, sort, Time Machine, …) via Plugin Backend
+    // after the startup storm — without waiting for the Storage dialog.
+    try {
+      if (typeof globalThis.thymerExtScheduleAfterStartupStorm === 'function') {
+        globalThis.thymerExtScheduleAfterStartupStorm(() => {
+          void this._backrefsEnsurePathBReady();
+        }, { reason: 'backrefs-pathb' });
+      } else {
+        setTimeout(() => { void this._backrefsEnsurePathBReady(); }, 2800);
+      }
+    } catch (_) {
+      setTimeout(() => { void this._backrefsEnsurePathBReady(); }, 2800);
+    }
 
     this._eventHandlerIds.push(
       this.events.on('panel.navigated', (ev) => this.handlePanelChanged(ev.panel, 'panel.navigated'))
@@ -2721,16 +2750,22 @@ class Plugin extends AppPlugin {
       this._storageKeyPropGroupCollapsed,
       this._storageKeyRecordGroupCollapsed,
       this._storageKeySortByRecord,
+      this._storageKeyGroupByScope,
+      this._storageKeyTimeMachine,
     ];
     if (this._legacyStorageKeySortByRecord) keys.push(this._legacyStorageKeySortByRecord);
+    if (this._legacyStorageKeyGroupByRecord) keys.push(this._legacyStorageKeyGroupByRecord);
     return keys;
   }
 
   _backrefsScheduleSettingsFlush() {
-    globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._backrefsMirrorKeys());
+    // Ensure Path B has resolved sync mode before flush; otherwise scheduleFlush no-ops.
+    void this._backrefsEnsurePathBReady().then(() => {
+      globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._backrefsMirrorKeys());
+    });
   }
 
-  /** Path B / Plugin Backend init on demand — not on journal startup. */
+  /** Path B / Plugin Backend init on demand — deferred off the journal critical path. */
   _backrefsEnsurePathBReady() {
     if (this._backrefsPathBReadyPromise) return this._backrefsPathBReadyPromise;
     this._backrefsPathBReadyPromise = this._backrefsDeferredPathBBoot().catch(() => {});
@@ -2759,6 +2794,28 @@ class Plugin extends AppPlugin {
     this._propGroupCollapsed = this.loadPropGroupCollapsedSetting();
     this._recordGroupCollapsed = this.loadRecordGroupCollapsedSetting();
     this._sortByRecord = this.loadSortByRecordSetting();
+    this._groupByScope = this.loadGroupByScopeSetting();
+    this._timeMachineSettings = this.loadTimeMachineSettings();
+    this._reapplyGroupByPreferencesToOpenPanels();
+  }
+
+  /** After vault hydrate, restamp open footers with the synced collection-scoped group-by. */
+  _reapplyGroupByPreferencesToOpenPanels() {
+    for (const s of this._panelStates?.values?.() || []) {
+      if (!s?.recordGuid) continue;
+      const next = this.getGroupByPreferenceForRecord(s.recordGuid, s.panel);
+      if ((this.normalizeGroupBy(s.groupBy) || this._defaultGroupBy) === next) {
+        this.syncGroupModeControls(s);
+        continue;
+      }
+      s.groupBy = next;
+      try {
+        this.renderSortMenu(s);
+        this.syncSortControlState(s);
+        this.syncGroupModeControls(s);
+        this.renderFromCache(s);
+      } catch (e) { /* ignore */ }
+    }
   }
 
   _shouldLoadBackrefsData(state, metrics) {
@@ -2903,6 +2960,7 @@ class Plugin extends AppPlugin {
       const viewPrefs = this.getPageViewPreference(recordGuid);
       state.footerCollapsed = viewPrefs.footerCollapsed;
       state.sectionCollapsed = this.cloneSectionCollapsedState(viewPrefs.sections);
+      this.resetTimeMachineState(state);
     }
 
     if (recordChanged) {
@@ -2928,6 +2986,7 @@ class Plugin extends AppPlugin {
       const pref = this.getSortPreferenceForRecord(recordGuid);
       state.sortBy = pref.sortBy;
       state.sortDir = pref.sortDir;
+      state.groupBy = this.getGroupByPreferenceForRecord(recordGuid, panel);
       state.sortMenuOpen = false;
       state.searchOpen = Boolean((state.searchQuery || '').trim());
     }
@@ -3186,10 +3245,17 @@ class Plugin extends AppPlugin {
       propertySlotEl: null,
       linkedSlotEl: null,
       unlinkedSlotEl: null,
+      timeMachineSlotEl: null,
+      timeMachineToggleEl: null,
+      timeMachineCollapsed: true,
+      timeMachineLoading: false,
+      timeMachineResults: null,
+      timeMachineJournalKey: '',
       countEl: null,
       footerToggleEl: null,
       sortToggleEl: null,
       sortMenuEl: null,
+      groupModesEl: null,
       searchToggleEl: null,
       searchRowEl: null,
       searchWrapEl: null,
@@ -3220,6 +3286,7 @@ class Plugin extends AppPlugin {
       renderSectionKeys: null,
       sortBy: this._defaultSortBy,
       sortDir: this._defaultSortDir,
+      groupBy: this._defaultGroupBy,
       sortMenuOpen: false,
       sortMenuDismissHandler: null,
       sortMenuKeyHandler: null,
@@ -3321,6 +3388,7 @@ class Plugin extends AppPlugin {
     state.footerToggleEl = null;
     state.sortToggleEl = null;
     state.sortMenuEl = null;
+    state.groupModesEl = null;
     state.searchToggleEl = null;
     state.searchRowEl = null;
     state.searchWrapEl = null;
@@ -3355,6 +3423,8 @@ class Plugin extends AppPlugin {
       state.propertySlotEl = state.rootEl.querySelector('[data-role="property-slot"]');
       state.linkedSlotEl = state.rootEl.querySelector('[data-role="linked-slot"]');
       state.unlinkedSlotEl = state.rootEl.querySelector('[data-role="unlinked-slot"]');
+      state.timeMachineSlotEl = state.rootEl.querySelector('[data-role="time-machine-slot"]');
+      state.timeMachineToggleEl = state.rootEl.querySelector('[data-action="toggle-time-machine"]');
       state.countEl = state.rootEl.querySelector('[data-role="count"]');
       state.renderSectionKeys = null;
       this.setSearchOpen(state, state.searchOpen === true || Boolean((state.searchQuery || '').trim()));
@@ -3415,11 +3485,11 @@ class Plugin extends AppPlugin {
 
   buildFooterRoot(state) {
     const root = document.createElement('div');
-    root.className = 'tlr-footer form-field-group';
+    root.className = 'tlr-footer tlr-footer--native';
     root.dataset.panelId = state.panelId;
 
     const headerField = document.createElement('div');
-    headerField.className = 'tlr-header-field form-field';
+    headerField.className = 'tlr-header-field';
 
     const header = document.createElement('div');
     header.className = 'tlr-header form-field-row';
@@ -3430,8 +3500,9 @@ class Plugin extends AppPlugin {
     const headerControls = document.createElement('div');
     headerControls.className = 'tlr-header-controls';
 
+    // Built-in style: one summary pill (chevron + "N backlinks in M pages").
     const toggleBtn = document.createElement('button');
-    toggleBtn.className = 'tlr-btn tlr-toggle tlr-section-toggle button-none button-small button-minimal-hover';
+    toggleBtn.className = 'tlr-btn tlr-toggle tlr-summary-pill button-none button-small button-minimal-hover';
     toggleBtn.type = 'button';
     toggleBtn.dataset.action = 'toggle';
     toggleBtn.title = 'Collapse/expand';
@@ -3439,14 +3510,11 @@ class Plugin extends AppPlugin {
     toggleBtn.setAttribute('aria-expanded', 'true');
     toggleBtn.appendChild(this.buildChevronIcon(false, 'tlr-toggle-caret'));
 
-    const title = document.createElement('div');
-    title.className = 'tlr-title tlr-section-title text-details';
-    title.textContent = 'Backreferences';
-
-    const count = document.createElement('div');
-    count.className = 'tlr-count text-details';
+    const count = document.createElement('span');
+    count.className = 'tlr-count';
     count.dataset.role = 'count';
     count.textContent = '';
+    toggleBtn.appendChild(count);
 
     const filterWrap = document.createElement('div');
     filterWrap.className = 'tlr-filter-wrap';
@@ -3651,9 +3719,25 @@ class Plugin extends AppPlugin {
     sortWrap.appendChild(sortMenu);
 
     headerMain.appendChild(toggleBtn);
-    headerMain.appendChild(title);
-    headerMain.appendChild(count);
 
+    const groupModes = this.buildGroupModeControls();
+    state.groupModesEl = groupModes;
+
+    const tmToggle = document.createElement('button');
+    tmToggle.type = 'button';
+    tmToggle.className = 'tlr-btn tlr-tm-toggle button-none button-small button-minimal-hover tooltip';
+    tmToggle.dataset.action = 'toggle-time-machine';
+    tmToggle.title = 'Time Machine';
+    tmToggle.setAttribute('aria-label', 'Time Machine');
+    tmToggle.setAttribute('data-tooltip', 'Time Machine');
+    tmToggle.setAttribute('data-tooltip-dir', 'top');
+    tmToggle.setAttribute('aria-pressed', 'false');
+    try { tmToggle.appendChild(this.ui.createIcon('ti-hourglass')); }
+    catch (e) { tmToggle.textContent = '⏳'; }
+    state.timeMachineToggleEl = tmToggle;
+
+    headerControls.appendChild(groupModes);
+    headerControls.appendChild(tmToggle);
     headerControls.appendChild(filterWrap);
     headerControls.appendChild(sortWrap);
 
@@ -3681,16 +3765,20 @@ class Plugin extends AppPlugin {
     unlinkedSlot.className = 'tlr-section-slot tlr-section-slot-unlinked';
     unlinkedSlot.dataset.role = 'unlinked-slot';
 
+    const timeMachineSlot = document.createElement('div');
+    timeMachineSlot.className = 'tlr-section-slot tlr-section-slot-tm';
+    timeMachineSlot.dataset.role = 'time-machine-slot';
+    timeMachineSlot.hidden = true;
+
     searchRowInner.appendChild(searchWrap);
     searchRow.appendChild(searchRowInner);
     root.appendChild(headerField);
     root.appendChild(searchRow);
     body.appendChild(statusSlot);
     body.appendChild(propertySlot);
-    this.appendReferenceDivider(body);
     body.appendChild(linkedSlot);
-    this.appendReferenceDivider(body);
     body.appendChild(unlinkedSlot);
+    body.appendChild(timeMachineSlot);
     root.appendChild(body);
 
     root.addEventListener('click', (e) => this.handleFooterClick(e));
@@ -3714,7 +3802,10 @@ class Plugin extends AppPlugin {
     state.propertySlotEl = propertySlot;
     state.linkedSlotEl = linkedSlot;
     state.unlinkedSlotEl = unlinkedSlot;
+    state.timeMachineSlotEl = timeMachineSlot;
     state.renderSectionKeys = null;
+    this.syncTimeMachineControl(state);
+    this.renderTimeMachineSection(state);
     return root;
   }
 
@@ -3864,6 +3955,30 @@ class Plugin extends AppPlugin {
       if (!nextSortDir) return;
       this.applySortPreferenceForRecord(state.recordGuid, state.sortBy, nextSortDir);
       this.setSortMenuOpen(state, true);
+      return;
+    }
+
+    if (action === 'set-group-by') {
+      if (!state) return;
+      const requested = this.normalizeGroupBy(actionEl.dataset.groupBy);
+      if (!requested) return;
+      const current = this.normalizeGroupBy(state.groupBy) || this._defaultGroupBy;
+      const fromMenu = Boolean(actionEl.closest?.('.tlr-sort-menu'));
+      // Clicking the lit icon toggles grouping back off.
+      const nextGroupBy = !fromMenu && requested === current ? 'none' : requested;
+      // Date headings would contradict a non-date order, so move the sort with it.
+      if (nextGroupBy === 'time' && !this.isDateSortKey(state.sortBy)) {
+        this.applySortPreferenceForRecord(state.recordGuid, 'journal_page', state.sortDir);
+      }
+      this.applyGroupByPreferenceForRecord(state.recordGuid, nextGroupBy);
+      if (fromMenu) this.setSortMenuOpen(state, true);
+      return;
+    }
+
+    if (action === 'toggle-time-machine') {
+      if (!state) return;
+      e.stopPropagation();
+      this.toggleTimeMachine(state).catch(() => {});
       return;
     }
 
@@ -5201,12 +5316,250 @@ class Plugin extends AppPlugin {
 
   getSortOptions() {
     return [
+      { id: 'journal_page', label: 'Journal Page / When' },
       { id: 'page_last_edited', label: 'Page Last Edited' },
-      { id: 'reference_activity', label: 'Reference Activity' },
-      { id: 'reference_count', label: 'Reference Count' },
       { id: 'page_title', label: 'Page Title' },
-      { id: 'page_created_date', label: 'Page Created Date' }
+      { id: 'reference_count', label: 'Reference Count' }
     ];
+  }
+
+  /** Sort keys that carry a date, so time grouping can borrow one. */
+  getDateSortKeys() {
+    return ['journal_page', 'page_last_edited'];
+  }
+
+  isDateSortKey(sortBy) {
+    return this.getDateSortKeys().includes(this.normalizeSortBy(sortBy) || '');
+  }
+
+  getGroupByOptions() {
+    return [
+      { id: 'none', label: 'None (flat list)' },
+      { id: 'collection', label: 'Collection' },
+      { id: 'property', label: 'Property' },
+      { id: 'time', label: 'Time' }
+    ];
+  }
+
+  /** Today's Notes-style icon toggles: click the lit one again to go back to a flat list. */
+  getGroupModeButtons() {
+    return [
+      { id: 'collection', icon: 'ti-folder', label: 'Group by collection' },
+      { id: 'time', icon: 'ti-clock', label: 'Group by time' },
+      { id: 'property', icon: 'ti-id', label: 'Group by property' }
+    ];
+  }
+
+  buildGroupModeControls() {
+    const wrap = document.createElement('div');
+    wrap.className = 'tlr-group-modes';
+
+    for (const mode of this.getGroupModeButtons()) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tlr-btn tlr-group-mode button-none button-small button-minimal-hover tooltip';
+      btn.dataset.action = 'set-group-by';
+      btn.dataset.groupBy = mode.id;
+      btn.title = mode.label;
+      btn.setAttribute('aria-label', mode.label);
+      btn.setAttribute('data-tooltip', mode.label);
+      btn.setAttribute('data-tooltip-dir', 'top');
+      btn.setAttribute('aria-pressed', 'false');
+      try {
+        btn.appendChild(this.ui.createIcon(mode.icon));
+      } catch (e) {
+        btn.textContent = mode.label.slice(0, 1);
+      }
+      wrap.appendChild(btn);
+    }
+
+    return wrap;
+  }
+
+  syncGroupModeControls(state) {
+    const wrap = state?.groupModesEl || state?.rootEl?.querySelector?.('.tlr-group-modes') || null;
+    if (!wrap) return;
+    const groupBy = this.normalizeGroupBy(state?.groupBy) || this._defaultGroupBy;
+
+    for (const mode of this.getGroupModeButtons()) {
+      const btn = wrap.querySelector(`[data-group-by="${mode.id}"]`);
+      if (!btn) continue;
+      const active = mode.id === groupBy;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+      const label = active ? `${mode.label} (click to ungroup)` : mode.label;
+      btn.title = label;
+      btn.setAttribute('data-tooltip', label);
+    }
+    this.syncTimeMachineControl(state);
+  }
+
+  /** One sentence describing order + grouping, so neither setting hides the other. */
+  buildSortStateSummary(state) {
+    const sortBy = this.normalizeSortBy(state?.sortBy) || this._defaultSortBy;
+    const sortDir = this.normalizeSortDir(state?.sortDir) || this._defaultSortDir;
+    const groupBy = this.normalizeGroupBy(state?.groupBy) || this._defaultGroupBy;
+
+    const dirLabel = sortBy === 'page_title'
+      ? (sortDir === 'asc' ? 'A→Z' : 'Z→A')
+      : sortBy === 'reference_count'
+        ? (sortDir === 'asc' ? 'fewest first' : 'most first')
+        : (sortDir === 'asc' ? 'oldest first' : 'newest first');
+
+    const parts = [this.getSortLabel(sortBy), dirLabel];
+    if (groupBy !== 'none') {
+      const groupNoun = groupBy === 'time' ? 'month' : groupBy;
+      parts.push(`grouped by ${groupNoun}`);
+    }
+    return parts.join(' · ');
+  }
+
+  getGroupByLabel(groupBy) {
+    const id = this.normalizeGroupBy(groupBy) || this._defaultGroupBy;
+    for (const option of this.getGroupByOptions()) {
+      if (option.id === id) return option.label;
+    }
+    return 'None (flat list)';
+  }
+
+  isValidGroupBy(groupBy) {
+    if (typeof groupBy !== 'string') return false;
+    return this.getGroupByOptions().some((x) => x.id === groupBy);
+  }
+
+  normalizeGroupBy(groupBy) {
+    return this.isValidGroupBy(groupBy) ? groupBy : null;
+  }
+
+  /**
+   * Scope key for grouping prefs: journals share one setting; other pages share
+   * by collection so People→time sticks across every person, etc.
+   */
+  getGroupByScopeKey(record, panel) {
+    if (record && this.isJournalLikeRecord(record)) return '__journal__';
+
+    const panelColl = panel ? this.getPanelCollection(panel) : null;
+    const panelGuid = this.getCollectionGuid(panelColl);
+    if (panelGuid) return `c:${panelGuid}`;
+
+    const label = this.getRecordCollectionLabel(record);
+    if (label) return `n:${label.toLowerCase()}`;
+
+    const guid = (record?.guid || '').trim();
+    return guid ? `r:${guid}` : '';
+  }
+
+  getGroupByPreferenceForRecord(recordGuid, panel) {
+    const fallback = this._defaultGroupBy;
+    let record = null;
+    try { record = this.data.getRecord?.((recordGuid || '').trim()) || null; } catch (e) { record = null; }
+    const scope = this.getGroupByScopeKey(record, panel || null);
+    if (!scope) return fallback;
+    const raw = this._groupByScope?.[scope] || null;
+    if (!raw || typeof raw !== 'object') return fallback;
+    return this.normalizeGroupBy(raw.groupBy) || fallback;
+  }
+
+  applyGroupByPreferenceForRecord(recordGuid, groupBy) {
+    const guid = (recordGuid || '').trim();
+    if (!guid) return;
+
+    const nextGroupBy = this.normalizeGroupBy(groupBy) || this._defaultGroupBy;
+    let record = null;
+    try { record = this.data.getRecord?.(guid) || null; } catch (e) { record = null; }
+
+    let panel = null;
+    for (const s of this._panelStates.values()) {
+      if (s?.recordGuid === guid) { panel = s.panel || null; break; }
+    }
+    const scope = this.getGroupByScopeKey(record, panel);
+    if (!scope) return;
+
+    this.setGroupByPreferenceForScope(scope, nextGroupBy);
+
+    for (const s of this._panelStates.values()) {
+      if (!s?.recordGuid) continue;
+      let other = null;
+      try { other = this.data.getRecord?.(s.recordGuid) || null; } catch (e) { other = null; }
+      if (this.getGroupByScopeKey(other, s.panel) !== scope) continue;
+      s.groupBy = nextGroupBy;
+      this.renderSortMenu(s);
+      this.syncSortControlState(s);
+      this.renderFromCache(s);
+    }
+  }
+
+  loadGroupByScopeSetting() {
+    const normalizePref = (pref) => {
+      const groupBy = this.normalizeGroupBy(pref?.groupBy);
+      if (!groupBy) return null;
+      return {
+        groupBy,
+        touchedAt: this.normalizeTouchedAt(pref?.touchedAt)
+      };
+    };
+
+    const current = this.parseStoredRecordMap(
+      this.readJsonStorage(this._storageKeyGroupByScope),
+      normalizePref
+    );
+    if (current && Object.keys(current).length) {
+      const pruned = this.pruneTouchedRecordMap(current, this._maxStoredSortByRecords);
+      if (Object.keys(pruned).length !== Object.keys(current).length) {
+        this.writeJsonStorage(this._storageKeyGroupByScope, pruned);
+      }
+      return pruned;
+    }
+
+    // One-time lift of any leftover per-record prefs into collection scopes.
+    const legacy = this.parseStoredRecordMap(
+      this.readJsonStorage(this._legacyStorageKeyGroupByRecord),
+      normalizePref
+    ) || {};
+    const migrated = {};
+    for (const [recordGuid, pref] of Object.entries(legacy)) {
+      let record = null;
+      try { record = this.data.getRecord?.(recordGuid) || null; } catch (e) { record = null; }
+      const scope = this.getGroupByScopeKey(record, null) || `r:${recordGuid}`;
+      const prev = migrated[scope];
+      if (!prev || (pref.touchedAt || 0) >= (prev.touchedAt || 0)) {
+        migrated[scope] = pref;
+      }
+    }
+    if (Object.keys(migrated).length) {
+      this.writeJsonStorage(this._storageKeyGroupByScope, migrated);
+      return migrated;
+    }
+    return {};
+  }
+
+  saveGroupByScopeSetting() {
+    this._groupByScope = this.pruneTouchedRecordMap(
+      this._groupByScope || {},
+      this._maxStoredSortByRecords
+    );
+    this.writeJsonStorage(this._storageKeyGroupByScope, this._groupByScope || {});
+  }
+
+  setGroupByPreferenceForScope(scopeKey, groupBy) {
+    const scope = (scopeKey || '').trim();
+    if (!scope) return;
+
+    const nextGroupBy = this.normalizeGroupBy(groupBy) || this._defaultGroupBy;
+    if (!this._groupByScope || typeof this._groupByScope !== 'object') {
+      this._groupByScope = {};
+    }
+
+    if (nextGroupBy === this._defaultGroupBy) {
+      delete this._groupByScope[scope];
+    } else {
+      this._groupByScope[scope] = {
+        groupBy: nextGroupBy,
+        touchedAt: Date.now()
+      };
+    }
+    this.saveGroupByScopeSetting();
+    this._backrefsScheduleSettingsFlush?.();
   }
 
   getSortLabel(sortBy) {
@@ -5214,7 +5567,7 @@ class Plugin extends AppPlugin {
     for (const option of this.getSortOptions()) {
       if (option.id === id) return option.label;
     }
-    return 'Page Last Edited';
+    return 'Journal Page / When';
   }
 
   isValidSortBy(sortBy) {
@@ -5227,7 +5580,14 @@ class Plugin extends AppPlugin {
   }
 
   normalizeSortBy(sortBy) {
-    return this.isValidSortBy(sortBy) ? sortBy : null;
+    if (this.isValidSortBy(sortBy)) return sortBy;
+    // Retired keys map onto their closest survivor so stored prefs still work.
+    const retired = {
+      reference_activity: 'page_last_edited',
+      page_created_date: 'journal_page'
+    };
+    const mapped = retired[sortBy];
+    return mapped && this.isValidSortBy(mapped) ? mapped : null;
   }
 
   normalizeSortDir(sortDir) {
@@ -5294,6 +5654,11 @@ class Plugin extends AppPlugin {
     thumb.className = 'vscrollbar-thumb scrollbar-thumb clickable';
     thumb.innerHTML = '&nbsp;';
 
+    const stateLine = document.createElement('div');
+    stateLine.className = 'tlr-sort-menu-state';
+    stateLine.textContent = this.buildSortStateSummary(state);
+    content.appendChild(stateLine);
+
     const title = document.createElement('div');
     title.className = 'tlr-sort-menu-title text-details';
     title.textContent = 'Sort by';
@@ -5349,6 +5714,9 @@ class Plugin extends AppPlugin {
     content.appendChild(ascBtn);
     content.appendChild(descBtn);
 
+    // Grouping lives in the header icon toggles, not this menu.
+    state.groupBy = this.normalizeGroupBy(state.groupBy) || this._defaultGroupBy;
+
     scroll.appendChild(content);
     scroll.addEventListener('scroll', () => {
       this.syncSortMenuScrollbar(state);
@@ -5399,21 +5767,29 @@ class Plugin extends AppPlugin {
     if (!state) return;
     const sortBy = this.normalizeSortBy(state.sortBy) || this._defaultSortBy;
     const sortDir = this.normalizeSortDir(state.sortDir) || this._defaultSortDir;
+    const groupBy = this.normalizeGroupBy(state.groupBy) || this._defaultGroupBy;
     state.sortBy = sortBy;
     state.sortDir = sortDir;
+    state.groupBy = groupBy;
 
     const sortLabel = this.getSortLabel(sortBy);
     const dirLabel = sortDir === 'asc' ? 'Ascending' : 'Descending';
+    const groupLabel = this.getGroupByLabel(groupBy);
 
     if (state.sortToggleEl) {
-      state.sortToggleEl.title = `Sort: ${sortLabel} (${dirLabel})`;
-      state.sortToggleEl.setAttribute('aria-label', `Sort options: ${sortLabel}, ${dirLabel}`);
+      state.sortToggleEl.title = `Sort: ${sortLabel} (${dirLabel}) · Group: ${groupLabel}`;
+      state.sortToggleEl.setAttribute(
+        'aria-label',
+        `Sort options: ${sortLabel}, ${dirLabel}. Group by ${groupLabel}`
+      );
       state.sortToggleEl.setAttribute('aria-expanded', state.sortMenuOpen === true ? 'true' : 'false');
     }
 
     if (state.rootEl) {
       state.rootEl.classList.toggle('tlr-sort-open', state.sortMenuOpen === true);
     }
+
+    this.syncGroupModeControls(state);
   }
 
   setSortMenuOpen(state, open) {
@@ -6221,15 +6597,23 @@ class Plugin extends AppPlugin {
   }
 
   /**
-   * When Thymer exposes record.getBackReferenceRecords(), skip the workspace-wide index.
+   * When Thymer exposes host reverse-index APIs, skip the workspace-wide property index.
+   * Prefers getBackReferences(); getBackReferenceRecords() alone also enables SDK mode.
    * @returns {boolean} true if SDK mode is now active
    */
   noteSdkPropertyBacklinksFromRecord(record) {
     if (this._propertyIndexSdkMode === true) return true;
-    if (typeof record?.getBackReferenceRecords !== 'function') return false;
+    const hasDetailed = typeof record?.getBackReferences === 'function';
+    const hasRecords = typeof record?.getBackReferenceRecords === 'function';
+    if (!hasDetailed && !hasRecords) return false;
     this._propertyIndexSdkMode = true;
     this.cancelInitialPropertyIndexDefer();
     return true;
+  }
+
+  hostBackReferencesAvailable(record) {
+    return typeof record?.getBackReferences === 'function'
+      || typeof record?.getBackReferenceRecords === 'function';
   }
 
   scheduleInitialPropertyIndex() {
@@ -6681,6 +7065,20 @@ class Plugin extends AppPlugin {
   }
 
   async getPropertyBacklinkCandidateRecords(targetRecord) {
+    if (typeof targetRecord?.getBackReferences === 'function') {
+      const refs = await targetRecord.getBackReferences();
+      const out = [];
+      const seen = new Set();
+      for (const ref of refs || []) {
+        if (ref?.kind && ref.kind !== 'property') continue;
+        const record = ref?.record || null;
+        const guid = record?.guid || '';
+        if (!guid || seen.has(guid)) continue;
+        seen.add(guid);
+        out.push(record);
+      }
+      return out;
+    }
     if (typeof targetRecord?.getBackReferenceRecords !== 'function') {
       throw new Error(this.getUnavailablePropertyBacklinkMessage());
     }
@@ -6688,10 +7086,285 @@ class Plugin extends AppPlugin {
     return Array.isArray(records) ? records : [];
   }
 
+  async fetchDetailedBackReferences(targetRecord) {
+    if (typeof targetRecord?.getBackReferences === 'function') {
+      const refs = await targetRecord.getBackReferences();
+      return Array.isArray(refs) ? refs : [];
+    }
+    if (typeof targetRecord?.getBackReferenceRecords === 'function') {
+      const records = await targetRecord.getBackReferenceRecords();
+      return (Array.isArray(records) ? records : []).map((record) => ({
+        record,
+        kind: 'property',
+        propertyId: null,
+        lineItemGuid: null
+      }));
+    }
+    return null;
+  }
+
+  /**
+   * `PluginBackReference.propertyId` matches `PluginProperty.guid` (there is no `.id`).
+   * Returns '' when the field can't be named — callers then fall back to the
+   * name-based property scan so headers never show a raw field id.
+   */
+  resolvePropertyNameFromRecord(record, propertyId) {
+    const id = propertyId == null ? '' : String(propertyId).trim();
+    if (!record || !id) return '';
+
+    const readFrom = (props) => {
+      for (const prop of props || []) {
+        const propGuid = String(prop?.guid || '').trim();
+        if (propGuid && propGuid === id) {
+          const name = (prop?.name || '').trim();
+          if (name) return name;
+        }
+      }
+      return '';
+    };
+
+    try {
+      const name = readFrom(record.getAllProperties?.() || []);
+      if (name) return name;
+    } catch (e) {
+      // ignore
+    }
+
+    try {
+      const props = typeof record.getProperties === 'function' ? record.getProperties(null) : [];
+      const name = readFrom(props);
+      if (name) return name;
+    } catch (e) {
+      // ignore
+    }
+
+    return '';
+  }
+
+  mergePropertyBacklinkGroups(base, extra) {
+    const byName = new Map();
+    for (const group of [...(base || []), ...(extra || [])]) {
+      const name = group?.propertyName || '';
+      if (!name) continue;
+      let bucket = byName.get(name) || null;
+      if (!bucket) {
+        bucket = new Map();
+        byName.set(name, bucket);
+      }
+      for (const record of group?.records || []) {
+        const guid = record?.guid || '';
+        if (guid && !bucket.has(guid)) bucket.set(guid, record);
+      }
+    }
+
+    const groups = Array.from(byName.entries()).map(([propertyName, recordMap]) => ({
+      propertyName,
+      records: Array.from(recordMap.values())
+    }));
+
+    groups.sort((a, b) => {
+      const an = (a.propertyName || '').toLowerCase();
+      const bn = (b.propertyName || '').toLowerCase();
+      return an < bn ? -1 : an > bn ? 1 : 0;
+    });
+
+    for (const g of groups) {
+      g.records.sort((a, b) => {
+        const ad = a?.getUpdatedAt?.() || null;
+        const bd = b?.getUpdatedAt?.() || null;
+        const at = ad ? ad.getTime() : 0;
+        const bt = bd ? bd.getTime() : 0;
+        if (bt !== at) return bt - at;
+        const an = (a?.getName?.() || '').toLowerCase();
+        const bn = (b?.getName?.() || '').toLowerCase();
+        return an < bn ? -1 : an > bn ? 1 : 0;
+      });
+    }
+
+    return groups;
+  }
+
+  buildPropertyGroupsFromDetailedRefs(refs, targetGuid, { showSelf } = {}) {
+    const byProp = new Map();
+    const unresolved = new Map();
+
+    for (const ref of refs || []) {
+      if (ref?.kind && ref.kind !== 'property') continue;
+      const src = ref?.record || null;
+      const srcGuid = src?.guid || '';
+      if (!srcGuid) continue;
+      if (!showSelf && srcGuid === targetGuid) continue;
+
+      const propName = this.resolvePropertyNameFromRecord(src, ref?.propertyId);
+      if (!propName) {
+        // Unknown field id — let the name-based scan label this record's groups.
+        if (!unresolved.has(srcGuid)) unresolved.set(srcGuid, src);
+        continue;
+      }
+
+      let group = byProp.get(propName) || null;
+      if (!group) {
+        group = new Map();
+        byProp.set(propName, group);
+      }
+      group.set(srcGuid, src);
+    }
+
+    const resolvedGroups = Array.from(byProp.entries()).map(([propertyName, recordMap]) => ({
+      propertyName,
+      records: Array.from(recordMap.values())
+    }));
+
+    const fallbackGroups = unresolved.size > 0
+      ? this.buildPropertyBacklinkGroupsFromRecords(
+          Array.from(unresolved.values()),
+          targetGuid,
+          { showSelf }
+        )
+      : [];
+
+    return this.mergePropertyBacklinkGroups(resolvedGroups, fallbackGroups);
+  }
+
+  indexLineItemsByGuid(items, into = null) {
+    const map = into || new Map();
+    const walk = (arr) => {
+      for (const item of arr || []) {
+        const guid = item?.guid || '';
+        if (guid) map.set(guid, item);
+        const children = item?.children;
+        if (Array.isArray(children) && children.length) walk(children);
+      }
+    };
+    walk(items);
+    return map;
+  }
+
+  async buildLinkedGroupsFromDetailedRefs(refs, targetGuid, { showSelf, maxResults } = {}) {
+    const bySource = new Map();
+    for (const ref of refs || []) {
+      if (ref?.kind && ref.kind !== 'line') continue;
+      const record = ref?.record || null;
+      const srcGuid = record?.guid || '';
+      if (!srcGuid) continue;
+      if (!showSelf && srcGuid === targetGuid) continue;
+      const lineGuid = (ref?.lineItemGuid || '').trim();
+      if (!lineGuid) continue;
+      let entry = bySource.get(srcGuid);
+      if (!entry) {
+        entry = { record, lineGuids: new Set() };
+        bySource.set(srcGuid, entry);
+      }
+      entry.lineGuids.add(lineGuid);
+    }
+
+    const lines = [];
+    for (const { record, lineGuids } of bySource.values()) {
+      let items = [];
+      try {
+        items = (await record.getLineItems?.()) || [];
+      } catch (e) {
+        items = [];
+      }
+      const byGuid = this.indexLineItemsByGuid(items);
+      for (const lineGuid of lineGuids) {
+        const line = byGuid.get(lineGuid) || null;
+        if (line) {
+          if (!line.record) {
+            try { line.record = record; } catch (e) { /* ignore */ }
+          }
+          lines.push(line);
+        } else {
+          lines.push({
+            guid: lineGuid,
+            record,
+            segments: [],
+            getCreatedAt: () => null,
+            getUpdatedAt: () => null
+          });
+        }
+        if (maxResults && lines.length >= maxResults) break;
+      }
+      if (maxResults && lines.length >= maxResults) break;
+    }
+
+    return this.groupBacklinkLines(lines, targetGuid, { showSelf });
+  }
+
+  /**
+   * Primary host-index path for linked + property refs.
+   * @returns {null|object} null when SDK APIs are unavailable
+   */
+  async loadHostIndexedReferenceBundle(targetRecord, targetGuid, { showSelf, maxResults } = {}) {
+    if (!this.hostBackReferencesAvailable(targetRecord)) return null;
+    this.noteSdkPropertyBacklinksFromRecord(targetRecord);
+
+    const startedAt = new Date();
+    const stats = {
+      ...this.createEmptyPropertyIndexStats(),
+      reason: 'sdk-getBackReferences',
+      startedAt,
+      finishedAt: null
+    };
+
+    try {
+      const refs = await this.fetchDetailedBackReferences(targetRecord);
+      if (refs === null) return null;
+
+      stats.scannedRecords = refs.length;
+      let propertyGroups = this.buildPropertyGroupsFromDetailedRefs(refs, targetGuid, { showSelf });
+      const linkedGroups = await this.buildLinkedGroupsFromDetailedRefs(refs, targetGuid, {
+        showSelf,
+        maxResults
+      });
+
+      // Journal days: When-style dates aren't links, so getBackReferences is empty.
+      // Fold in `@date` record hits as property groups (same index Today's Notes uses).
+      const dateGroups = await this.loadDatePropertyBacklinkGroups(targetRecord, targetGuid, {
+        showSelf,
+        maxResults
+      });
+      if (dateGroups.length) {
+        propertyGroups = this.mergePropertyBacklinkGroups(propertyGroups, dateGroups);
+        stats.reason = refs.length
+          ? 'sdk-getBackReferences+date'
+          : 'date-search-journal';
+      }
+
+      stats.indexedReferences = propertyGroups.reduce(
+        (total, group) => total + (group?.records?.length || 0),
+        0
+      );
+      stats.indexedTargets = stats.indexedReferences > 0 ? 1 : 0;
+      stats.finishedAt = new Date();
+
+      return {
+        linkedGroups,
+        linkedError: '',
+        propertyGroups,
+        propertyError: '',
+        propertyIndexStatus: 'ready',
+        propertyIndexStats: stats,
+        propertyIndexError: '',
+        fromHostIndex: true
+      };
+    } catch (e) {
+      console.warn('[Backreferences] host getBackReferences failed; falling back to search/index', e);
+      return null;
+    }
+  }
+
   async loadPropertyBacklinkResult(targetRecord, targetGuid, { showSelf } = {}) {
     const guid = (targetGuid || targetRecord?.guid || '').trim();
     if (!this.noteSdkPropertyBacklinksFromRecord(targetRecord)) {
-      return this.getPropertyBacklinkResult(guid, { showSelf });
+      const indexed = this.getPropertyBacklinkResult(guid, { showSelf });
+      const dateGroups = await this.loadDatePropertyBacklinkGroups(targetRecord, guid, { showSelf });
+      if (!dateGroups.length) return indexed;
+      return {
+        ...indexed,
+        propertyGroups: this.mergePropertyBacklinkGroups(indexed.propertyGroups, dateGroups),
+        propertyIndexStatus: 'ready'
+      };
     }
 
     const startedAt = new Date();
@@ -6713,9 +7386,23 @@ class Plugin extends AppPlugin {
     }
 
     try {
-      const candidateRecords = await this.getPropertyBacklinkCandidateRecords(targetRecord);
-      stats.scannedRecords = candidateRecords.length;
-      const propertyGroups = this.buildPropertyBacklinkGroupsFromRecords(candidateRecords, guid, { showSelf });
+      const refs = await this.fetchDetailedBackReferences(targetRecord);
+      let propertyGroups = [];
+      if (Array.isArray(refs)) {
+        stats.scannedRecords = refs.length;
+        propertyGroups = this.buildPropertyGroupsFromDetailedRefs(refs, guid, { showSelf });
+      } else {
+        const candidateRecords = await this.getPropertyBacklinkCandidateRecords(targetRecord);
+        stats.scannedRecords = candidateRecords.length;
+        propertyGroups = this.buildPropertyBacklinkGroupsFromRecords(candidateRecords, guid, { showSelf });
+      }
+
+      const dateGroups = await this.loadDatePropertyBacklinkGroups(targetRecord, guid, { showSelf });
+      if (dateGroups.length) {
+        propertyGroups = this.mergePropertyBacklinkGroups(propertyGroups, dateGroups);
+        stats.reason = 'sdk-backreferences+date';
+      }
+
       stats.indexedReferences = propertyGroups.reduce(
         (total, group) => total + (group?.records?.length || 0),
         0
@@ -6929,7 +7616,111 @@ class Plugin extends AppPlugin {
       // Fall back to parsing date-like page titles below.
     }
 
+    // Synthetic journal GUIDs end in -YYYYMMDD even when getJournalDetails is absent.
+    const guid = (record?.guid || '').trim();
+    const guidMatch = guid.match(/(?:^|-)(\d{8})$/);
+    if (guidMatch) {
+      const raw = guidMatch[1];
+      const iso = `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+      if (this.normalizeDateToIso(iso)) return iso;
+    }
+
     return this.parseDateIsoFromRecordTitle(record.getName?.() || '');
+  }
+
+  /**
+   * Date properties that land on `dateIso`. Prefer named When/Date fields; fall back to any
+   * datetime property on that day. Used for journal-page backlinks, where `getBackReferences`
+   * returns nothing because a When datetime is not a link.
+   */
+  getMatchingDatePropertyNames(record, dateIso) {
+    const iso = this.normalizeDateToIso(dateIso);
+    if (!record || !iso) return [];
+
+    const preferred = [];
+    const other = [];
+    let props = [];
+    try {
+      props = record.getAllProperties?.() || [];
+    } catch (e) {
+      props = [];
+    }
+
+    for (const prop of props) {
+      const name = (prop?.name || '').trim();
+      if (!name) continue;
+      let dateVal = null;
+      try {
+        if (typeof prop.date === 'function') dateVal = prop.date();
+      } catch (e) {
+        dateVal = null;
+      }
+      if (!(dateVal instanceof Date) || Number.isNaN(dateVal.getTime())) continue;
+      if (this.normalizeDateToIso(dateVal) !== iso) continue;
+      if (/^(when|date)$/i.test(name)) preferred.push(name);
+      else other.push(name);
+    }
+
+    return preferred.length ? preferred : other;
+  }
+
+  isJournalLikeRecord(record) {
+    if (!record) return false;
+    try {
+      if (typeof record.getJournalDetails === 'function') {
+        const details = record.getJournalDetails();
+        if (details?.date) return true;
+      }
+    } catch (e) {
+      // ignore
+    }
+    return /(?:^|-)S-.*-\d{8}$/.test((record.guid || '').trim())
+      || /-\d{8}$/.test((record.guid || '').trim());
+  }
+
+  /**
+   * `@date` search finds records whose date properties match a journal day. Host
+   * `getBackReferences()` does not — those hits are property refs, not line links.
+   */
+  async loadDatePropertyBacklinkGroups(targetRecord, targetGuid, { showSelf, maxResults } = {}) {
+    const dateIso = this.getRecordDateReferenceIso(targetRecord);
+    if (!dateIso) return [];
+
+    const limit = Math.max(50, Number(maxResults) || 200);
+    let result = null;
+    try {
+      result = await this.data.searchByQuery(`@date = "${dateIso}"`, limit);
+    } catch (e) {
+      return [];
+    }
+    if (result?.error) return [];
+
+    const records = Array.isArray(result?.records) ? result.records : [];
+    if (!records.length) return [];
+
+    const byProp = new Map();
+    for (const src of records) {
+      const srcGuid = src?.guid || '';
+      if (!srcGuid) continue;
+      if (!showSelf && srcGuid === targetGuid) continue;
+      if (this.isJournalLikeRecord(src)) continue;
+
+      const propNames = this.getMatchingDatePropertyNames(src, dateIso);
+      const names = propNames.length ? propNames : ['When'];
+      for (const propName of names) {
+        let group = byProp.get(propName) || null;
+        if (!group) {
+          group = new Map();
+          byProp.set(propName, group);
+        }
+        group.set(srcGuid, src);
+      }
+    }
+
+    return Array.from(byProp.entries()).map(([propertyName, recordMap]) => ({
+      propertyName,
+      records: Array.from(recordMap.values())
+    }));
   }
 
   getLinkedReferenceSearchSpecs(recordGuid, targetRecord) {
@@ -7304,33 +8095,82 @@ class Plugin extends AppPlugin {
 
     try {
       const { maxResults, showSelf } = this.getRefreshConfig();
-
       const recordName = (record?.getName?.() || '').trim();
-      const searchSettled = await this.runLinkedReferenceSearch(recordGuid, maxResults, { targetRecord: record });
+
+      let linkedError = '';
+      let linkedGroups = [];
+      let hostBundle = null;
+
+      if (this.hostBackReferencesAvailable(record)) {
+        hostBundle = await this.loadHostIndexedReferenceBundle(record, recordGuid, {
+          showSelf,
+          maxResults
+        });
+      }
 
       if (!this.isRefreshStateCurrent(panelId, state, seq)) return;
 
-      const { linkedError, linkedGroups } = this.resolveLinkedReferenceSearch(
-        searchSettled,
-        recordGuid,
-        { showSelf }
-      );
+      if (hostBundle) {
+        linkedGroups = Array.isArray(hostBundle.linkedGroups) ? hostBundle.linkedGroups : [];
+        linkedError = hostBundle.linkedError || '';
 
-      const followupResults = await this.loadFollowupReferenceResults(state, record, {
-        recordGuid,
-        recordName,
-        maxResults,
-        showSelf,
-        linkedGroups
-      });
+        const shouldLoadUnlinked = Boolean(recordName) && !this.isSectionCollapsed(state, 'unlinked');
+        let unlinkedError = '';
+        let unlinkedGroups = [];
+        const unlinkedDeferred = Boolean(recordName) && !shouldLoadUnlinked;
+        if (shouldLoadUnlinked) {
+          const unlinked = await this.loadUnlinkedReferenceGroups(recordName, maxResults, {
+            recordGuid,
+            linkedGroups,
+            showSelf
+          });
+          if (!this.isRefreshStateCurrent(panelId, state, seq)) return;
+          unlinkedError = unlinked.unlinkedError || '';
+          unlinkedGroups = Array.isArray(unlinked.unlinkedGroups) ? unlinked.unlinkedGroups : [];
+        }
 
-      if (!this.isRefreshStateCurrent(panelId, state, seq)) return;
+        this.applyRefreshedResults(state, {
+          propertyError: hostBundle.propertyError || '',
+          propertyGroups: Array.isArray(hostBundle.propertyGroups) ? hostBundle.propertyGroups : [],
+          propertyIndexStatus: hostBundle.propertyIndexStatus || 'ready',
+          propertyIndexStats: hostBundle.propertyIndexStats || null,
+          propertyIndexError: hostBundle.propertyIndexError || '',
+          linkedGroups,
+          linkedError,
+          unlinkedGroups,
+          unlinkedError,
+          unlinkedDeferred,
+          unlinkedLoading: false
+        }, { reason: reason || 'refresh-host-index' });
+      } else {
+        const searchSettled = await this.runLinkedReferenceSearch(recordGuid, maxResults, {
+          targetRecord: record
+        });
 
-      this.applyRefreshedResults(state, {
-        ...followupResults,
-        linkedGroups,
-        linkedError
-      }, { reason: reason || 'refresh' });
+        if (!this.isRefreshStateCurrent(panelId, state, seq)) return;
+
+        ({ linkedError, linkedGroups } = this.resolveLinkedReferenceSearch(
+          searchSettled,
+          recordGuid,
+          { showSelf }
+        ));
+
+        const followupResults = await this.loadFollowupReferenceResults(state, record, {
+          recordGuid,
+          recordName,
+          maxResults,
+          showSelf,
+          linkedGroups
+        });
+
+        if (!this.isRefreshStateCurrent(panelId, state, seq)) return;
+
+        this.applyRefreshedResults(state, {
+          ...followupResults,
+          linkedGroups,
+          linkedError
+        }, { reason: reason || 'refresh' });
+      }
     } finally {
       if (showLoading && this.isRefreshStateCurrent(panelId, state, seq)) {
         this.setLoadingState(state, false);
@@ -8666,6 +9506,8 @@ class Plugin extends AppPlugin {
       primary = this.compareText(this.getRecordNameForSort(a), this.getRecordNameForSort(b));
     } else if (sortBy === 'page_created_date') {
       primary = this.compareNumbers(this.getRecordCreatedTimestamp(a), this.getRecordCreatedTimestamp(b));
+    } else if (sortBy === 'journal_page') {
+      primary = this.compareNumbers(this.getRecordJournalPageTimestamp(a), this.getRecordJournalPageTimestamp(b));
     } else if (sortBy === 'reference_count') {
       const ac = sortMetrics?.referenceCountByGuid?.get?.(aGuid) || 0;
       const bc = sortMetrics?.referenceCountByGuid?.get?.(bGuid) || 0;
@@ -8699,6 +9541,144 @@ class Plugin extends AppPlugin {
   getRecordCreatedTimestamp(record) {
     const d = record?.getCreatedAt?.() || null;
     return d instanceof Date ? d.getTime() : 0;
+  }
+
+  /**
+   * Chronological key: journal page date, else a `When`-style date property, else a
+   * date-like record title. Records with no resolvable date collapse to 0 and keep the
+   * name tie-break, so they cluster at one end instead of interleaving.
+   */
+  getRecordJournalPageTimestamp(record) {
+    if (!record) return 0;
+
+    try {
+      const details = typeof record.getJournalDetails === 'function' ? record.getJournalDetails() : null;
+      const raw = details?.date || null;
+      const journalTs = this.timestampFromDateTimeValue(raw);
+      if (journalTs > 0) return journalTs;
+    } catch (e) {
+      // Fall through to property / title lookups.
+    }
+
+    const propertyTs = this.getRecordWhenPropertyTimestamp(record);
+    if (propertyTs > 0) return propertyTs;
+
+    const titleIso = this.parseDateIsoFromRecordTitle(record.getName?.() || '')
+      || this.parseLeadingDateIsoFromRecordTitle(record.getName?.() || '');
+    return this.timestampFromIsoParts(titleIso, this.parseLeadingTimeFromRecordTitle(record.getName?.() || ''));
+  }
+
+  /** First `When`-style date property on the record, in milliseconds (0 when absent). */
+  getRecordWhenPropertyTimestamp(record) {
+    const wanted = ['when', 'date'];
+    const candidates = [];
+
+    try {
+      for (const prop of record.getAllProperties?.() || []) {
+        const name = (prop?.name || '').trim().toLowerCase();
+        if (wanted.includes(name)) candidates.push(prop);
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    if (candidates.length === 0 && typeof record.prop === 'function') {
+      for (const name of ['When', 'when', 'Date', 'date']) {
+        try {
+          const prop = record.prop(name);
+          if (prop) candidates.push(prop);
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+
+    for (const prop of candidates) {
+      const raws = [];
+      try { if (typeof prop.date === 'function') raws.push(prop.date()); } catch (e) { /* ignore */ }
+      try { if (typeof prop.get === 'function') raws.push(prop.get()); } catch (e) { /* ignore */ }
+      try { if (prop && 'value' in prop) raws.push(prop.value); } catch (e) { /* ignore */ }
+      try { if (typeof prop.text === 'function') raws.push(prop.text()); } catch (e) { /* ignore */ }
+
+      for (const raw of raws) {
+        const ts = this.timestampFromDateTimeValue(raw);
+        if (ts > 0) return ts;
+      }
+    }
+
+    return 0;
+  }
+
+  /** Milliseconds for a Date, a `["datetime", {d, t}]` pair, a `{d, t}` object, or a date string. */
+  timestampFromDateTimeValue(value) {
+    if (!value) return 0;
+
+    if (value instanceof Date) {
+      return Number.isFinite(value.getTime()) ? value.getTime() : 0;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const ts = this.timestampFromDateTimeValue(item);
+        if (ts > 0) return ts;
+      }
+      return 0;
+    }
+
+    if (typeof value === 'object') {
+      const parts = this.extractDateTimeDisplayParts(value);
+      return parts?.date ? this.timestampFromIsoParts(parts.date, parts.time) : 0;
+    }
+
+    if (typeof value === 'string') {
+      return this.timestampFromIsoParts(this.normalizeDateToIso(value), '');
+    }
+
+    return 0;
+  }
+
+  timestampFromIsoParts(isoDate, isoTime) {
+    const date = /^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof isoDate === 'string' ? isoDate.trim() : '');
+    if (!date) return 0;
+
+    const time = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(typeof isoTime === 'string' ? isoTime.trim() : '');
+    const parsed = new Date(
+      Number(date[1]),
+      Number(date[2]) - 1,
+      Number(date[3]),
+      Number(time?.[1] || 0),
+      Number(time?.[2] || 0),
+      Number(time?.[3] || 0)
+    );
+    const ms = parsed.getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+
+  /** Sort-only: leading `2024.12.06` / `2024-12-06` / `2024/12/06` in a title. */
+  parseLeadingDateIsoFromRecordTitle(recordName) {
+    const match = /^\s*(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})/.exec(typeof recordName === 'string' ? recordName : '');
+    if (!match) return '';
+
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return '';
+
+    return `${this.padDateTimeNumber(year, 4)}-${this.padDateTimeNumber(month, 2)}-${this.padDateTimeNumber(day, 2)}`;
+  }
+
+  /** Sort-only: `08:04` following a leading date, so same-day records stay in order. */
+  parseLeadingTimeFromRecordTitle(recordName) {
+    const match = /^\s*\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\.?\s+(\d{1,2}):(\d{2})/.exec(
+      typeof recordName === 'string' ? recordName : ''
+    );
+    if (!match) return '';
+
+    const hours = Number(match[1]);
+    const minutes = Number(match[2]);
+    if (hours > 23 || minutes > 59) return '';
+
+    return `${this.padDateTimeNumber(hours, 2)}:${this.padDateTimeNumber(minutes, 2)}`;
   }
 
   getLineActivityTimestamp(line) {
@@ -8852,56 +9832,24 @@ class Plugin extends AppPlugin {
     filteredVisibleRefCount,
     totalVisibleRefCount
   }) {
-    const parts = [];
-
+    // Built-in style: "N backlinks in M pages" (single pill label).
     if (searchMode === 'query') {
-      if (incompleteQueryDraft) {
-        parts.push('Continue typing...');
-      } else if (queryFilterState?.error) {
-        parts.push('Invalid query');
-      } else if (queryFilterState?.loading === true && canApplyScopedQuery !== true) {
-        parts.push('Applying...');
-      }
-
-      if (canApplyScopedQuery) {
-        const pageLabel = this.formatCountLabel(filteredUniquePagesSize, 'page', {
-          totalCount: totalUniquePagesSize,
-          scoped: true
-        });
-        const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
-          totalCount: totalVisibleRefCount,
-          scoped: true
-        });
-        if (pageLabel) parts.push(pageLabel);
-        if (refLabel) parts.push(refLabel);
-      } else {
-        const pageLabel = this.formatCountLabel(totalUniquePagesSize, 'page');
-        const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
-        if (pageLabel) parts.push(pageLabel);
-        if (refLabel) parts.push(refLabel);
-      }
-      return parts;
+      if (incompleteQueryDraft) return ['Continue typing…'];
+      if (queryFilterState?.error) return ['Invalid query'];
+      if (queryFilterState?.loading === true && canApplyScopedQuery !== true) return ['Applying…'];
     }
 
-    if (hasScopedView) {
-      const pageLabel = this.formatCountLabel(filteredUniquePagesSize, 'page', {
-        totalCount: totalUniquePagesSize,
-        scoped: true
-      });
-      const refLabel = this.formatCountLabel(filteredVisibleRefCount, 'ref', {
-        totalCount: totalVisibleRefCount,
-        scoped: true
-      });
-      if (pageLabel) parts.push(pageLabel);
-      if (refLabel) parts.push(refLabel);
-      return parts;
-    }
+    const pages = (searchMode === 'query' && canApplyScopedQuery) || hasScopedView
+      ? filteredUniquePagesSize
+      : totalUniquePagesSize;
+    const refs = (searchMode === 'query' && canApplyScopedQuery) || hasScopedView
+      ? filteredVisibleRefCount
+      : totalVisibleRefCount;
 
-    const pageLabel = this.formatCountLabel(totalUniquePagesSize, 'page');
-    const refLabel = this.formatCountLabel(totalVisibleRefCount, 'ref');
-    if (pageLabel) parts.push(pageLabel);
-    if (refLabel) parts.push(refLabel);
-    return parts;
+    if (Number(refs) <= 0 && Number(pages) <= 0) return ['No backlinks'];
+    const refNoun = Number(refs) === 1 ? 'backlink' : 'backlinks';
+    const pageNoun = Number(pages) === 1 ? 'page' : 'pages';
+    return [`${refs} ${refNoun} in ${pages} ${pageNoun}`];
   }
 
   buildReferenceSectionMeta(visibleCount, totalCount, showScopedCounts) {
@@ -9047,7 +9995,7 @@ class Plugin extends AppPlugin {
         totalUniquePagesSize: totalUniquePages.size,
         filteredVisibleRefCount,
         totalVisibleRefCount
-      }).join(' | ')
+      })[0] || ''
     };
   }
 
@@ -9100,8 +10048,16 @@ class Plugin extends AppPlugin {
       viewState.highlightQuery || '',
       viewState.filteredPropRefCount,
       viewState.totalPropRefCount,
+      viewState.filteredLinkedRefCount,
+      viewState.totalLinkedRefCount,
+      viewState.linkedError || '',
+      this.normalizeGroupBy(state?.groupBy) || this._defaultGroupBy,
+      this.normalizeSortBy(state?.sortBy) || this._defaultSortBy,
+      this.normalizeSortDir(state?.sortDir) || this._defaultSortDir,
       this.buildPropertyGroupsSignature(viewState.props),
-      state?.liveRenderVersion || 0
+      this.buildLineGroupsSignature(viewState.linked),
+      state?.liveRenderVersion || 0,
+      state?.linkedContextRenderVersion || 0
     ].join('|');
   }
 
@@ -9177,105 +10133,108 @@ class Plugin extends AppPlugin {
   }
 
   renderPropertyReferenceSection(body, state, viewState) {
-    const section = this.appendCollapsibleSection(body, state, {
-      sectionId: 'property',
-      title: 'Property References',
-      collapsed: viewState.propertySectionCollapsed,
-      meta: viewState.propertyIndexStatus !== 'ready'
-        ? this.buildUnknownReferenceSectionMeta()
-        : this.buildReferenceSectionMeta(
-            viewState.showScopedCounts ? viewState.filteredPropRefCount : viewState.totalPropRefCount,
-            viewState.totalPropRefCount,
-            viewState.showScopedCounts
-          )
-    });
-
+    // Unified list: property + linked pages together (no equal-weight section titles).
     if (viewState.propertyError) {
-      this.appendError(section.bodyEl, viewState.propertyError);
+      this.appendError(body, viewState.propertyError);
     } else if (viewState.propertyIndexStatus === 'indexing' || viewState.propertyIndexStatus === 'idle') {
-      this.appendNote(section.bodyEl, viewState.propertyIndexMessage);
+      this.appendNote(body, viewState.propertyIndexMessage);
     } else if (viewState.propertyIndexStatus === 'error') {
-      this.appendPropertyIndexError(section.bodyEl, viewState.propertyIndexError);
-    } else if (viewState.props.length === 0) {
-      this.appendEmpty(
-        section.bodyEl,
-        viewState.hasScopedView ? 'No matching property references.' : 'No property references.'
-      );
-    } else {
-      this.appendPropertyReferenceGroups(section.bodyEl, viewState.props, {
-        query: viewState.highlightQuery,
-        state
-      });
+      this.appendPropertyIndexError(body, viewState.propertyIndexError);
     }
-  }
-
-  renderLinkedReferenceSection(body, state, viewState) {
-    const section = this.appendCollapsibleSection(body, state, {
-      sectionId: 'linked',
-      title: 'Linked References',
-      collapsed: viewState.linkedSectionCollapsed,
-      meta: this.buildReferenceSectionMeta(
-        viewState.showScopedCounts ? viewState.filteredLinkedRefCount : viewState.totalLinkedRefCount,
-        viewState.totalLinkedRefCount,
-        viewState.showScopedCounts
-      )
-    });
 
     if (viewState.linkedError) {
-      this.appendError(section.bodyEl, viewState.linkedError);
-    } else {
-      this.appendLinkedReferenceGroups(section.bodyEl, viewState.linked, {
-        groupSectionId: 'linked',
-        state,
-        maxResults: viewState.maxResults,
-        query: viewState.highlightQuery,
-        totalLineCount: viewState.totalLinkedRefCount,
-        emptyMessage: viewState.hasScopedView ? 'No matching linked references.' : 'No linked references.'
-      });
-    }
-  }
-
-  renderUnlinkedReferenceSection(body, state, viewState) {
-    const section = this.appendCollapsibleSection(body, state, {
-      sectionId: 'unlinked',
-      title: 'Unlinked References',
-      collapsed: viewState.unlinkedSectionCollapsed,
-      meta: (viewState.unlinkedDeferred === true || viewState.unlinkedLoading === true)
-        ? this.buildUnknownReferenceSectionMeta()
-        : this.buildReferenceSectionMeta(
-          viewState.showScopedCounts && viewState.showUnlinkedCounts
-            ? viewState.filteredUnlinkedRefCount
-            : viewState.totalUnlinkedRefCount,
-          viewState.totalUnlinkedRefCount,
-          viewState.showScopedCounts && viewState.showUnlinkedCounts
-        )
-    });
-
-    if (viewState.unlinkedLoading) {
-      this.appendNote(section.bodyEl, 'Loading unlinked references...');
-      return;
+      this.appendError(body, viewState.linkedError);
     }
 
-    if (viewState.unlinkedError) {
-      this.appendError(section.bodyEl, viewState.unlinkedError);
-      return;
-    }
+    const propsReady = !viewState.propertyError
+      && viewState.propertyIndexStatus !== 'indexing'
+      && viewState.propertyIndexStatus !== 'idle'
+      && viewState.propertyIndexStatus !== 'error';
 
-    if (viewState.unlinkedDeferred) {
-      if (!viewState.unlinkedSectionCollapsed) {
-        this.appendNote(section.bodyEl, 'Loading unlinked references...');
+    const props = propsReady ? (viewState.props || []) : [];
+    const linked = viewState.linkedError ? [] : (viewState.linked || []);
+
+    if (props.length === 0 && linked.length === 0) {
+      if (propsReady || viewState.linkedError) {
+        // Avoid duplicate empties while the property index is still warming.
+        if (propsReady && !viewState.linkedError) {
+          this.appendEmpty(
+            body,
+            viewState.hasScopedView ? 'No matching backlinks.' : 'No backlinks.'
+          );
+        }
       }
       return;
     }
 
-    this.appendLinkedReferenceGroups(section.bodyEl, viewState.unlinked, {
+    this.appendUnifiedBacklinkPages(body, props, linked, {
+      query: viewState.highlightQuery,
+      state,
+      maxResults: viewState.maxResults,
+      totalLineCount: viewState.totalLinkedRefCount
+    });
+  }
+
+  renderLinkedReferenceSection(body, state, viewState) {
+    // Linked refs render inside the unified list above.
+    return;
+  }
+
+  renderUnlinkedReferenceSection(body, state, viewState) {
+    const collapsed = viewState.unlinkedSectionCollapsed === true;
+
+    const pill = document.createElement('button');
+    pill.type = 'button';
+    pill.className = 'tlr-unlinked-pill button-none button-minimal-hover';
+    pill.dataset.action = 'toggle-section';
+    pill.dataset.sectionId = 'unlinked';
+    pill.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+
+    const caret = this.buildChevronIcon(collapsed, 'tlr-unlinked-pill-caret');
+    const label = document.createElement('span');
+    label.className = 'tlr-unlinked-pill-label';
+    if (viewState.unlinkedLoading || (viewState.unlinkedDeferred && !collapsed)) {
+      label.textContent = 'Loading unlinked mentions…';
+    } else if (collapsed) {
+      label.textContent = 'Find unlinked mentions';
+    } else {
+      const n = viewState.showScopedCounts && viewState.showUnlinkedCounts
+        ? viewState.filteredUnlinkedRefCount
+        : viewState.totalUnlinkedRefCount;
+      label.textContent = Number(n) > 0
+        ? `Unlinked mentions · ${n}`
+        : 'Unlinked mentions';
+    }
+    pill.appendChild(caret);
+    pill.appendChild(label);
+    body.appendChild(pill);
+
+    if (collapsed) return;
+
+    const results = document.createElement('div');
+    results.className = 'tlr-unlinked-results';
+
+    if (viewState.unlinkedLoading || viewState.unlinkedDeferred) {
+      this.appendNote(results, 'Loading unlinked references...');
+      body.appendChild(results);
+      return;
+    }
+
+    if (viewState.unlinkedError) {
+      this.appendError(results, viewState.unlinkedError);
+      body.appendChild(results);
+      return;
+    }
+
+    this.appendLinkedReferenceGroups(results, viewState.unlinked, {
       groupSectionId: 'unlinked',
       state,
       maxResults: viewState.maxResults,
       query: viewState.highlightQuery,
       totalLineCount: viewState.totalUnlinkedRefCount,
-      emptyMessage: viewState.hasScopedView ? 'No matching unlinked references.' : 'No unlinked references.'
+      emptyMessage: viewState.hasScopedView ? 'No matching unlinked mentions.' : 'No unlinked mentions.'
     });
+    body.appendChild(results);
   }
 
   appendReferenceDivider(container) {
@@ -9337,6 +10296,9 @@ class Plugin extends AppPlugin {
       state.unlinkedSlotEl.innerHTML = '';
       this.renderUnlinkedReferenceSection(state.unlinkedSlotEl, state, viewState);
     }
+
+    this.syncTimeMachineControl(state);
+    this.renderTimeMachineSection(state);
 
     state.renderSectionKeys = plan.nextKeys;
   }
@@ -9521,6 +10483,64 @@ class Plugin extends AppPlugin {
     syncExpandCaret(true);
   }
 
+  /**
+   * Transclusion/ref rows carry their target's guid somewhere in props or segments.
+   * `getLineItems()` already ships the target's line items, so once we know the guid
+   * we can render the transcluded subtree instead of an empty row.
+   */
+  resolveTransclusionTargetGuid(item, byGuid, childrenOf) {
+    const candidates = [];
+    const pushGuidish = (value) => {
+      const text = typeof value === 'string' ? value.trim() : '';
+      if (text.length >= 10 && /^[0-9A-Z][0-9A-Z_-]{9,}$/i.test(text)) candidates.push(text);
+    };
+    const scan = (value, depth = 0) => {
+      if (depth > 3 || value == null) return;
+      if (typeof value === 'string') return pushGuidish(value);
+      if (Array.isArray(value)) {
+        for (const entry of value) scan(entry, depth + 1);
+        return;
+      }
+      if (typeof value === 'object') {
+        for (const entry of Object.values(value)) scan(entry, depth + 1);
+      }
+    };
+
+    scan(item?.props);
+    for (const seg of item?.segments || []) scan(seg);
+
+    for (const guid of candidates) {
+      if (guid === item?.guid) continue;
+      if (byGuid.has(guid) || childrenOf.has(guid)) return guid;
+    }
+    return '';
+  }
+
+  buildPreviewMarker(item, ordinal) {
+    const type = item?.type || '';
+    const marker = document.createElement('span');
+    marker.className = `tlr-preview-marker tlr-preview-marker-${type || 'text'}`;
+
+    if (type === 'task') {
+      let done = null;
+      try { done = item.isTaskCompleted?.(); } catch (e) { done = null; }
+      marker.classList.add('tlr-preview-marker-checkbox');
+      if (done === true) marker.classList.add('is-done');
+      marker.textContent = done === true ? '✓' : '';
+      return marker;
+    }
+    if (type === 'ulist') {
+      marker.textContent = '•';
+      return marker;
+    }
+    if (type === 'olist') {
+      marker.textContent = `${ordinal}.`;
+      marker.classList.add('tlr-preview-marker-ordinal');
+      return marker;
+    }
+    return null;
+  }
+
   renderRecordPreview(previewEl, allItems, recordGuid, collapsedNodes) {
     if (!previewEl) return;
     previewEl.innerHTML = '';
@@ -9534,25 +10554,60 @@ class Plugin extends AppPlugin {
     }
 
     const childrenOf = new Map();
+    const byGuid = new Map();
     for (const item of allItems) {
+      const guid = item?.guid || '';
+      if (guid) byGuid.set(guid, item);
       const p = item.parent_guid || recordGuid;
       if (!childrenOf.has(p)) childrenOf.set(p, []);
-      childrenOf.get(p).push(item);
+      const siblings = childrenOf.get(p);
+      // expandReferences can ship the same guid twice under one parent.
+      if (guid && siblings.some((s) => s?.guid === guid)) continue;
+      siblings.push(item);
     }
 
-    const renderNode = (item, depth) => {
+    const renderChildren = (parentGuid, visiting) => {
+      const children = childrenOf.get(parentGuid) || [];
+      if (!children.length) return null;
+      const wrap = document.createElement('div');
+      wrap.className = 'tlr-preview-children';
+      let ordinal = 0;
+      for (const child of children) {
+        ordinal = child?.type === 'olist' ? ordinal + 1 : 0;
+        wrap.appendChild(renderNode(child, ordinal, visiting));
+      }
+      return wrap;
+    };
+
+    const renderNode = (item, ordinal, visiting) => {
       const guid = item.guid || '';
-      const children = childrenOf.get(guid) || [];
-      const hasChildren = children.length > 0;
+      const type = item?.type || 'text';
       const isCollapsed = collapsedNodes.has(guid);
+      // Native editor: `ref` = link pill (no body); `transclusion` = embed with children.
+      const isLinkRef = type === 'ref';
+      const isTransclusion = type === 'transclusion';
 
       const nodeEl = document.createElement('div');
       nodeEl.className = 'tlr-preview-node';
       nodeEl.dataset.nodeGuid = guid;
-      nodeEl.style.setProperty('--tlr-depth', depth);
+      if (type) nodeEl.dataset.lineType = type;
 
       const rowEl = document.createElement('div');
-      rowEl.className = 'tlr-preview-row';
+      rowEl.className = `tlr-preview-row tlr-preview-row-${type}`;
+
+      let targetGuid = '';
+      if ((isTransclusion || isLinkRef) && !visiting.has(guid)) {
+        targetGuid = this.resolveTransclusionTargetGuid(item, byGuid, childrenOf);
+      }
+
+      const ownChildren = isLinkRef ? [] : (childrenOf.get(guid) || []);
+      const targetChildren = (!isLinkRef && targetGuid) ? (childrenOf.get(targetGuid) || []) : [];
+      // Prefer the clean target tree when present — ownChildren can be a flattened
+      // expandReferences copy that duplicates the same nodes at multiple depths.
+      const embeddedParentGuid = targetChildren.length > 0
+        ? targetGuid
+        : (ownChildren.length > 0 ? guid : '');
+      const hasChildren = !!embeddedParentGuid;
 
       const toggleEl = document.createElement('button');
       toggleEl.type = 'button';
@@ -9568,127 +10623,581 @@ class Plugin extends AppPlugin {
       }
       rowEl.appendChild(toggleEl);
 
+      if (!isLinkRef) {
+        const marker = this.buildPreviewMarker(item, ordinal);
+        if (marker) rowEl.appendChild(marker);
+      }
+
       const lineBtn = document.createElement('button');
       lineBtn.type = 'button';
       lineBtn.className = 'tlr-expand-line button-none';
+      if (isLinkRef) lineBtn.classList.add('tlr-preview-link-pill');
+      if (isTransclusion) lineBtn.classList.add('tlr-preview-transclusion-title');
       lineBtn.dataset.action = 'open-line';
       lineBtn.dataset.recordGuid = recordGuid;
       lineBtn.dataset.lineGuid = guid;
-      this.appendLineText(lineBtn, item, '');
+      this.appendLineText(lineBtn, item, '', { skipPrefix: true });
+
+      if ((isTransclusion || isLinkRef) && !this.lineHasVisibleContent(item)) {
+        const targetItem = targetGuid ? byGuid.get(targetGuid) : null;
+        if (targetItem) {
+          this.appendLineText(lineBtn, targetItem, '', { skipPrefix: true });
+        } else if (targetGuid) {
+          const name = this.resolveRecordName?.(targetGuid) || '';
+          const placeholder = document.createElement('span');
+          placeholder.className = 'tlr-preview-embed-note';
+          placeholder.textContent = name || (isLinkRef ? 'Linked note' : 'Embedded content');
+          lineBtn.appendChild(placeholder);
+        } else {
+          const placeholder = document.createElement('span');
+          placeholder.className = 'tlr-preview-embed-note';
+          placeholder.textContent = isLinkRef ? 'Linked note' : 'Embedded content';
+          lineBtn.appendChild(placeholder);
+        }
+      }
+      if (isTransclusion || isLinkRef) {
+        const glyph = document.createElement('span');
+        glyph.className = 'tlr-preview-reference-glyph';
+        glyph.textContent = '↗';
+        glyph.setAttribute('aria-hidden', 'true');
+        lineBtn.appendChild(glyph);
+      }
       rowEl.appendChild(lineBtn);
 
       nodeEl.appendChild(rowEl);
 
-      if (hasChildren) {
-        const childrenEl = document.createElement('div');
-        childrenEl.className = 'tlr-preview-children' + (isCollapsed ? ' is-hidden' : '');
-        for (const child of children) {
-          childrenEl.appendChild(renderNode(child, depth + 1));
+      if (hasChildren && embeddedParentGuid && !visiting.has(embeddedParentGuid)) {
+        const nextVisiting = new Set(visiting);
+        nextVisiting.add(guid);
+        if (targetGuid) nextVisiting.add(targetGuid);
+
+        const childrenEl = renderChildren(embeddedParentGuid, nextVisiting);
+        const holder = document.createElement('div');
+        holder.className = 'tlr-preview-children-holder' + (isCollapsed ? ' is-hidden' : '');
+        if (childrenEl) {
+          if (isTransclusion) childrenEl.classList.add('tlr-preview-transcluded');
+          holder.appendChild(childrenEl);
         }
-        nodeEl.appendChild(childrenEl);
+        nodeEl.appendChild(holder);
       }
 
       return nodeEl;
     };
 
     const roots = childrenOf.get(recordGuid) || [];
+    let ordinal = 0;
     for (const root of roots) {
-      previewEl.appendChild(renderNode(root, 0));
+      ordinal = root?.type === 'olist' ? ordinal + 1 : 0;
+      previewEl.appendChild(renderNode(root, ordinal, new Set()));
     }
   }
 
-  appendPropertyReferenceGroups(container, groups, opts) {
+  /** Collection display name from the built-in Collection property when present. */
+  getRecordCollectionLabel(record) {
+    if (!record || typeof record.prop !== 'function') return '';
+    try {
+      const prop = record.prop('Collection') || record.prop('collection');
+      if (!prop) return '';
+      if (typeof prop.choiceLabel === 'function') {
+        const label = (prop.choiceLabel() || '').trim();
+        if (label) return label;
+      }
+      if (typeof prop.text === 'function') {
+        const text = (prop.text() || '').trim();
+        if (text) return text;
+      }
+    } catch (e) {
+      // ignore
+    }
+    return '';
+  }
+
+  appendRecordIcon(container, record) {
+    if (!container || !record) return;
+    let iconName = '';
+    try { iconName = record.getIcon?.(true) || record.getIcon?.() || ''; } catch (e) { iconName = ''; }
+    if (!iconName) return;
+    try {
+      const iconEl = this.ui.createIcon(iconName);
+      iconEl.classList.add('tlr-record-icon');
+      container.appendChild(iconEl);
+    } catch (e) {
+      const span = document.createElement('span');
+      span.className = `ti ${iconName} tlr-record-icon`;
+      span.setAttribute('aria-hidden', 'true');
+      container.appendChild(span);
+    }
+  }
+
+  appendTitleMeta(container, metaText) {
+    const text = (metaText || '').trim();
+    if (!container || !text) return;
+    const sep = document.createElement('span');
+    sep.className = 'tlr-title-sep';
+    sep.textContent = '·';
+    const meta = document.createElement('span');
+    meta.className = 'tlr-title-meta';
+    meta.textContent = text;
+    container.appendChild(sep);
+    container.appendChild(meta);
+  }
+
+  /**
+   * Format a property chip like the built-in backlinks: "When → Fri Jul 31".
+   */
+  /** True when every backlink arrived through the same property. */
+  hasUniformProperty(pages) {
+    const seen = new Set();
+    for (const page of pages || []) {
+      for (const propName of page?.properties || []) {
+        seen.add(propName);
+        if (seen.size > 1) return false;
+      }
+    }
+    return seen.size === 1;
+  }
+
+  /**
+   * Display value for a property. Link-type values are omitted by default: on a
+   * page's own backlink list they are mostly the page itself plus co-participants,
+   * which makes every row a different length for no added meaning.
+   */
+  getPropertyDisplayValue(record, propertyName, opts) {
+    if (!record || typeof record.prop !== 'function') return '';
+    const name = (propertyName || '').trim();
+    if (!name) return '';
+    const includeLinks = opts?.includeLinks === true;
+    try {
+      const prop = record.prop(name);
+      if (!prop) return '';
+
+      try {
+        if (typeof prop.date === 'function') {
+          const d = prop.date();
+          if (d instanceof Date && !Number.isNaN(d.getTime())) {
+            return this.formatShortDateLabel(d);
+          }
+        }
+      } catch (e) { /* ignore */ }
+
+      // Link-type properties before text(): text() returns raw GUIDs.
+      try {
+        const linked = typeof prop.linkedRecords === 'function' ? (prop.linkedRecords() || []) : [];
+        if (linked.length) {
+          if (!includeLinks) return '';
+          const names = linked
+            .map((r) => (r?.getName?.() || '').trim())
+            .filter(Boolean);
+          if (names.length) return names.join(', ');
+        }
+      } catch (e) { /* ignore */ }
+
+      try {
+        if (typeof prop.choiceLabel === 'function') {
+          const label = this.resolveGuidishLabel(prop.choiceLabel(), includeLinks);
+          if (label) return label;
+        }
+      } catch (e) { /* ignore */ }
+
+      try {
+        if (typeof prop.text === 'function') {
+          const text = this.resolveGuidishLabel(prop.text(), includeLinks);
+          if (text) return text;
+        }
+      } catch (e) { /* ignore */ }
+
+      try {
+        const raw = typeof prop.get === 'function' ? prop.get() : prop.value;
+        if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+          return this.formatShortDateLabel(raw);
+        }
+        if (typeof raw === 'string') {
+          const resolved = this.resolveGuidishLabel(raw, includeLinks);
+          if (resolved) return resolved;
+        }
+        if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw);
+      } catch (e) { /* ignore */ }
+    } catch (e) {
+      // ignore
+    }
+    return '';
+  }
+
+  /** Turn a bare record GUID into its page name; blank when it stays unresolvable. */
+  resolveGuidishLabel(value, resolveLinks) {
+    const text = typeof value === 'string' ? value.trim() : '';
+    if (!text) return '';
+    if (!/^[0-9A-Z]{20,32}$/.test(text)) return text;
+    if (resolveLinks !== true) return '';
+    try {
+      const name = (this.data.getRecord?.(text)?.getName?.() || '').trim();
+      if (name) return name;
+    } catch (e) {
+      // ignore
+    }
+    return '';
+  }
+
+  formatShortDateLabel(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+    try {
+      return date.toLocaleDateString(undefined, {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric'
+      });
+    } catch (e) {
+      return date.toISOString().slice(0, 10);
+    }
+  }
+
+  collectUnifiedBacklinkPages(propertyGroups, linkedGroups) {
+    const byGuid = new Map();
+
+    for (const g of propertyGroups || []) {
+      const propName = (g?.propertyName || '').trim();
+      if (!propName) continue;
+      for (const r of g?.records || []) {
+        const guid = r?.guid || '';
+        if (!guid) continue;
+        let entry = byGuid.get(guid);
+        if (!entry) {
+          entry = { record: r, properties: [], lines: [] };
+          byGuid.set(guid, entry);
+        }
+        if (!entry.properties.includes(propName)) entry.properties.push(propName);
+      }
+    }
+
+    for (const g of linkedGroups || []) {
+      const record = g?.record || null;
+      const guid = record?.guid || '';
+      if (!guid) continue;
+      let entry = byGuid.get(guid);
+      if (!entry) {
+        entry = { record, properties: [], lines: [] };
+        byGuid.set(guid, entry);
+      } else if (!entry.record && record) {
+        entry.record = record;
+      }
+      const lines = Array.isArray(g?.lines) ? g.lines : [];
+      for (const line of lines) {
+        const lineGuid = line?.guid || '';
+        if (!lineGuid) continue;
+        if (!entry.lines.some((x) => x?.guid === lineGuid)) entry.lines.push(line);
+      }
+    }
+
+    return Array.from(byGuid.values()).filter((p) => p?.record?.guid);
+  }
+
+  /** Meta shown after the title as `· parts`; collection is already conveyed by title templates. */
+  getUnifiedPageMetaParts(page, groupBy, opts) {
+    const parts = [];
+    const record = page?.record || null;
+    const targetJournalIso = (opts?.targetJournalIso || '').trim();
+
+    if (groupBy !== 'property') {
+      const uniformProperty = opts?.uniformProperty === true;
+      for (const propName of page?.properties || []) {
+        const value = this.getPropertyDisplayValue(record, propName);
+        // On a journal page, date props that land on that same day are the reason
+        // the row is here — "When → Fri, Jul 31" just restates the page you're on.
+        if (value && targetJournalIso && this.propertyDateMatchesIso(record, propName, targetJournalIso)) {
+          parts.push(propName);
+        } else if (value) {
+          parts.push(`${propName} → ${value}`);
+        } else if (!uniformProperty) {
+          parts.push(propName);
+        }
+      }
+    }
+
+    return parts;
+  }
+
+  propertyDateMatchesIso(record, propertyName, dateIso) {
+    const iso = this.normalizeDateToIso(dateIso);
+    const name = (propertyName || '').trim();
+    if (!record || !iso || !name || typeof record.prop !== 'function') return false;
+    try {
+      const prop = record.prop(name);
+      if (!prop || typeof prop.date !== 'function') return false;
+      const d = prop.date();
+      if (!(d instanceof Date) || Number.isNaN(d.getTime())) return false;
+      return this.normalizeDateToIso(d) === iso;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  getUnifiedPageBucketKey(page, groupBy, sortBy) {
+    if (groupBy === 'collection') {
+      return this.getRecordCollectionLabel(page?.record) || 'No collection';
+    }
+    if (groupBy === 'property') {
+      // Caller expands multi-property pages into one bucket per property.
+      return (page?.bucketProperty || page?.properties?.[0] || 'Linked references').trim() || 'Linked references';
+    }
+    if (groupBy === 'time') {
+      // Borrow the date the list is already sorted by, so headings can't contradict the order.
+      const key = this.normalizeSortBy(sortBy) || this._defaultSortBy;
+      const ts = key === 'page_last_edited'
+        ? this.getRecordUpdatedTimestamp(page?.record)
+        : (this.getRecordJournalPageTimestamp(page?.record) || this.getRecordUpdatedTimestamp(page?.record));
+      if (!ts) return 'No date';
+      try {
+        return this.formatMonthLabel(new Date(ts)) || 'No date';
+      } catch (e) {
+        return 'No date';
+      }
+    }
+    return '';
+  }
+
+  formatMonthLabel(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+    try {
+      return date.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    } catch (e) {
+      return date.toISOString().slice(0, 7);
+    }
+  }
+
+  expandPagesForGrouping(pages, groupBy) {
+    if (groupBy !== 'property') return pages || [];
+    const out = [];
+    for (const page of pages || []) {
+      const props = page.properties || [];
+      const lines = page.lines || [];
+      if (props.length === 0) {
+        out.push({ ...page, bucketProperty: 'Linked references' });
+        continue;
+      }
+      for (const propName of props) {
+        out.push({ ...page, bucketProperty: propName, properties: [propName], lines: [] });
+      }
+      // Inline mentions belong to their own bucket, not repeated under each property.
+      if (lines.length) {
+        out.push({ ...page, bucketProperty: 'Linked references', properties: [], lines });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Keep the chosen sort order but pull every page of a bucket together, so a
+   * bucket heading is emitted once instead of repeating down the list.
+   */
+  clusterPagesByBucket(pages, groupBy, sortBy) {
+    if (groupBy === 'none') return pages || [];
+    const buckets = new Map();
+    for (const page of pages || []) {
+      const key = this.getUnifiedPageBucketKey(page, groupBy, sortBy) || '';
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(page);
+    }
+    const out = [];
+    for (const list of buckets.values()) out.push(...list);
+    return out;
+  }
+
+  appendUnifiedBucketHeader(container, label) {
+    const text = (label || '').trim();
+    if (!container || !text) return;
+    const head = document.createElement('div');
+    head.className = 'tlr-bucket-header text-details';
+    head.textContent = text;
+    container.appendChild(head);
+  }
+
+  /**
+   * Unified page-centric backlinks: collection icon + title · meta, property chips,
+   * and linked line snippets — optionally bucketed by collection / property / time.
+   */
+  appendUnifiedBacklinkPages(container, propertyGroups, linkedGroups, opts) {
     if (!container) return;
 
     const query = (opts?.query || '').trim();
     const state = opts?.state || null;
+    const maxResults = opts?.maxResults || 0;
+    const totalLineCount = typeof opts?.totalLineCount === 'number' ? opts.totalLineCount : null;
+    const groupBy = this.normalizeGroupBy(state?.groupBy) || this._defaultGroupBy;
+    const sortSpec = {
+      sortBy: this.normalizeSortBy(state?.sortBy) || this._defaultSortBy,
+      sortDir: this.normalizeSortDir(state?.sortDir) || this._defaultSortDir
+    };
 
-    for (const g of groups || []) {
-      const propName = (g?.propertyName || '').trim();
-      if (!propName) continue;
+    let targetName = '';
+    let targetJournalIso = '';
+    try {
+      const target = this.data.getRecord?.(state?.recordGuid || '') || null;
+      targetName = (target?.getName?.() || '').trim();
+      targetJournalIso = this.getRecordDateReferenceIso(target) || '';
+    } catch (e) {
+      targetName = '';
+      targetJournalIso = '';
+    }
 
-      const isCollapsed = this.isPropGroupCollapsed(propName);
+    let pages = this.collectUnifiedBacklinkPages(propertyGroups, linkedGroups);
+    pages.sort((a, b) => this.compareRecordsForSort(a.record, b.record, sortSpec));
+    pages = this.expandPagesForGrouping(pages, groupBy);
+    pages = this.clusterPagesByBucket(pages, groupBy, sortSpec.sortBy);
 
-      const groupEl = document.createElement('div');
-      groupEl.className = 'tlr-prop-group';
+    if (pages.length === 0) return;
 
-      if (isCollapsed) groupEl.classList.add('tlr-prop-collapsed');
+    const uniformProperty = this.hasUniformProperty(pages);
+    let lastBucket = null;
+    for (const page of pages) {
+      const record = page.record;
+      const guid = record?.guid || '';
+      if (!guid) continue;
 
-      const rowEl = document.createElement('div');
-      rowEl.className = 'tlr-prop-row';
-
-      const toggleBtn = document.createElement('button');
-      toggleBtn.type = 'button';
-      toggleBtn.className = 'tlr-btn tlr-prop-toggle button-none button-small button-minimal-hover';
-      toggleBtn.dataset.action = 'toggle-prop-group';
-      toggleBtn.dataset.propName = propName;
-      toggleBtn.title = isCollapsed ? 'Expand' : 'Collapse';
-      toggleBtn.setAttribute('aria-label', isCollapsed ? 'Expand' : 'Collapse');
-      toggleBtn.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
-      toggleBtn.appendChild(this.buildChevronIcon(isCollapsed, 'tlr-prop-caret'));
-
-      const header = document.createElement('button');
-      header.type = 'button';
-      header.className = 'tlr-prop-header button-normal button-normal-hover';
-      header.dataset.action = 'toggle-prop-group';
-      header.dataset.propName = propName;
-      header.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
-
-      const title = document.createElement('div');
-      title.className = 'tlr-prop-title';
-      title.textContent = `${propName} in...`;
-
-      const meta = document.createElement('div');
-      meta.className = 'tlr-prop-meta text-details';
-      meta.textContent = `${g?.records?.length || 0}`;
-
-      header.appendChild(title);
-      header.appendChild(meta);
-
-      rowEl.appendChild(toggleBtn);
-      rowEl.appendChild(header);
-
-      const recsEl = document.createElement('div');
-      recsEl.className = 'tlr-prop-records';
-
-      for (const r of g?.records || []) {
-        const guid = r?.guid || null;
-        if (!guid) continue;
-
-        const recWrap = document.createElement('div');
-        recWrap.className = 'tlr-prop-record-wrap tlr-group';
-        if (state?.recordExpandedState?.get?.(guid)?.expanded === true) {
-          recWrap.classList.add('tlr-record-expanded');
+      if (groupBy !== 'none') {
+        const bucket = this.getUnifiedPageBucketKey(page, groupBy, sortSpec.sortBy);
+        if (bucket && bucket !== lastBucket) {
+          this.appendUnifiedBucketHeader(container, bucket);
+          lastBucket = bucket;
         }
-
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'tlr-prop-record button-none button-minimal-hover';
-        btn.dataset.action = 'open-record';
-        btn.dataset.recordGuid = guid;
-        const name = r.getName?.() || 'Untitled';
-        btn.textContent = '';
-        this.appendHighlightedText(btn, name, query);
-        this.appendLiveBadges(btn, state, this.getPropertySnapshotKey(propName, guid));
-
-        const titleCluster = document.createElement('div');
-        titleCluster.className = 'tlr-row-title-cluster';
-        titleCluster.appendChild(btn);
-        titleCluster.appendChild(this.buildPanelNavActions(guid));
-
-        const btnRow = document.createElement('div');
-        btnRow.className = 'tlr-prop-record-row';
-        btnRow.appendChild(this.buildExpandRecordBtn(guid, state));
-        btnRow.appendChild(titleCluster);
-        recWrap.appendChild(btnRow);
-        recWrap.appendChild(this.buildRecordPreviewEl(guid, state));
-        recsEl.appendChild(recWrap);
       }
 
+      const groupEl = document.createElement('div');
+      groupEl.className = 'tlr-group tlr-group-unified';
+      if ((page.properties || []).length) groupEl.classList.add('tlr-group-property');
+      if ((page.lines || []).length) groupEl.classList.add('tlr-group-linked');
+      if ((page.lines || []).length === 1 && !(page.properties || []).length) {
+        groupEl.classList.add('tlr-group-single');
+      }
+      if (state?.recordExpandedState?.get?.(guid)?.expanded === true) {
+        groupEl.classList.add('tlr-record-expanded');
+      }
+
+      const rowEl = document.createElement('div');
+      rowEl.className = 'tlr-group-row tlr-prop-record-row';
+
+      // One chevron per row (preview) — matched lines always stay visible.
+      rowEl.appendChild(this.buildExpandRecordBtn(guid, state));
+
+      const titleBtn = document.createElement('button');
+      titleBtn.type = 'button';
+      titleBtn.className = 'tlr-group-header tlr-prop-record button-none button-minimal-hover';
+      titleBtn.dataset.action = 'open-record';
+      titleBtn.dataset.recordGuid = guid;
+
+      const titleInner = document.createElement('div');
+      titleInner.className = 'tlr-group-title';
+      // Always reserve the icon slot so titles line up whether or not one exists.
+      const iconSlot = document.createElement('span');
+      iconSlot.className = 'tlr-record-icon-slot';
+      this.appendRecordIcon(iconSlot, record);
+      titleInner.appendChild(iconSlot);
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'tlr-group-title-text';
+      this.appendHighlightedText(nameSpan, record.getName?.() || 'Untitled', query);
+      titleInner.appendChild(nameSpan);
+      titleBtn.appendChild(titleInner);
+
+      const metaParts = this.getUnifiedPageMetaParts(page, groupBy, {
+        uniformProperty,
+        targetName,
+        targetJournalIso
+      });
+      if (metaParts.length) {
+        const metaEl = document.createElement('div');
+        metaEl.className = 'tlr-row-meta';
+        for (const part of metaParts) this.appendTitleMeta(metaEl, part);
+        titleBtn.appendChild(metaEl);
+      }
+
+      if ((page.properties || []).length) {
+        this.appendLiveBadges(
+          titleBtn,
+          state,
+          this.getPropertySnapshotKey(page.properties[0] || 'prop', guid)
+        );
+      }
+
+      rowEl.appendChild(titleBtn);
       groupEl.appendChild(rowEl);
-      groupEl.appendChild(recsEl);
+      groupEl.appendChild(this.buildRecordPreviewEl(guid, state));
+
+      if ((page.lines || []).length > 0) {
+        const linesEl = document.createElement('div');
+        linesEl.className = 'tlr-lines';
+        for (const line of page.lines) {
+          const entryEl = document.createElement('div');
+          entryEl.className = 'tlr-line-entry';
+
+          const ctx = state ? this.getLinkedContextState(state, line.guid) : null;
+          if (state && ctx && this.hasRequestedLinkedContext(ctx) && ctx.loaded !== true && ctx.loading !== true) {
+            this.ensureLinkedContextLoaded(state, line).catch(() => {});
+          }
+
+          this.appendLinkedContextRows(entryEl, guid, ctx, query, 'top');
+
+          const lineEl = document.createElement('button');
+          lineEl.type = 'button';
+          lineEl.className = 'tlr-line button-none button-minimal-hover';
+          lineEl.dataset.action = 'open-line';
+          lineEl.dataset.recordGuid = guid;
+          lineEl.dataset.lineGuid = line.guid;
+          this.appendLineText(lineEl, line, query);
+          this.appendLiveBadges(lineEl, state, this.getLinkedSnapshotKey(line.guid));
+
+          const lineCluster = document.createElement('div');
+          lineCluster.className = 'tlr-line-title-cluster';
+          lineCluster.appendChild(lineEl);
+
+          const mainRowEl = document.createElement('div');
+          mainRowEl.className = 'tlr-line-main';
+          mainRowEl.appendChild(lineCluster);
+          entryEl.appendChild(mainRowEl);
+
+          if (state && ctx) {
+            if (ctx.showMoreContext === true) mainRowEl.classList.add('is-context-open');
+            const controlsEl = this.buildLinkedContextControls(line.guid, ctx, {
+              showLinkAction: false
+            });
+            if (controlsEl) mainRowEl.appendChild(controlsEl);
+
+            if (ctx.loading === true && ctx.backgroundLoading !== true) {
+              const loadingEl = document.createElement('div');
+              loadingEl.className = 'tlr-note tlr-context-note';
+              loadingEl.textContent = 'Loading context...';
+              entryEl.appendChild(loadingEl);
+            } else if (ctx.error) {
+              const errorEl = document.createElement('div');
+              errorEl.className = 'tlr-error tlr-context-note';
+              errorEl.textContent = ctx.error;
+              entryEl.appendChild(errorEl);
+            }
+          }
+
+          this.appendLinkedContextRows(entryEl, guid, ctx, query, 'bottom');
+          linesEl.appendChild(entryEl);
+        }
+        groupEl.appendChild(linesEl);
+      }
+
       container.appendChild(groupEl);
     }
+
+    if (maxResults > 0 && (totalLineCount ?? 0) >= maxResults) {
+      const note = document.createElement('div');
+      note.className = 'tlr-note';
+      note.textContent = `Showing first ${maxResults} matches.`;
+      container.appendChild(note);
+    }
+  }
+
+  appendPropertyReferencePages(container, groups, opts) {
+    // Legacy entry point — render property-only pages via the unified path.
+    return this.appendUnifiedBacklinkPages(container, groups, [], opts);
+  }
+
+  appendPropertyReferenceGroups(container, groups, opts) {
+    // Kept as a thin alias for any older call sites.
+    return this.appendPropertyReferencePages(container, groups, opts);
   }
 
   appendLinkedReferenceGroups(container, groups, opts) {
@@ -9705,6 +11214,7 @@ class Plugin extends AppPlugin {
     const refCount = groups.reduce((n, g) => n + (g?.lines?.length || 0), 0);
 
     if (pageCount === 0) {
+      if (opts?.quietEmpty === true || !emptyMessage) return;
       const empty = document.createElement('div');
       empty.className = 'tlr-empty';
       empty.textContent = emptyMessage;
@@ -9747,27 +11257,23 @@ class Plugin extends AppPlugin {
 
       const header = document.createElement('button');
       header.type = 'button';
-      header.className = 'tlr-group-header button-normal button-normal-hover';
+      header.className = 'tlr-group-header button-none button-minimal-hover';
       header.dataset.action = 'open-record';
       header.dataset.recordGuid = recordGuid;
 
       const title = document.createElement('div');
       title.className = 'tlr-group-title';
-      title.textContent = record.getName?.() || 'Untitled';
+      this.appendRecordIcon(title, record);
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'tlr-group-title-text';
+      nameSpan.textContent = record.getName?.() || 'Untitled';
+      title.appendChild(nameSpan);
+      this.appendTitleMeta(title, this.getRecordCollectionLabel(record));
 
-      const meta = document.createElement('div');
-      meta.className = 'tlr-group-meta text-details';
-      meta.textContent = `${lines.length}`;
-
-      const titleCluster = document.createElement('div');
-      titleCluster.className = 'tlr-row-title-cluster';
-      titleCluster.appendChild(title);
-      titleCluster.appendChild(this.buildPanelNavActions(recordGuid));
-
-      header.appendChild(titleCluster);
-      header.appendChild(meta);
+      header.appendChild(title);
 
       rowEl.appendChild(toggleBtn);
+      rowEl.appendChild(this.buildExpandRecordBtn(recordGuid, state));
       rowEl.appendChild(header);
 
       const linesEl = document.createElement('div');
@@ -9797,7 +11303,6 @@ class Plugin extends AppPlugin {
         const lineCluster = document.createElement('div');
         lineCluster.className = 'tlr-line-title-cluster';
         lineCluster.appendChild(lineEl);
-        lineCluster.appendChild(this.buildPanelNavActions(recordGuid, line.guid));
 
         const mainRowEl = document.createElement('div');
         mainRowEl.className = 'tlr-line-main';
@@ -9829,7 +11334,6 @@ class Plugin extends AppPlugin {
       }
 
       groupEl.appendChild(rowEl);
-      groupEl.appendChild(this.buildExpandRecordBtn(recordGuid, state));
       groupEl.appendChild(this.buildRecordPreviewEl(recordGuid, state));
       groupEl.appendChild(linesEl);
       container.appendChild(groupEl);
@@ -9974,10 +11478,18 @@ class Plugin extends AppPlugin {
     return glyph;
   }
 
-  appendLineText(container, line, query) {
+  lineHasVisibleContent(line) {
+    const segments = Array.isArray(line?.segments) ? line.segments : [];
+    for (const seg of segments) {
+      if ((this.getSegmentDisplayText(seg) || '').trim()) return true;
+    }
+    return (this.getLineContentText(line) || '').trim().length > 0;
+  }
+
+  appendLineText(container, line, query, opts) {
     if (!container) return;
 
-    const prefix = this.getLinePrefix(line);
+    const prefix = opts?.skipPrefix === true ? '' : this.getLinePrefix(line);
     if (prefix) {
       const p = document.createElement('span');
       p.className = 'tlr-prefix';
@@ -10452,6 +11964,716 @@ class Plugin extends AppPlugin {
     return i;
   }
 
+  // ---------- Time Machine ----------
+
+  defaultTimeMachineSettings() {
+    return {
+      enabled: true,
+      filters: [{ id: 'tm_default', field: 'When', op: 'same_day_last_year', value: '' }],
+      excludeJournalYearForMonthDay: true,
+      groupWithinYear: 'collection',
+      excludedCollections: []
+    };
+  }
+
+  normalizeTimeMachineSettings(raw) {
+    const base = this.defaultTimeMachineSettings();
+    if (!raw || typeof raw !== 'object') return base;
+    const enabled = raw.enabled !== false;
+    const filters = Array.isArray(raw.filters) && raw.filters.length
+      ? raw.filters.map((f, i) => ({
+          id: String(f?.id || `tm_${i}`),
+          field: String(f?.field || 'When').trim(),
+          op: String(f?.op || 'same_day_last_year').trim(),
+          value: f?.value != null ? String(f.value) : ''
+        }))
+      : base.filters;
+    const excludeJournalYearForMonthDay = raw.excludeJournalYearForMonthDay !== false;
+    const g = String(raw.groupWithinYear || '').trim().toLowerCase();
+    const groupWithinYear = g === 'chrono' ? 'chrono' : 'collection';
+    const excludedCollections = Array.isArray(raw.excludedCollections)
+      ? raw.excludedCollections.map((n) => String(n || '').trim()).filter(Boolean)
+      : base.excludedCollections;
+    return { enabled, filters, excludeJournalYearForMonthDay, groupWithinYear, excludedCollections };
+  }
+
+  loadTimeMachineSettings() {
+    const key = this._storageKeyTimeMachine;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) return this.normalizeTimeMachineSettings(JSON.parse(raw));
+    } catch (e) { /* ignore */ }
+
+    // Migrate from Today's Notes / Journal Footer Suite so filters survive the suite retirement.
+    try {
+      const tn = JSON.parse(localStorage.getItem('tn_settings_v1') || 'null');
+      if (tn && typeof tn === 'object') {
+        const migrated = this.normalizeTimeMachineSettings({
+          ...(tn.timeMachine || {}),
+          excludedCollections: tn.excludedCollections || []
+        });
+        this.saveTimeMachineSettings(migrated);
+        return migrated;
+      }
+    } catch (e) { /* ignore */ }
+
+    return this.defaultTimeMachineSettings();
+  }
+
+  saveTimeMachineSettings(settings) {
+    const normalized = this.normalizeTimeMachineSettings(settings);
+    this._timeMachineSettings = normalized;
+    try {
+      localStorage.setItem(this._storageKeyTimeMachine, JSON.stringify(normalized));
+    } catch (e) { /* ignore */ }
+    this._backrefsScheduleSettingsFlush?.();
+    return normalized;
+  }
+
+  timeMachineEnabled() {
+    const tm = this.normalizeTimeMachineSettings(this._timeMachineSettings);
+    return !!tm.enabled && Array.isArray(tm.filters) && tm.filters.length > 0;
+  }
+
+  getJournalYyyymmdd(record) {
+    const iso = this.getRecordDateReferenceIso(record);
+    if (!iso || iso.length < 10) return '';
+    return iso.slice(0, 4) + iso.slice(5, 7) + iso.slice(8, 10);
+  }
+
+  journalDateParts(yyyymmdd) {
+    const y = parseInt(String(yyyymmdd || '').slice(0, 4), 10);
+    const m = parseInt(String(yyyymmdd || '').slice(4, 6), 10);
+    const d = parseInt(String(yyyymmdd || '').slice(6, 8), 10);
+    return { year: y, month: m, day: d, yyyymmdd: String(yyyymmdd || '') };
+  }
+
+  dayRangeFromKey(yyyymmdd) {
+    const p = this.journalDateParts(yyyymmdd);
+    const start = new Date(p.year, p.month - 1, p.day, 0, 0, 0, 0);
+    const end = new Date(p.year, p.month - 1, p.day, 23, 59, 59, 999);
+    return { start, end };
+  }
+
+  dayRangeSameDayLastYear(yyyymmdd) {
+    const p = this.journalDateParts(yyyymmdd);
+    const start = new Date(p.year, p.month - 1, p.day, 0, 0, 0, 0);
+    start.setFullYear(start.getFullYear() - 1);
+    const end = new Date(p.year, p.month - 1, p.day, 23, 59, 59, 999);
+    end.setFullYear(end.getFullYear() - 1);
+    return { start, end };
+  }
+
+  coerceDateForTm(raw) {
+    if (!raw) return null;
+    if (raw instanceof Date && !Number.isNaN(raw.getTime())) return raw;
+    if (typeof raw?.toDate === 'function') {
+      const d = raw.toDate();
+      if (d instanceof Date && !Number.isNaN(d.getTime())) return d;
+    }
+    if (typeof raw?.value === 'function') {
+      const d = new Date(raw.value());
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    if (typeof raw === 'number') {
+      const d = new Date(raw);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    if (typeof raw === 'string' && raw.length >= 8) {
+      const d = new Date(raw);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    return null;
+  }
+
+  readDateFieldNamed(record, fieldName) {
+    const key = String(fieldName || '').trim();
+    if (!key || !record) return null;
+    try {
+      const prop = record.prop?.(key);
+      if (!prop) return null;
+      if (typeof prop.date === 'function') {
+        const d = prop.date();
+        if (d instanceof Date && !Number.isNaN(d.getTime())) return d;
+      }
+      return this.coerceDateForTm(prop.get?.());
+    } catch (e) {
+      return null;
+    }
+  }
+
+  readFieldValueSimple(record, fieldName) {
+    const key = String(fieldName || '').trim();
+    if (!key || !record) return '';
+    try {
+      const prop = record.prop?.(key);
+      if (!prop) return '';
+      const raw = prop.get?.();
+      if (raw == null) return '';
+      if (typeof raw === 'string') return raw;
+      if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw);
+      if (raw instanceof Date) {
+        return `${raw.getFullYear()}-${String(raw.getMonth() + 1).padStart(2, '0')}-${String(raw.getDate()).padStart(2, '0')}`;
+      }
+      if (typeof raw?.label === 'string') return raw.label;
+      if (typeof raw?.name === 'string') return raw.name;
+      return String(raw);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  evaluateTmFilterRule(record, rule, journalParts, dayRange, lastYearRange) {
+    const field = String(rule?.field || '').trim();
+    const op = String(rule?.op || '').trim();
+    const cmpRaw = String(rule?.value || '');
+    if (!field) return true;
+
+    const isDateOp = ['on_journal_day', 'not_on_journal_day', 'same_month_day_as_journal', 'same_day_last_year'].includes(op);
+    const raw = isDateOp ? this.readDateFieldNamed(record, field) : this.readFieldValueSimple(record, field);
+    const value = (v) => {
+      if (v == null) return '';
+      if (v instanceof Date) {
+        return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
+      }
+      return String(v).toLowerCase();
+    };
+    const cmp = String(cmpRaw || '').toLowerCase();
+
+    if (op === 'is_empty') {
+      if (isDateOp) return !this.coerceDateForTm(raw);
+      const vs = this.readFieldValueSimple(record, field);
+      return !vs || !String(vs).trim();
+    }
+    if (op === 'is_not_empty') {
+      if (isDateOp) return !!this.coerceDateForTm(raw);
+      const vs = this.readFieldValueSimple(record, field);
+      return !!vs && !!String(vs).trim();
+    }
+    if (op === 'same_month_day_as_journal') {
+      const d = this.coerceDateForTm(raw);
+      if (!d) return false;
+      if (d.getMonth() + 1 !== journalParts.month || d.getDate() !== journalParts.day) return false;
+      const tmCfg = this.normalizeTimeMachineSettings(this._timeMachineSettings);
+      if (tmCfg.excludeJournalYearForMonthDay !== false && d.getFullYear() === journalParts.year) return false;
+      return true;
+    }
+    if (op === 'on_journal_day') {
+      const d = this.coerceDateForTm(raw);
+      if (!d) return false;
+      return d >= dayRange.start && d <= dayRange.end;
+    }
+    if (op === 'not_on_journal_day') {
+      const d = this.coerceDateForTm(raw);
+      if (!d) return true;
+      return !(d >= dayRange.start && d <= dayRange.end);
+    }
+    if (op === 'same_day_last_year') {
+      const d = this.coerceDateForTm(raw);
+      if (!d) return false;
+      return d >= lastYearRange.start && d <= lastYearRange.end;
+    }
+
+    const v = value(raw);
+    if (op === 'eq') return v === cmp;
+    if (op === 'neq') return v !== cmp;
+    if (op === 'contains') return v.includes(cmp);
+    if (op === 'not_contains') return !v.includes(cmp);
+    if (op === 'starts_with') return v.startsWith(cmp);
+    if (op === 'ends_with') return v.endsWith(cmp);
+    return true;
+  }
+
+  recordPassesTmFilters(record, journalYyyymmdd) {
+    const tm = this.normalizeTimeMachineSettings(this._timeMachineSettings);
+    const journalParts = this.journalDateParts(journalYyyymmdd);
+    const dayRange = this.dayRangeFromKey(journalYyyymmdd);
+    const lastYearRange = this.dayRangeSameDayLastYear(journalYyyymmdd);
+    for (const rule of tm.filters || []) {
+      if (!this.evaluateTmFilterRule(record, rule, journalParts, dayRange, lastYearRange)) return false;
+    }
+    return true;
+  }
+
+  collectionIconName(coll) {
+    if (!coll) return '';
+    const candidates = [];
+    const push = (v) => {
+      if (v == null || typeof v === 'object') return;
+      const t = String(v).trim();
+      if (t) candidates.push(t);
+    };
+    try {
+      const cfg = coll.getConfiguration?.() || {};
+      push(cfg.icon); push(cfg.collection_icon); push(cfg.iconName); push(cfg.emoji);
+    } catch (e) { /* ignore */ }
+    try {
+      const data = coll?.getData?.() || {};
+      push(data.icon); push(data.emoji);
+    } catch (e) { /* ignore */ }
+    push(coll?.icon);
+    try { push(coll.getIcon?.()); } catch (e) { /* ignore */ }
+    for (const raw of candidates) {
+      if (/^ti-photo$/i.test(raw)) continue;
+      if (raw.startsWith('ti-')) return raw;
+      if (/^[a-z0-9_-]+$/i.test(raw)) return `ti-${raw.replace(/^ti-?/, '').replace(/_/g, '-')}`;
+    }
+    return '';
+  }
+
+  async queryTimeMachineRecords(journalYyyymmdd) {
+    const tm = this.normalizeTimeMachineSettings(this._timeMachineSettings);
+    const excludedSet = new Set((tm.excludedCollections || []).map((n) => n.toLowerCase()));
+    const journalNames = new Set(['journal', 'journals']);
+    let collections = [];
+    try { collections = await this.data.getAllCollections(); } catch (e) { collections = []; }
+    const out = [];
+    const tm0 = tm.filters[0];
+    for (const coll of collections) {
+      const name = coll.getName?.() || '';
+      if (!name || journalNames.has(name.toLowerCase())) continue;
+      if (excludedSet.has(name.toLowerCase())) continue;
+      let records;
+      try { records = await coll.getAllRecords(); } catch (e) { continue; }
+      const icon = this.collectionIconName(coll);
+      for (const record of records || []) {
+        if (!this.recordPassesTmFilters(record, journalYyyymmdd)) continue;
+        let dateVal = null;
+        if (tm0?.field) dateVal = this.readDateFieldNamed(record, tm0.field);
+        if (!dateVal) {
+          for (const field of ['When', 'when', 'Date', 'date']) {
+            dateVal = this.readDateFieldNamed(record, field);
+            if (dateVal) break;
+          }
+        }
+        const d = this.coerceDateForTm(dateVal);
+        out.push({ record, collectionName: name, dateVal: d || dateVal || null, collectionIcon: icon });
+      }
+    }
+    out.sort((a, b) => {
+      const c = a.collectionName.localeCompare(b.collectionName);
+      if (c !== 0) return c;
+      const ta = a.dateVal instanceof Date && !Number.isNaN(a.dateVal.getTime()) ? a.dateVal.getTime() : 0;
+      const tb = b.dateVal instanceof Date && !Number.isNaN(b.dateVal.getTime()) ? b.dateVal.getTime() : 0;
+      return ta - tb;
+    });
+    return out;
+  }
+
+  tmItemYear(item) {
+    const d = item?.dateVal instanceof Date && !Number.isNaN(item.dateVal.getTime())
+      ? item.dateVal
+      : this.coerceDateForTm(item?.dateVal);
+    if (!d || Number.isNaN(d.getTime())) return null;
+    return d.getFullYear();
+  }
+
+  groupTmResultsByYearDescending(items) {
+    const yearMap = new Map();
+    const unknown = [];
+    for (const it of items || []) {
+      const y = this.tmItemYear(it);
+      if (y == null || Number.isNaN(y)) { unknown.push(it); continue; }
+      if (!yearMap.has(y)) yearMap.set(y, []);
+      yearMap.get(y).push(it);
+    }
+    const years = Array.from(yearMap.keys()).sort((a, b) => b - a);
+    return { yearMap, years, unknown };
+  }
+
+  sortTmItemsByTimeAscending(items) {
+    return [...(items || [])].sort((a, b) => {
+      const ta = a.dateVal instanceof Date && !Number.isNaN(a.dateVal.getTime()) ? a.dateVal.getTime() : 0;
+      const tb = b.dateVal instanceof Date && !Number.isNaN(b.dateVal.getTime()) ? b.dateVal.getTime() : 0;
+      return ta - tb;
+    });
+  }
+
+  groupTmResultsByCollection(items) {
+    const byColl = new Map();
+    for (const item of items || []) {
+      const name = item?.collectionName || 'Other';
+      if (!byColl.has(name)) byColl.set(name, []);
+      byColl.get(name).push(item);
+    }
+    return byColl;
+  }
+
+  resetTimeMachineState(state) {
+    if (!state) return;
+    state.timeMachineCollapsed = true;
+    state.timeMachineLoading = false;
+    state.timeMachineResults = null;
+    state.timeMachineJournalKey = '';
+  }
+
+  syncTimeMachineControl(state) {
+    const btn = state?.timeMachineToggleEl || state?.rootEl?.querySelector?.('[data-action="toggle-time-machine"]') || null;
+    if (!btn) return;
+    let record = null;
+    try { record = state?.recordGuid ? this.data.getRecord?.(state.recordGuid) : null; } catch (e) { record = null; }
+    const journalKey = this.getJournalYyyymmdd(record);
+    const enabled = this.timeMachineEnabled() && !!journalKey;
+    const open = enabled && state.timeMachineCollapsed !== true;
+    btn.classList.toggle('is-active', open);
+    btn.classList.toggle('is-disabled', !enabled);
+    btn.setAttribute('aria-pressed', open ? 'true' : 'false');
+    btn.disabled = !enabled;
+    btn.title = !this.timeMachineEnabled()
+      ? 'Time Machine (disabled in settings)'
+      : (!journalKey
+        ? 'Time Machine (journal pages only)'
+        : (open ? 'Hide Time Machine' : 'Show Time Machine'));
+    btn.setAttribute('data-tooltip', btn.title);
+  }
+
+  async toggleTimeMachine(state) {
+    if (!state || !this.timeMachineEnabled()) return;
+    let record = null;
+    try { record = state.recordGuid ? this.data.getRecord?.(state.recordGuid) : null; } catch (e) { record = null; }
+    const journalKey = this.getJournalYyyymmdd(record);
+    if (!journalKey) return;
+
+    const nextCollapsed = state.timeMachineCollapsed !== true;
+    state.timeMachineCollapsed = nextCollapsed;
+    this.syncTimeMachineControl(state);
+    if (!nextCollapsed) {
+      await this.runTimeMachineGenerate(state);
+    } else {
+      this.renderTimeMachineSection(state);
+    }
+  }
+
+  async runTimeMachineGenerate(state) {
+    if (!state || !this.timeMachineEnabled()) return;
+    let record = null;
+    try { record = state.recordGuid ? this.data.getRecord?.(state.recordGuid) : null; } catch (e) { record = null; }
+    const journalKey = this.getJournalYyyymmdd(record);
+    if (!journalKey) {
+      state.timeMachineResults = [];
+      this.renderTimeMachineSection(state);
+      return;
+    }
+
+    if (state.timeMachineLoading) return;
+    if (state.timeMachineResults != null && state.timeMachineJournalKey === journalKey) {
+      this.renderTimeMachineSection(state);
+      this.syncTimeMachineControl(state);
+      return;
+    }
+    state.timeMachineLoading = true;
+    state.timeMachineJournalKey = journalKey;
+    this.renderTimeMachineSection(state);
+    this.syncTimeMachineControl(state);
+    try {
+      state.timeMachineResults = await this.queryTimeMachineRecords(journalKey);
+    } catch (e) {
+      console.error('[Backreferences] Time Machine', e);
+      state.timeMachineResults = [];
+    }
+    state.timeMachineLoading = false;
+    this.renderTimeMachineSection(state);
+    this.syncTimeMachineControl(state);
+  }
+
+  buildTimeMachineRow(item, state) {
+    const record = item?.record || null;
+    const guid = record?.guid || '';
+    if (!guid) return document.createElement('div');
+
+    const groupEl = document.createElement('div');
+    groupEl.className = 'tlr-group tlr-group-tm';
+    if (state?.recordExpandedState?.get?.(guid)?.expanded === true) {
+      groupEl.classList.add('tlr-record-expanded');
+    }
+
+    const rowEl = document.createElement('div');
+    rowEl.className = 'tlr-group-row tlr-prop-record-row';
+    rowEl.appendChild(this.buildExpandRecordBtn(guid, state));
+
+    const titleBtn = document.createElement('button');
+    titleBtn.type = 'button';
+    titleBtn.className = 'tlr-group-header tlr-prop-record button-none button-minimal-hover';
+    titleBtn.dataset.action = 'open-record';
+    titleBtn.dataset.recordGuid = guid;
+
+    const titleInner = document.createElement('div');
+    titleInner.className = 'tlr-group-title';
+    const iconSlot = document.createElement('span');
+    iconSlot.className = 'tlr-record-icon-slot';
+    if (item.collectionIcon) {
+      try {
+        const iconEl = this.ui.createIcon(item.collectionIcon);
+        iconEl.classList.add('tlr-record-icon');
+        iconSlot.appendChild(iconEl);
+      } catch (e) { /* ignore */ }
+    } else {
+      this.appendRecordIcon(iconSlot, record);
+    }
+    titleInner.appendChild(iconSlot);
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'tlr-group-title-text';
+    nameSpan.textContent = record.getName?.() || 'Untitled';
+    titleInner.appendChild(nameSpan);
+    titleBtn.appendChild(titleInner);
+
+    if (item.collectionName) {
+      const metaEl = document.createElement('div');
+      metaEl.className = 'tlr-row-meta';
+      this.appendTitleMeta(metaEl, item.collectionName);
+      titleBtn.appendChild(metaEl);
+    }
+
+    rowEl.appendChild(titleBtn);
+    groupEl.appendChild(rowEl);
+    groupEl.appendChild(this.buildRecordPreviewEl(guid, state));
+    return groupEl;
+  }
+
+  renderTimeMachineSection(state) {
+    const slot = state?.timeMachineSlotEl;
+    if (!slot) return;
+    slot.innerHTML = '';
+
+    let record = null;
+    try { record = state.recordGuid ? this.data.getRecord?.(state.recordGuid) : null; } catch (e) { record = null; }
+    const journalKey = this.getJournalYyyymmdd(record);
+    if (!this.timeMachineEnabled() || !journalKey || state.timeMachineCollapsed === true) {
+      slot.hidden = true;
+      return;
+    }
+    slot.hidden = false;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'tlr-tm-section';
+
+    const head = document.createElement('div');
+    head.className = 'tlr-tm-head';
+    const iconWrap = document.createElement('span');
+    iconWrap.className = 'tlr-tm-icon';
+    try { iconWrap.appendChild(this.ui.createIcon('ti-hourglass')); }
+    catch (e) { iconWrap.textContent = '⏳'; }
+    const title = document.createElement('div');
+    title.className = 'tlr-tm-title';
+    title.textContent = 'Time Machine';
+    const collapseBtn = document.createElement('button');
+    collapseBtn.type = 'button';
+    collapseBtn.className = 'tlr-btn tlr-tm-collapse button-none button-small button-minimal-hover';
+    collapseBtn.dataset.action = 'toggle-time-machine';
+    collapseBtn.title = 'Collapse Time Machine';
+    collapseBtn.setAttribute('aria-label', 'Collapse Time Machine');
+    try { collapseBtn.appendChild(this.ui.createIcon('ti-chevron-up')); }
+    catch (e) { collapseBtn.textContent = '−'; }
+    head.append(iconWrap, title, collapseBtn);
+    wrap.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'tlr-tm-body';
+    wrap.appendChild(body);
+
+    if (state.timeMachineLoading) {
+      const loading = document.createElement('div');
+      loading.className = 'tlr-note';
+      loading.textContent = 'Loading Time Machine…';
+      body.appendChild(loading);
+      slot.appendChild(wrap);
+      return;
+    }
+
+    if (state.timeMachineResults == null) {
+      slot.appendChild(wrap);
+      return;
+    }
+
+    if (!state.timeMachineResults.length) {
+      const empty = document.createElement('div');
+      empty.className = 'tlr-empty';
+      empty.textContent = 'No records matched your Time Machine filters.';
+      body.appendChild(empty);
+      slot.appendChild(wrap);
+      return;
+    }
+
+    const tmCfg = this.normalizeTimeMachineSettings(this._timeMachineSettings);
+    const { yearMap, years, unknown } = this.groupTmResultsByYearDescending(state.timeMachineResults);
+
+    const renderYearBucket = (yearLabel, items) => {
+      const yearHead = document.createElement('div');
+      yearHead.className = 'tlr-tm-year-head';
+      yearHead.textContent = yearLabel;
+      body.appendChild(yearHead);
+
+      if (tmCfg.groupWithinYear === 'chrono') {
+        for (const item of this.sortTmItemsByTimeAscending(items)) {
+          body.appendChild(this.buildTimeMachineRow(item, state));
+        }
+        return;
+      }
+      const byColl = this.groupTmResultsByCollection(items);
+      const collNames = Array.from(byColl.keys()).sort((a, b) => String(a).localeCompare(String(b)));
+      for (const collName of collNames) {
+        const subLabel = document.createElement('div');
+        subLabel.className = 'tlr-tm-subcoll';
+        subLabel.textContent = collName;
+        body.appendChild(subLabel);
+        for (const item of this.sortTmItemsByTimeAscending(byColl.get(collName) || [])) {
+          body.appendChild(this.buildTimeMachineRow(item, state));
+        }
+      }
+    };
+
+    for (const y of years) renderYearBucket(String(y), yearMap.get(y) || []);
+    if (unknown.length) renderYearBucket('Other', unknown);
+    slot.appendChild(wrap);
+  }
+
+  getTimeMachineOpChoices() {
+    return [
+      ['same_day_last_year', 'Same calendar day, last year'],
+      ['on_journal_day', 'On journal day'],
+      ['same_month_day_as_journal', 'Same month/day as journal (any year)'],
+      ['not_on_journal_day', 'Not on journal day'],
+      ['eq', 'Text equals'],
+      ['neq', 'Text not equals'],
+      ['contains', 'Text contains'],
+      ['not_contains', 'Text does not contain'],
+      ['starts_with', 'Text starts with'],
+      ['ends_with', 'Text ends with'],
+      ['is_empty', 'Field empty'],
+      ['is_not_empty', 'Field not empty']
+    ];
+  }
+
+  openTimeMachineSettings() {
+    const existing = document.querySelector('.tlr-tm-settings-overlay');
+    if (existing) existing.remove();
+
+    const draft = this.normalizeTimeMachineSettings(this._timeMachineSettings);
+    const overlay = document.createElement('div');
+    overlay.className = 'tlr-tm-settings-overlay';
+    const panel = document.createElement('div');
+    panel.className = 'tlr-tm-settings-panel';
+
+    const h = document.createElement('h3');
+    h.textContent = 'Time Machine';
+    panel.appendChild(h);
+    const help = document.createElement('p');
+    help.className = 'tlr-tm-settings-help';
+    help.textContent = 'Optional journal-page section. Filters use the journal date as context. Settings migrate from Today\'s Notes if present.';
+    panel.appendChild(help);
+
+    const en = document.createElement('label');
+    en.className = 'tlr-tm-settings-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = draft.enabled !== false;
+    cb.addEventListener('change', () => { draft.enabled = cb.checked; });
+    en.append(cb, document.createTextNode(' Show Time Machine'));
+    panel.appendChild(en);
+
+    const exclInput = document.createElement('input');
+    exclInput.type = 'text';
+    exclInput.className = 'tlr-tm-settings-input';
+    exclInput.placeholder = 'Excluded collections (comma-separated)';
+    exclInput.value = (draft.excludedCollections || []).join(', ');
+    panel.appendChild(exclInput);
+
+    const filtersWrap = document.createElement('div');
+    filtersWrap.className = 'tlr-tm-filters';
+    const opChoices = this.getTimeMachineOpChoices();
+    const renderFilters = () => {
+      filtersWrap.innerHTML = '';
+      draft.filters.forEach((rule, ridx) => {
+        const row = document.createElement('div');
+        row.className = 'tlr-tm-filter-row';
+        const fin = document.createElement('input');
+        fin.type = 'text';
+        fin.placeholder = 'Field (e.g. When)';
+        fin.value = rule.field || '';
+        fin.addEventListener('input', () => { draft.filters[ridx].field = fin.value.trim(); });
+        const opSel = document.createElement('select');
+        for (const [val, lab] of opChoices) {
+          const o = document.createElement('option');
+          o.value = val; o.textContent = lab;
+          opSel.appendChild(o);
+        }
+        opSel.value = opChoices.some(([v]) => v === rule.op) ? rule.op : 'same_day_last_year';
+        opSel.addEventListener('change', () => { draft.filters[ridx].op = opSel.value; });
+        const vin = document.createElement('input');
+        vin.type = 'text';
+        vin.placeholder = 'Compare value';
+        vin.value = rule.value || '';
+        vin.addEventListener('input', () => { draft.filters[ridx].value = vin.value; });
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.textContent = '✕';
+        rm.addEventListener('click', () => { draft.filters.splice(ridx, 1); renderFilters(); });
+        row.append(fin, opSel, vin, rm);
+        filtersWrap.appendChild(row);
+      });
+    };
+    renderFilters();
+    panel.appendChild(filtersWrap);
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'tlr-tm-settings-secondary';
+    addBtn.textContent = '+ Add filter rule';
+    addBtn.addEventListener('click', () => {
+      draft.filters.push({ id: `tm_${Date.now()}`, field: 'When', op: 'same_day_last_year', value: '' });
+      renderFilters();
+    });
+    panel.appendChild(addBtn);
+
+    const exclLb = document.createElement('label');
+    exclLb.className = 'tlr-tm-settings-row';
+    const exclCb = document.createElement('input');
+    exclCb.type = 'checkbox';
+    exclCb.checked = draft.excludeJournalYearForMonthDay !== false;
+    exclCb.addEventListener('change', () => { draft.excludeJournalYearForMonthDay = exclCb.checked; });
+    exclLb.append(exclCb, document.createTextNode(' Exclude journal year from “same month/day” results'));
+    panel.appendChild(exclLb);
+
+    const groupSel = document.createElement('select');
+    groupSel.className = 'tlr-tm-settings-input';
+    [['collection', 'Group within year by collection'], ['chrono', 'Group within year by time']].forEach(([val, lab]) => {
+      const o = document.createElement('option');
+      o.value = val; o.textContent = lab;
+      groupSel.appendChild(o);
+    });
+    groupSel.value = draft.groupWithinYear === 'chrono' ? 'chrono' : 'collection';
+    groupSel.addEventListener('change', () => {
+      draft.groupWithinYear = groupSel.value === 'chrono' ? 'chrono' : 'collection';
+    });
+    panel.appendChild(groupSel);
+
+    const actions = document.createElement('div');
+    actions.className = 'tlr-tm-settings-actions';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', () => overlay.remove());
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'tlr-tm-settings-primary';
+    save.textContent = 'Save';
+    save.addEventListener('click', () => {
+      draft.excludedCollections = exclInput.value.split(',').map((s) => s.trim()).filter(Boolean);
+      this.saveTimeMachineSettings(draft);
+      for (const st of this._panelStates?.values?.() || []) {
+        this.resetTimeMachineState(st);
+        this.syncTimeMachineControl(st);
+        this.renderTimeMachineSection(st);
+      }
+      overlay.remove();
+    });
+    actions.append(cancel, save);
+    panel.appendChild(actions);
+    overlay.appendChild(panel);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+  }
+
   // ---------- CSS ----------
 
   injectCss() {
@@ -10467,16 +12689,81 @@ class Plugin extends AppPlugin {
         --tlr-border-color: var(--divider-color, var(--cmdpal-border-color, var(--border-subtle, transparent)));
         --tlr-hover-bg: var(--button-normal-hover-color, var(--bg-hover, transparent));
         --tlr-selected-bg: var(--bg-selected, var(--tlr-hover-bg));
+        --tlr-editor-font: var(--editor-font-family, var(--font-family, inherit));
+        --tlr-editor-size: var(--editor-font-size, 15px);
         margin-top: 14px;
         color: var(--tlr-text-default);
         font-size: 13px;
+      }
+
+      .tlr-footer--native .tlr-panel-nav-actions {
+        display: none !important;
+      }
+
+      /* No card/frame — sit directly on the page like the built-in backlinks. */
+      .tlr-footer--native,
+      .tlr-footer--native .tlr-header-field,
+      .tlr-footer--native .tlr-section {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+      }
+
+      /* Left rail runs the length of the list, like the built-in backlinks. */
+      .tlr-footer--native .tlr-body {
+        background: transparent !important;
+        border: none;
+        border-left: 1px solid var(--tlr-border-color);
+        box-shadow: none !important;
+        margin-left: 10px;
+        padding-left: 14px;
+      }
+
+      /* A host wrapper that holds only our footer must not draw a card either. */
+      :where(div):has(> .tlr-footer--native:only-child) {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+      }
+
+      .tlr-footer--native {
+        padding: 0;
+      }
+
+      .tlr-summary-pill {
+        display: inline-flex !important;
+        align-items: center;
+        gap: 8px;
+        width: auto;
+        height: auto;
+        max-width: 100%;
+        padding: 4px 12px 4px 8px !important;
+        min-height: 28px;
+        border-radius: 999px !important;
+        background: var(--button-minimal-bg-color, var(--bg-secondary, rgba(127,127,127,0.14))) !important;
+        border: 1px solid var(--tlr-border-color) !important;
+        color: var(--tlr-text-default);
+      }
+
+      .tlr-summary-pill .tlr-count {
+        flex: 0 1 auto;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--tlr-text-default);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .tlr-summary-pill .tlr-toggle-caret {
+        opacity: 0.85;
       }
 
       .tlr-header {
         display: flex;
         align-items: center;
         gap: 6px;
-        min-height: 20px;
+        min-height: 28px;
         margin-bottom: 0;
       }
 
@@ -10500,9 +12787,7 @@ class Plugin extends AppPlugin {
       }
 
       .tlr-title {
-        flex: 0 0 auto;
-        min-width: 0;
-        white-space: nowrap;
+        display: none;
       }
 
       .tlr-count {
@@ -10735,6 +13020,15 @@ class Plugin extends AppPlugin {
         font-size: 11px;
       }
 
+      .tlr-sort-menu-state {
+        padding: 10px 10px 8px;
+        margin-bottom: 2px;
+        border-bottom: 1px solid var(--tlr-border-color);
+        color: var(--tlr-text-muted);
+        font-size: 11.5px;
+        line-height: 1.45;
+      }
+
       .tlr-sort-option {
         width: 100%;
         display: flex;
@@ -10876,7 +13170,7 @@ class Plugin extends AppPlugin {
         background: var(--tlr-hover-bg);
       }
 
-      .tlr-toggle {
+      .tlr-toggle:not(.tlr-summary-pill) {
         flex: 0 0 auto;
         width: 20px;
         height: 20px;
@@ -11191,14 +13485,12 @@ class Plugin extends AppPlugin {
       .tlr-record-preview {
         display: none;
         flex-direction: column;
-        margin: 4px 0 6px 4px;
-        border-left: 2px solid var(--tlr-border-color);
-        padding: 6px 8px 8px 12px;
-        border-radius: 0 8px 8px 0;
-        background: var(--tlr-selected-bg);
-        gap: 2px;
-        font-size: 13px;
-        line-height: 1.45;
+        margin: 2px 0 10px 4px;
+        padding: 2px 0 2px 2px;
+        gap: 0;
+        font-family: var(--tlr-editor-font);
+        font-size: var(--tlr-editor-size);
+        line-height: 1.6;
         color: var(--tlr-text-default);
       }
 
@@ -11209,11 +13501,12 @@ class Plugin extends AppPlugin {
       .tlr-expand-line {
         display: block;
         width: 100%;
-        padding: 4px 6px;
+        padding: 1px 6px 1px 2px;
         text-align: left;
         color: var(--tlr-text-default);
-        font-size: 13px;
-        line-height: 1.45;
+        font-family: var(--tlr-editor-font);
+        font-size: var(--tlr-editor-size);
+        line-height: 1.6;
         border-radius: 4px;
         cursor: pointer;
         transition: background 0.1s, color 0.1s;
@@ -11241,21 +13534,28 @@ class Plugin extends AppPlugin {
 
       .tlr-preview-row {
         display: flex;
-        align-items: center;
-        gap: 2px;
-        padding-left: calc(var(--tlr-depth, 0) * 16px);
+        align-items: flex-start;
+        gap: 1px;
       }
 
       .tlr-preview-toggle {
         width: 14px;
         min-width: 14px;
-        height: 16px;
+        height: calc(var(--tlr-editor-size) * 1.6);
         display: flex;
         align-items: center;
         justify-content: center;
         flex-shrink: 0;
         padding: 0;
         color: var(--tlr-text-muted);
+        opacity: 0;
+        transition: opacity 0.12s ease;
+      }
+
+      .tlr-preview-node:hover > .tlr-preview-row > .tlr-preview-toggle,
+      .tlr-preview-toggle.is-open,
+      .tlr-preview-row:hover > .tlr-preview-toggle {
+        opacity: 0.75;
       }
 
       .tlr-preview-arrow {
@@ -11270,20 +13570,149 @@ class Plugin extends AppPlugin {
 
       .tlr-preview-arrow.is-collapsed {
         transform: rotate(-90deg);
+        opacity: 1;
+      }
+
+      /* Collapsed parents keep their affordance visible, like the editor. */
+      .tlr-preview-toggle:has(.tlr-preview-arrow.is-collapsed) {
+        opacity: 0.75;
+      }
+
+      /* Indent guides mirror the editor's vertical rails instead of flat padding. */
+      .tlr-preview-children-holder {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .tlr-preview-children-holder.is-hidden {
+        display: none;
       }
 
       .tlr-preview-children {
         display: flex;
         flex-direction: column;
-      }
-
-      .tlr-preview-children.is-hidden {
-        display: none;
+        margin-left: 7px;
+        padding-left: 14px;
+        border-left: 1px solid var(--tlr-border-color);
       }
 
       .tlr-preview-row .tlr-expand-line {
         flex: 1;
         min-width: 0;
+      }
+
+      .tlr-preview-marker {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 14px;
+        height: calc(var(--tlr-editor-size) * 1.6);
+        color: var(--tlr-text-muted);
+        font-size: 1.08em;
+        line-height: 1;
+        user-select: none;
+      }
+
+      .tlr-preview-marker-ordinal {
+        justify-content: flex-end;
+        padding-right: 2px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .tlr-preview-marker-ulist {
+        font-size: 1.3em;
+      }
+
+      .tlr-preview-marker-checkbox {
+        width: 13px;
+        min-width: 13px;
+        height: 13px;
+        margin-top: calc((var(--tlr-editor-size) * 1.6 - 13px) / 2);
+        border: 1px solid var(--tlr-border-color);
+        border-radius: 3px;
+        font-size: 10px;
+        line-height: 1;
+      }
+
+      .tlr-preview-marker-checkbox.is-done {
+        color: var(--ed-link-color, var(--link-color, var(--accent, inherit)));
+        border-color: currentColor;
+      }
+
+      .tlr-preview-row-task .tlr-expand-line,
+      .tlr-preview-row-ulist .tlr-expand-line,
+      .tlr-preview-row-olist .tlr-expand-line {
+        padding-left: 4px;
+      }
+
+      .tlr-preview-row-heading .tlr-expand-line {
+        font-weight: 600;
+        font-size: calc(var(--tlr-editor-size) * 1.12);
+        padding-top: 4px;
+      }
+
+      .tlr-preview-row-quote .tlr-expand-line {
+        border-left: 2px solid var(--tlr-border-color);
+        padding-left: 8px;
+        font-style: italic;
+        color: var(--tlr-text-muted);
+      }
+
+      .tlr-preview-row-ref > .tlr-expand-line,
+      .tlr-preview-row-transclusion > .tlr-expand-line {
+        color: var(--ed-link-color, var(--link-color, var(--accent, var(--tlr-text-default))));
+        font-weight: 500;
+      }
+
+      .tlr-preview-link-pill {
+        display: inline-flex !important;
+        width: auto !important;
+        max-width: 100%;
+        align-items: center;
+        gap: 4px;
+        margin: 1px 0;
+        padding: 3px 10px 3px 8px !important;
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--tlr-selected-bg) 70%, var(--tlr-text-default) 14%);
+        border: 1px solid color-mix(in srgb, var(--tlr-border-color) 70%, transparent);
+      }
+
+      .tlr-preview-transclusion-title {
+        font-weight: 600;
+      }
+
+      .tlr-preview-reference-glyph {
+        display: inline-block;
+        margin-left: 5px;
+        color: currentColor;
+        font-size: 0.82em;
+        opacity: 0.72;
+        transform: translateY(-0.08em);
+      }
+
+      /* Note blocks render as a soft container in the editor; approximate it here. */
+      .tlr-preview-node[data-line-type="block"] > .tlr-preview-children-holder > .tlr-preview-children {
+        margin: 2px 0 4px 7px;
+        padding: 4px 10px;
+        border: 1px solid var(--tlr-border-color);
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--tlr-selected-bg) 70%, #000 18%);
+      }
+
+      .tlr-preview-transcluded {
+        margin-top: 1px;
+        margin-bottom: 3px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        border-left: 1px solid var(--tlr-border-color) !important;
+        border-radius: 0 8px 8px 0;
+        background: color-mix(in srgb, var(--tlr-selected-bg) 65%, #000 22%);
+      }
+
+      .tlr-preview-embed-note {
+        color: var(--tlr-text-muted);
+        font-style: italic;
       }
 
       .tlr-group { margin: 6px 0 10px; }
@@ -11334,6 +13763,103 @@ class Plugin extends AppPlugin {
         white-space: normal;
         overflow-wrap: anywhere;
         line-height: 1.35;
+        display: inline-flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 0 6px;
+      }
+
+      .tlr-record-icon {
+        flex: 0 0 auto;
+        font-size: 15px;
+        line-height: 1;
+        color: var(--tlr-text-muted);
+        margin-right: 2px;
+        transform: translateY(1px);
+      }
+
+      .tlr-group-title-text {
+        font-weight: 700;
+        color: var(--tlr-text-default);
+      }
+
+      .tlr-title-sep {
+        color: var(--tlr-text-muted);
+        font-weight: 500;
+        opacity: 0.7;
+      }
+
+      .tlr-title-meta {
+        color: var(--tlr-text-muted);
+        font-weight: 500;
+        font-size: 13px;
+      }
+
+      .tlr-prop-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 6px 0 4px var(--tlr-child-indent);
+        padding-left: 4px;
+      }
+
+      .tlr-prop-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--tlr-border-color);
+        background: var(--button-minimal-bg-color, var(--bg-secondary, rgba(127,127,127,0.12)));
+        color: var(--tlr-text-muted);
+        font-size: 12.5px;
+        font-weight: 500;
+      }
+
+      .tlr-prop-chip-icon {
+        font-size: 14px;
+        opacity: 0.85;
+      }
+
+      .tlr-bucket-header {
+        margin: 12px 0 6px 2px;
+        color: var(--tlr-text-muted);
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        text-transform: none;
+      }
+
+      .tlr-bucket-header:first-child {
+        margin-top: 4px;
+      }
+
+      .tlr-unlinked-pill {
+        display: inline-flex !important;
+        align-items: center;
+        gap: 8px;
+        margin-top: 14px;
+        padding: 4px 12px 4px 8px !important;
+        min-height: 28px;
+        border-radius: 999px !important;
+        background: var(--button-minimal-bg-color, var(--bg-secondary, rgba(127,127,127,0.14))) !important;
+        border: 1px solid var(--tlr-border-color) !important;
+        color: var(--tlr-text-default);
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .tlr-unlinked-pill-label {
+        white-space: nowrap;
+      }
+
+      .tlr-unlinked-results {
+        margin-top: 10px;
+      }
+
+      .tlr-section-slot-property,
+      .tlr-section-slot-linked {
+        margin-top: 4px;
       }
 
       .tlr-group-meta {
@@ -11621,6 +14147,309 @@ class Plugin extends AppPlugin {
 
       .tlr-loading .tlr-search-wrap { opacity: 0.78; }
       .tlr-loading .tlr-sort-toggle { opacity: 0.6; cursor: default; }
+
+      /* ---------- Native list density (one line per backlink) ---------- */
+
+      .tlr-footer--native .tlr-header-field {
+        margin-bottom: 2px;
+      }
+
+      .tlr-footer--native .tlr-group {
+        margin: 0;
+      }
+
+      .tlr-footer--native .tlr-group-row {
+        align-items: center;
+        gap: 2px;
+        padding: 5px 8px 5px 0;
+        border-radius: 8px;
+      }
+
+      .tlr-footer--native .tlr-group-row:hover {
+        background: var(--tlr-hover-bg);
+      }
+
+      .tlr-footer--native .tlr-group-header {
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 14px;
+        padding: 0;
+        min-width: 0;
+      }
+
+      .tlr-footer--native .tlr-group-title {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        align-items: baseline;
+        flex-wrap: nowrap;
+        gap: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        font-size: var(--tlr-editor-size);
+        font-weight: 600;
+        line-height: 1.7;
+      }
+
+      .tlr-footer--native .tlr-group-title-text {
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* Fixed slot keeps every title on the same left edge, icon or not. */
+      .tlr-footer--native .tlr-record-icon-slot {
+        flex: 0 0 auto;
+        width: 20px;
+        display: inline-flex;
+        justify-content: flex-start;
+        align-items: center;
+      }
+
+      .tlr-footer--native .tlr-record-icon {
+        font-size: 14px;
+        margin: 0;
+        opacity: 0.7;
+      }
+
+      .tlr-footer--native .tlr-row-meta {
+        flex: 0 1 auto;
+        min-width: 0;
+        display: flex;
+        align-items: baseline;
+        gap: 0 5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .tlr-footer--native .tlr-title-sep,
+      .tlr-footer--native .tlr-title-meta {
+        flex: 0 0 auto;
+        font-size: 12.5px;
+        font-weight: 400;
+      }
+
+      .tlr-footer--native .tlr-group-modes {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        margin-right: 2px;
+      }
+
+      .tlr-footer--native .tlr-group-mode {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 26px;
+        min-height: 24px;
+        border-radius: var(--button-radius, 5px);
+        color: var(--tlr-text-muted);
+        opacity: 0.5;
+        transition: opacity 0.15s, background-color 0.15s, color 0.15s;
+      }
+
+      .tlr-footer--native .tlr-group-mode:hover {
+        opacity: 0.9;
+      }
+
+      .tlr-footer--native .tlr-group-mode.is-active {
+        opacity: 1;
+        color: var(--tlr-text-default);
+        background: var(--button-minimal-bg-active-color, var(--tlr-selected-bg));
+      }
+
+      .tlr-footer--native .tlr-expand-record-btn {
+        width: 16px;
+        height: 16px;
+        opacity: 0;
+        transition: opacity 0.12s;
+      }
+
+      .tlr-footer--native .tlr-group-row:hover .tlr-expand-record-btn,
+      .tlr-footer--native .tlr-expand-record-btn:focus-visible,
+      .tlr-footer--native .tlr-expand-record-btn.is-expanded {
+        opacity: 1;
+      }
+
+      .tlr-footer--native .tlr-expand-record-btn .tlr-expand-caret {
+        font-size: 12px;
+      }
+
+      .tlr-footer--native .tlr-lines {
+        margin-top: 0;
+        margin-left: 22px;
+        padding-left: 8px;
+        gap: 2px;
+      }
+
+      .tlr-footer--native .tlr-line {
+        font-size: 13.5px;
+        line-height: 1.5;
+        color: var(--tlr-text-muted);
+      }
+
+      .tlr-footer--native .tlr-bucket-header {
+        margin: 16px 0 4px 0;
+        font-size: 11.5px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        opacity: 0.55;
+      }
+
+      .tlr-footer--native .tlr-bucket-header:first-child {
+        margin-top: 4px;
+      }
+
+      .tlr-footer--native .tlr-record-preview {
+        margin-left: 22px;
+      }
+
+      /* Secondary to the list: indented, quieter, lighter than a row title. */
+      .tlr-footer--native .tlr-unlinked-pill {
+        margin-top: 18px;
+        margin-left: 4px;
+        padding: 2px 11px 2px 7px !important;
+        min-height: 24px;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--tlr-text-muted);
+        background: transparent !important;
+        opacity: 0.75;
+        transition: opacity 0.15s, background-color 0.15s;
+      }
+
+      .tlr-footer--native .tlr-unlinked-pill:hover,
+      .tlr-footer--native .tlr-unlinked-pill[aria-expanded="true"] {
+        opacity: 1;
+        background: var(--tlr-hover-bg) !important;
+      }
+
+      .tlr-footer--native .tlr-unlinked-pill-caret {
+        font-size: 11px;
+      }
+
+      .tlr-tm-toggle.is-active {
+        color: var(--ed-link-color, var(--link-color, var(--accent, inherit)));
+      }
+
+      .tlr-tm-toggle.is-disabled,
+      .tlr-tm-toggle:disabled {
+        opacity: 0.35;
+        cursor: default;
+      }
+
+      .tlr-tm-section {
+        margin-top: 18px;
+        padding-top: 12px;
+        border-top: 1px solid var(--tlr-border-color);
+      }
+
+      .tlr-tm-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+        color: var(--tlr-text-muted);
+      }
+
+      .tlr-tm-icon {
+        display: inline-flex;
+        width: 16px;
+        height: 16px;
+        opacity: 0.85;
+      }
+
+      .tlr-tm-title {
+        flex: 1;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .tlr-tm-year-head {
+        margin: 12px 0 6px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid var(--tlr-border-color);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--tlr-text-default);
+        opacity: 0.85;
+      }
+
+      .tlr-tm-year-head:first-child { margin-top: 0; }
+
+      .tlr-tm-subcoll {
+        margin: 8px 0 4px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--tlr-text-muted);
+      }
+
+      .tlr-tm-settings-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 99999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.45);
+      }
+
+      .tlr-tm-settings-panel {
+        width: min(560px, 92vw);
+        max-height: min(80vh, 720px);
+        overflow: auto;
+        padding: 18px 18px 14px;
+        border-radius: 12px;
+        background: var(--bg-default, #18181b);
+        color: var(--tlr-text-default);
+        border: 1px solid var(--tlr-border-color);
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .tlr-tm-settings-panel h3 { margin: 0; font-size: 16px; }
+      .tlr-tm-settings-help { margin: 0; font-size: 12px; color: var(--tlr-text-muted); line-height: 1.4; }
+      .tlr-tm-settings-row { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+      .tlr-tm-settings-input, .tlr-tm-filter-row input, .tlr-tm-filter-row select {
+        width: 100%;
+        padding: 7px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        background: var(--bg-default, #18181b);
+        color: inherit;
+        border: 1px solid var(--border-default, #3f3f46);
+      }
+      .tlr-tm-filters { display: flex; flex-direction: column; gap: 8px; }
+      .tlr-tm-filter-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .tlr-tm-filter-row input, .tlr-tm-filter-row select { width: auto; flex: 1; min-width: 90px; }
+      .tlr-tm-settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+      .tlr-tm-settings-actions button, .tlr-tm-settings-secondary {
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--tlr-border-color);
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      .tlr-tm-settings-primary {
+        background: var(--ed-link-color, var(--link-color, #6aa7ff)) !important;
+        border-color: transparent !important;
+        color: #fff !important;
+        font-weight: 700;
+      }
 
       @media (max-width: 760px) {
         .tlr-footer {
