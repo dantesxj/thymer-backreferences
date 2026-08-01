@@ -2559,6 +2559,9 @@ class Plugin extends AppPlugin {
     this._storageKeyTimeMachine = 'thymer_backreferences_timemachine_v1';
     this._timeMachineSettings = this.loadTimeMachineSettings();
 
+    this._storageKeyExcludedSources = 'thymer_backreferences_excluded_sources_v1';
+    this._excludedSources = this.loadExcludedSourcesConfig();
+
     this._defaultMaxResults = 200;
     this._refreshDebounceMs = 350;
     /** Known backlink sources: content-only edits cannot change the backlink list. */
@@ -2607,6 +2610,7 @@ class Plugin extends AppPlugin {
     ];
 
     this.injectCss();
+    this.applyBuiltInBacklinksVisibility();
 
     this._cmdRebuildIndex = this.ui.addCommandPaletteCommand({
       label: 'Backreferences: Rebuild Graph Index',
@@ -2615,6 +2619,13 @@ class Plugin extends AppPlugin {
         this.rebuildPropertyIndex({ reason: 'cmdpal-rebuild-index' }).catch(() => {
           // The error state is rendered in the footer.
         });
+      }
+    });
+    this._cmdDiagnoseRefs = this.ui.addCommandPaletteCommand({
+      label: 'Backreferences: Diagnose links on this page',
+      icon: 'ti-bug',
+      onSelected: () => {
+        void this.diagnoseActiveRecordBackReferences();
       }
     });
     this._cmdToggleDefaultVisibility = this.ui.addCommandPaletteCommand({
@@ -2631,6 +2642,11 @@ class Plugin extends AppPlugin {
       label: 'Backreferences: Time Machine settings…',
       icon: 'ti-hourglass',
       onSelected: () => this.openTimeMachineSettings()
+    });
+    this._cmdExcludedSources = this.ui.addCommandPaletteCommand({
+      label: 'Backreferences: Excluded collections…',
+      icon: 'ti-filter-off',
+      onSelected: () => { void this.openExcludedSourcesSettings(); }
     });
     this._cmdStorage = this.ui.addCommandPaletteCommand({
       label: 'Backreferences: Storage location…',
@@ -2752,6 +2768,7 @@ class Plugin extends AppPlugin {
       this._storageKeySortByRecord,
       this._storageKeyGroupByScope,
       this._storageKeyTimeMachine,
+      this._storageKeyExcludedSources,
     ];
     if (this._legacyStorageKeySortByRecord) keys.push(this._legacyStorageKeySortByRecord);
     if (this._legacyStorageKeyGroupByRecord) keys.push(this._legacyStorageKeyGroupByRecord);
@@ -2796,6 +2813,8 @@ class Plugin extends AppPlugin {
     this._sortByRecord = this.loadSortByRecordSetting();
     this._groupByScope = this.loadGroupByScopeSetting();
     this._timeMachineSettings = this.loadTimeMachineSettings();
+    this._excludedSources = this.loadExcludedSourcesConfig();
+    this.applyBuiltInBacklinksVisibility();
     this._reapplyGroupByPreferencesToOpenPanels();
   }
 
@@ -2890,10 +2909,14 @@ class Plugin extends AppPlugin {
     this._eventHandlerIds = [];
 
     this._cmdRebuildIndex?.remove?.();
+    this._cmdDiagnoseRefs?.remove?.();
     this._cmdToggleDefaultVisibility?.remove?.();
     this._cmdToggleCollectionVisibility?.remove?.();
+    this._cmdTimeMachineSettings?.remove?.();
+    this._cmdExcludedSources?.remove?.();
     this._cmdStorage?.remove?.();
     this._backrefsPathBReadyPromise = null;
+    try { document.documentElement.classList.remove('tlr-hide-native-backrefs'); } catch (e) { /* ignore */ }
 
     if (this._mobileGraceDrainTimer) {
       clearTimeout(this._mobileGraceDrainTimer);
@@ -3114,6 +3137,119 @@ class Plugin extends AppPlugin {
     return this.isCollectionVisible(this.getPanelCollection(panel));
   }
 
+  defaultExcludedSourcesConfig() {
+    return {
+      version: 1,
+      collections: [],
+      hideBuiltInBacklinks: true,
+      updatedAt: 0
+    };
+  }
+
+  normalizeExcludedSourcesConfig(raw, fallback = null) {
+    const base = fallback || this.defaultExcludedSourcesConfig();
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const list = Array.isArray(source.collections)
+      ? source.collections
+      : (Array.isArray(source.excludedCollections) ? source.excludedCollections : base.collections);
+    const collections = [];
+    const seen = new Set();
+    for (const entry of list || []) {
+      const name = String(entry || '').trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      collections.push(name);
+    }
+    return {
+      version: 1,
+      collections,
+      hideBuiltInBacklinks: source.hideBuiltInBacklinks !== false,
+      updatedAt: Number(source.updatedAt) || base.updatedAt || 0
+    };
+  }
+
+  loadExcludedSourcesConfig() {
+    let next = this.normalizeExcludedSourcesConfig(
+      this.readJsonStorage(this._storageKeyExcludedSources),
+      this.defaultExcludedSourcesConfig()
+    );
+    // One-time migrate from Time Machine's old free-text exclusion list.
+    if (!next.collections.length) {
+      try {
+        const tm = this.normalizeTimeMachineSettings(this._timeMachineSettings || this.loadTimeMachineSettings());
+        const migrated = (tm.excludedCollections || []).map((n) => String(n || '').trim()).filter(Boolean);
+        if (migrated.length) {
+          next = this.normalizeExcludedSourcesConfig({ ...next, collections: migrated });
+          this.writeJsonStorage(this._storageKeyExcludedSources, next);
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+    return next;
+  }
+
+  saveExcludedSourcesConfig(config) {
+    const next = this.normalizeExcludedSourcesConfig(config, this.defaultExcludedSourcesConfig());
+    next.updatedAt = Date.now();
+    this._excludedSources = next;
+    this.writeJsonStorage(this._storageKeyExcludedSources, next);
+    // Keep Time Machine's mirrored list in sync (single menu owns both).
+    try {
+      const tm = this.normalizeTimeMachineSettings(this._timeMachineSettings || this.loadTimeMachineSettings());
+      if (JSON.stringify(tm.excludedCollections || []) !== JSON.stringify(next.collections)) {
+        this.saveTimeMachineSettings({ ...tm, excludedCollections: [...next.collections] });
+      }
+    } catch (e) {
+      // ignore
+    }
+    this.applyBuiltInBacklinksVisibility();
+    this._backrefsScheduleSettingsFlush?.();
+    return next;
+  }
+
+  shouldHideBuiltInBacklinks() {
+    const cfg = this._excludedSources || this.loadExcludedSourcesConfig();
+    return cfg.hideBuiltInBacklinks !== false;
+  }
+
+  applyBuiltInBacklinksVisibility() {
+    try {
+      document.documentElement.classList.toggle(
+        'tlr-hide-native-backrefs',
+        this.shouldHideBuiltInBacklinks()
+      );
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  getExcludedSourceCollectionSet() {
+    const cfg = this._excludedSources || this.loadExcludedSourcesConfig();
+    return new Set((cfg.collections || []).map((n) => String(n || '').trim().toLowerCase()).filter(Boolean));
+  }
+
+  /**
+   * True when this source record's collection is in the excluded list
+   * (e.g. YNAB / Contacts Tracker date-stamped noise on journal days).
+   */
+  isExcludedSourceRecord(record) {
+    const excluded = this.getExcludedSourceCollectionSet();
+    if (!excluded.size) return false;
+    const label = (this.getRecordCollectionLabel(record) || '').trim().toLowerCase();
+    if (label && excluded.has(label)) return true;
+    try {
+      const coll = record?.getCollection?.() || null;
+      const name = (this.getCollectionName(coll) || '').trim().toLowerCase();
+      if (name && name !== 'current collection' && excluded.has(name)) return true;
+    } catch (e) {
+      // ignore
+    }
+    return false;
+  }
+
   showToast(title) {
     const text = typeof title === 'string' ? title.trim() : '';
     if (!text) return;
@@ -3126,6 +3262,56 @@ class Plugin extends AppPlugin {
     } catch (e) {
       // ignore
     }
+  }
+
+  /**
+   * Reports what the host back-reference API returns for the open record, so a link the
+   * built-in backlinks panel shows but this footer drops can be traced to a ref shape
+   * the linked-group builder rejects (unexpected kind, or a missing lineItemGuid).
+   */
+  async diagnoseActiveRecordBackReferences() {
+    const record = this.ui?.getActivePanel?.()?.getActiveRecord?.() || null;
+    if (!record) {
+      this.showToast('Backreferences diag: no active record');
+      return;
+    }
+
+    let refs = null;
+    try {
+      refs = await this.fetchDetailedBackReferences(record);
+    } catch (e) {
+      console.error('[Backreferences/diag] getBackReferences threw', e);
+      this.showToast('Backreferences diag: back-reference lookup failed (see console)');
+      return;
+    }
+
+    if (refs === null) {
+      this.showToast('Backreferences diag: host back-reference API unavailable');
+      return;
+    }
+
+    const rows = (refs || []).map((ref) => ({
+      kind: ref?.kind === undefined ? '(undefined)' : String(ref.kind),
+      lineItemGuid: (ref?.lineItemGuid || '').trim(),
+      propertyId: ref?.propertyId || '',
+      source: (ref?.record?.getName?.() || '').trim() || ref?.record?.guid || '(unknown)'
+    }));
+
+    const kinds = Object.create(null);
+    for (const row of rows) kinds[row.kind] = (kinds[row.kind] || 0) + 1;
+    const droppedLineRefs = rows.filter((r) => r.kind === 'line' && !r.lineItemGuid).length;
+
+    console.info('[Backreferences/diag]', {
+      record: (record.getName?.() || '').trim() || record.guid,
+      guid: record.guid,
+      totalRefs: rows.length,
+      kinds,
+      lineRefsMissingLineItemGuid: droppedLineRefs,
+      rows
+    });
+
+    const kindSummary = Object.keys(kinds).map((k) => k + ' x' + kinds[k]).join(', ') || 'none';
+    this.showToast(`Backreferences diag: ${rows.length} refs (${kindSummary}) — details in console`);
   }
 
   toggleDefaultVisibility() {
@@ -3508,13 +3694,26 @@ class Plugin extends AppPlugin {
     toggleBtn.title = 'Collapse/expand';
     toggleBtn.setAttribute('aria-label', 'Collapse');
     toggleBtn.setAttribute('aria-expanded', 'true');
-    toggleBtn.appendChild(this.buildChevronIcon(false, 'tlr-toggle-caret'));
+
+    const pillIcon = document.createElement('span');
+    pillIcon.className = 'tlr-title-icon';
+    pillIcon.setAttribute('aria-hidden', 'true');
+    const pillGlyph = this.buildInlineIcon('affiliate', 15);
+    if (pillGlyph) pillIcon.appendChild(pillGlyph);
+    const pillLabel = document.createElement('span');
+    pillLabel.className = 'tlr-pill-label';
+    pillLabel.textContent = 'backlinks';
 
     const count = document.createElement('span');
     count.className = 'tlr-count';
     count.dataset.role = 'count';
-    count.textContent = '';
+    count.textContent = '0';
+
+    // Icon → label → count → chevron, matching the Highlights pill.
+    toggleBtn.appendChild(pillIcon);
+    toggleBtn.appendChild(pillLabel);
     toggleBtn.appendChild(count);
+    toggleBtn.appendChild(this.buildChevronIcon(false, 'tlr-toggle-caret'));
 
     const filterWrap = document.createElement('div');
     filterWrap.className = 'tlr-filter-wrap';
@@ -3736,6 +3935,19 @@ class Plugin extends AppPlugin {
     catch (e) { tmToggle.textContent = '⏳'; }
     state.timeMachineToggleEl = tmToggle;
 
+    const settingsBtn = document.createElement('button');
+    settingsBtn.type = 'button';
+    settingsBtn.className = 'tlr-btn tlr-hover-action tlr-settings-cog button-none button-small button-minimal-hover tooltip';
+    settingsBtn.dataset.action = 'open-settings';
+    settingsBtn.title = 'Backreferences settings';
+    settingsBtn.setAttribute('aria-label', 'Backreferences settings');
+    settingsBtn.setAttribute('data-tooltip', 'Settings');
+    settingsBtn.setAttribute('data-tooltip-dir', 'top');
+    try { settingsBtn.appendChild(this.ui.createIcon('ti-settings')); }
+    catch (e) { settingsBtn.textContent = '⚙'; }
+    state.settingsCogEl = settingsBtn;
+
+    headerControls.appendChild(settingsBtn);
     headerControls.appendChild(groupModes);
     headerControls.appendChild(tmToggle);
     headerControls.appendChild(filterWrap);
@@ -3979,6 +4191,13 @@ class Plugin extends AppPlugin {
       if (!state) return;
       e.stopPropagation();
       this.toggleTimeMachine(state).catch(() => {});
+      return;
+    }
+
+    if (action === 'open-settings') {
+      e.stopPropagation();
+      e.preventDefault();
+      this.openBackreferencesSettingsMenu(actionEl);
       return;
     }
 
@@ -7011,6 +7230,7 @@ class Plugin extends AppPlugin {
         const sourceGuid = (record?.guid || '').trim();
         if (!sourceGuid || seen.has(sourceGuid)) continue;
         if (!showSelf && sourceGuid === guid) continue;
+        if (this.isExcludedSourceRecord(record)) continue;
         seen.add(sourceGuid);
         records.push(record);
       }
@@ -7194,6 +7414,7 @@ class Plugin extends AppPlugin {
       const srcGuid = src?.guid || '';
       if (!srcGuid) continue;
       if (!showSelf && srcGuid === targetGuid) continue;
+      if (this.isExcludedSourceRecord(src)) continue;
 
       const propName = this.resolvePropertyNameFromRecord(src, ref?.propertyId);
       if (!propName) {
@@ -7248,6 +7469,7 @@ class Plugin extends AppPlugin {
       const srcGuid = record?.guid || '';
       if (!srcGuid) continue;
       if (!showSelf && srcGuid === targetGuid) continue;
+      if (this.isExcludedSourceRecord(record)) continue;
       const lineGuid = (ref?.lineItemGuid || '').trim();
       if (!lineGuid) continue;
       let entry = bySource.get(srcGuid);
@@ -7313,10 +7535,28 @@ class Plugin extends AppPlugin {
 
       stats.scannedRecords = refs.length;
       let propertyGroups = this.buildPropertyGroupsFromDetailedRefs(refs, targetGuid, { showSelf });
-      const linkedGroups = await this.buildLinkedGroupsFromDetailedRefs(refs, targetGuid, {
+      let linkedGroups = await this.buildLinkedGroupsFromDetailedRefs(refs, targetGuid, {
         showSelf,
         maxResults
       });
+      let linkedError = '';
+
+      // Host getBackReferences() can return [] for journal days even when body links
+      // exist (built-in backlinks still shows them). Fall back to @linkto search.
+      if (!this.countLinkedReferences(linkedGroups)) {
+        const searchSettled = await this.runLinkedReferenceSearch(targetGuid, maxResults, {
+          targetRecord
+        });
+        const searched = this.resolveLinkedReferenceSearch(searchSettled, targetGuid, { showSelf });
+        if (searched.linkedGroups?.length) {
+          linkedGroups = searched.linkedGroups;
+          stats.reason = refs.length
+            ? 'sdk-getBackReferences+linkto'
+            : 'linkto-search';
+        } else if (searched.linkedError) {
+          linkedError = searched.linkedError;
+        }
+      }
 
       // Journal days: When-style dates aren't links, so getBackReferences is empty.
       // Fold in `@date` record hits as property groups (same index Today's Notes uses).
@@ -7326,9 +7566,15 @@ class Plugin extends AppPlugin {
       });
       if (dateGroups.length) {
         propertyGroups = this.mergePropertyBacklinkGroups(propertyGroups, dateGroups);
-        stats.reason = refs.length
-          ? 'sdk-getBackReferences+date'
-          : 'date-search-journal';
+        if (stats.reason === 'sdk-getBackReferences') {
+          stats.reason = refs.length
+            ? 'sdk-getBackReferences+date'
+            : 'date-search-journal';
+        } else if (stats.reason === 'linkto-search') {
+          stats.reason = 'linkto+date-search';
+        } else if (stats.reason === 'sdk-getBackReferences+linkto') {
+          stats.reason = 'sdk-getBackReferences+linkto+date';
+        }
       }
 
       stats.indexedReferences = propertyGroups.reduce(
@@ -7340,7 +7586,7 @@ class Plugin extends AppPlugin {
 
       return {
         linkedGroups,
-        linkedError: '',
+        linkedError,
         propertyGroups,
         propertyError: '',
         propertyIndexStatus: 'ready',
@@ -7704,6 +7950,7 @@ class Plugin extends AppPlugin {
       if (!srcGuid) continue;
       if (!showSelf && srcGuid === targetGuid) continue;
       if (this.isJournalLikeRecord(src)) continue;
+      if (this.isExcludedSourceRecord(src)) continue;
 
       const propNames = this.getMatchingDatePropertyNames(src, dateIso);
       const names = propNames.length ? propNames : ['When'];
@@ -7768,6 +8015,8 @@ class Plugin extends AppPlugin {
       for (const line of search.value?.lines || []) {
         const guid = line?.guid || '';
         if (guid && seenLineGuids.has(guid)) continue;
+        const sourceRecord = line?.record || null;
+        if (sourceRecord && this.isExcludedSourceRecord(sourceRecord)) continue;
         if (guid) seenLineGuids.add(guid);
         lines.push(line);
       }
@@ -8931,6 +9180,7 @@ class Plugin extends AppPlugin {
       if (seenSourceGuids.has(srcGuid)) continue;
       seenSourceGuids.add(srcGuid);
       if (!showSelf && srcGuid === targetGuid) continue;
+      if (this.isExcludedSourceRecord(src)) continue;
 
       const props = src.getAllProperties?.() || [];
       for (const p of props || []) {
@@ -9852,6 +10102,31 @@ class Plugin extends AppPlugin {
     return [`${refs} ${refNoun} in ${pages} ${pageNoun}`];
   }
 
+  /**
+   * Pill shows a fixed "backlinks" label plus a muted count, so the header does
+   * not reflow as counts change. Full "N backlinks in M pages" moves to the tooltip.
+   */
+  buildReferenceSummaryCount({
+    searchMode,
+    incompleteQueryDraft,
+    queryFilterState,
+    canApplyScopedQuery,
+    hasScopedView,
+    filteredVisibleRefCount,
+    totalVisibleRefCount
+  }) {
+    if (searchMode === 'query') {
+      if (incompleteQueryDraft) return '…';
+      if (queryFilterState?.error) return '!';
+      if (queryFilterState?.loading === true && canApplyScopedQuery !== true) return '…';
+    }
+    const refs = (searchMode === 'query' && canApplyScopedQuery) || hasScopedView
+      ? filteredVisibleRefCount
+      : totalVisibleRefCount;
+    const n = Number(refs);
+    return String(Number.isFinite(n) && n > 0 ? n : 0);
+  }
+
   buildReferenceSectionMeta(visibleCount, totalCount, showScopedCounts) {
     if (showScopedCounts !== true && Number(visibleCount) === 0) return '';
     return this.formatCountLabel(visibleCount, 'ref', {
@@ -9995,7 +10270,16 @@ class Plugin extends AppPlugin {
         totalUniquePagesSize: totalUniquePages.size,
         filteredVisibleRefCount,
         totalVisibleRefCount
-      })[0] || ''
+      })[0] || '',
+      summaryCount: this.buildReferenceSummaryCount({
+        searchMode,
+        incompleteQueryDraft,
+        queryFilterState,
+        canApplyScopedQuery,
+        hasScopedView,
+        filteredVisibleRefCount,
+        totalVisibleRefCount
+      })
     };
   }
 
@@ -10277,7 +10561,10 @@ class Plugin extends AppPlugin {
 
     this.syncFooterCollapsedState(state, this.isFooterCollapsed(state, viewState.collapseMetrics));
 
-    state.countEl.textContent = viewState.summaryText;
+    state.countEl.textContent = viewState.summaryCount;
+    if (state.footerToggleEl) {
+      state.footerToggleEl.title = viewState.summaryText || 'Collapse/expand';
+    }
     const plan = this.buildReferenceRenderPlan(state, viewState);
 
     if (plan.statusChanged) {
@@ -10712,8 +10999,72 @@ class Plugin extends AppPlugin {
     return '';
   }
 
+  /**
+   * Thymer's icon font only ships a subset of Tabler, so glyphs like `affiliate` render
+   * blank through `ui.createIcon`. These are inlined from the Tabler outline sources.
+   */
+  inlineIconMarkup(kind, sizePx) {
+    const paths = {
+      affiliate: '<path d="M5.931 6.936l1.275 4.249m5.607 5.609l4.251 1.275"/><path d="M11.683 12.317l5.759 -5.759"/><path d="M4 5.5a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0"/><path d="M17 5.5a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0"/><path d="M17 18.5a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0"/><path d="M4 15.5a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0 -9 0"/>',
+      book: '<path d="M3 19a9 9 0 0 1 9 0a9 9 0 0 1 9 0"/><path d="M3 6a9 9 0 0 1 9 0a9 9 0 0 1 9 0"/><path d="M3 6l0 13"/><path d="M12 6l0 13"/><path d="M21 6l0 13"/>',
+      article: '<path d="M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2l0 -12"/><path d="M7 8h10"/><path d="M7 12h10"/><path d="M7 16h10"/>',
+      microphone: '<path d="M9 5a3 3 0 0 1 3 -3a3 3 0 0 1 3 3v5a3 3 0 0 1 -3 3a3 3 0 0 1 -3 -3l0 -5"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M8 21l8 0"/><path d="M12 17l0 4"/>',
+      video: '<path d="M15 10l4.553 -2.276a1 1 0 0 1 1.447 .894v6.764a1 1 0 0 1 -1.447 .894l-4.553 -2.276v-4"/><path d="M3 8a2 2 0 0 1 2 -2h8a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-8a2 2 0 0 1 -2 -2l0 -8"/>'
+    };
+    const body = paths[kind];
+    if (!body) return '';
+    const n = sizePx || 15;
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + n + '" height="' + n
+      + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"'
+      + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + body + '</svg>';
+  }
+
+  buildInlineIcon(kind, sizePx) {
+    const markup = this.inlineIconMarkup(kind, sizePx);
+    if (!markup) return null;
+    const wrap = document.createElement('span');
+    wrap.className = 'tlr-inline-svg-icon';
+    wrap.setAttribute('aria-hidden', 'true');
+    wrap.innerHTML = markup;
+    return wrap;
+  }
+
+  /**
+   * Readwise Reference records all share one collection icon, so prefer their
+   * `source_category` choice (Books / Articles / Podcasts / Video) when present.
+   */
+  getCategoryIconKind(record) {
+    let raw = '';
+    try {
+      if (typeof record?.choice !== 'function') return '';
+      const ch = record.choice('source_category');
+      if (ch == null) return '';
+      raw = typeof ch === 'string' ? ch : String(ch.id || ch.label || '');
+    } catch (e) {
+      return '';
+    }
+    const k = raw.trim().toLowerCase();
+    if (!k) return '';
+    if (k.startsWith('book')) return 'book';
+    if (k.startsWith('article') || k === 'rss' || k.startsWith('email')) return 'article';
+    if (k.startsWith('podcast')) return 'microphone';
+    if (k.startsWith('video') || k.startsWith('tweet')) return 'video';
+    return '';
+  }
+
   appendRecordIcon(container, record) {
     if (!container || !record) return;
+
+    const categoryKind = this.getCategoryIconKind(record);
+    if (categoryKind) {
+      const inlineEl = this.buildInlineIcon(categoryKind, 14);
+      if (inlineEl) {
+        inlineEl.classList.add('tlr-record-icon');
+        container.appendChild(inlineEl);
+        return;
+      }
+    }
+
     let iconName = '';
     try { iconName = record.getIcon?.(true) || record.getIcon?.() || ''; } catch (e) { iconName = ''; }
     if (!iconName) return;
@@ -12223,7 +12574,7 @@ class Plugin extends AppPlugin {
 
   async queryTimeMachineRecords(journalYyyymmdd) {
     const tm = this.normalizeTimeMachineSettings(this._timeMachineSettings);
-    const excludedSet = new Set((tm.excludedCollections || []).map((n) => n.toLowerCase()));
+    const excludedSet = this.getExcludedSourceCollectionSet();
     const journalNames = new Set(['journal', 'journals']);
     let collections = [];
     try { collections = await this.data.getAllCollections(); } catch (e) { collections = []; }
@@ -12544,6 +12895,227 @@ class Plugin extends AppPlugin {
     ];
   }
 
+  /** Small popup anchored under the header settings cog. */
+  openBackreferencesSettingsMenu(anchorEl) {
+    const existing = document.getElementById('tlr-settings-menu');
+    if (existing) {
+      existing.remove();
+      if (existing.dataset.anchorOpen === '1') return;
+    }
+
+    const menu = document.createElement('div');
+    menu.id = 'tlr-settings-menu';
+    menu.className = 'tlr-menu';
+    menu.dataset.anchorOpen = '1';
+
+    const close = () => {
+      try { menu.remove(); } catch (e) { /* ignore */ }
+      document.removeEventListener('mousedown', onDocDown, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+    const onDocDown = (e) => {
+      if (menu.contains(e.target)) return;
+      if (anchorEl?.contains?.(e.target)) return;
+      close();
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        close();
+      }
+    };
+
+    const addItem = (label, onClick) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tlr-menu-item button-none';
+      btn.textContent = label;
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        close();
+        onClick();
+      });
+      menu.appendChild(btn);
+      return btn;
+    };
+    const addSep = () => {
+      const sep = document.createElement('div');
+      sep.className = 'tlr-menu-sep';
+      menu.appendChild(sep);
+    };
+
+    addItem('Excluded collections…', () => { void this.openExcludedSourcesSettings(); });
+    addItem('Time Machine settings…', () => this.openTimeMachineSettings());
+    addSep();
+    addItem('Storage location…', () => {
+      void this._backrefsEnsurePathBReady().then(() => {
+        globalThis.ThymerPluginSettings?.openStorageDialog?.({
+          plugin: this,
+          pluginId: BACKREFS_PLUGIN_ID,
+          modeKey: BACKREFS_MODE_KEY,
+          mirrorKeys: () => this._backrefsMirrorKeys(),
+          label: BACKREFS_PLUGIN_LABEL,
+          data: this.data,
+          ui: this.ui,
+        });
+      });
+    });
+
+    document.body.appendChild(menu);
+    try {
+      const r = anchorEl.getBoundingClientRect();
+      const w = menu.offsetWidth || 220;
+      const left = Math.max(8, Math.min(window.innerWidth - w - 8, Math.round(r.right - w)));
+      const top = Math.round(r.bottom + 6);
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+    } catch (e) { /* ignore */ }
+
+    setTimeout(() => {
+      document.addEventListener('mousedown', onDocDown, true);
+      document.addEventListener('keydown', onKey, true);
+    }, 0);
+  }
+
+  async openExcludedSourcesSettings() {
+    const existing = document.querySelector('.tlr-tm-settings-overlay');
+    if (existing) existing.remove();
+
+    const draft = this.normalizeExcludedSourcesConfig(this._excludedSources);
+    const selected = new Set((draft.collections || []).map((n) => n.toLowerCase()));
+
+    const overlay = document.createElement('div');
+    overlay.className = 'tlr-tm-settings-overlay';
+    const panel = document.createElement('div');
+    panel.className = 'tlr-tm-settings-panel';
+
+    const h = document.createElement('h3');
+    h.textContent = 'Excluded collections';
+    panel.appendChild(h);
+
+    const help = document.createElement('p');
+    help.className = 'tlr-tm-settings-help';
+    help.textContent = 'Checked collections are hidden from Backreferences and Time Machine (shared list). Useful for date-stamped trackers that clutter journal days.';
+    panel.appendChild(help);
+
+    const hideRow = document.createElement('label');
+    hideRow.className = 'tlr-tm-settings-row';
+    const hideCb = document.createElement('input');
+    hideCb.type = 'checkbox';
+    hideCb.checked = draft.hideBuiltInBacklinks !== false;
+    hideCb.addEventListener('change', () => { draft.hideBuiltInBacklinks = hideCb.checked; });
+    hideRow.append(hideCb, document.createTextNode(' Hide built-in Backlinks footer'));
+    panel.appendChild(hideRow);
+
+    const listWrap = document.createElement('div');
+    listWrap.className = 'tlr-excl-list';
+    const loading = document.createElement('p');
+    loading.className = 'tlr-tm-settings-help';
+    loading.textContent = 'Loading collections…';
+    listWrap.appendChild(loading);
+    panel.appendChild(listWrap);
+
+    const actions = document.createElement('div');
+    actions.className = 'tlr-tm-settings-actions';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', () => overlay.remove());
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'tlr-tm-settings-primary';
+    save.textContent = 'Save';
+    save.addEventListener('click', () => {
+      const names = [];
+      for (const row of listWrap.querySelectorAll('label.tlr-excl-item')) {
+        const cb = row.querySelector('input[type="checkbox"]');
+        const name = row.dataset.name || '';
+        if (cb?.checked && name) names.push(name);
+      }
+      draft.collections = names;
+      draft.hideBuiltInBacklinks = hideCb.checked;
+      this.saveExcludedSourcesConfig(draft);
+      this.reconcileAllPanelsVisibility({ refreshVisible: true, reason: 'excluded-sources-changed' });
+      for (const st of this._panelStates?.values?.() || []) {
+        this.resetTimeMachineState(st);
+        this.syncTimeMachineControl(st);
+        this.renderTimeMachineSection(st);
+      }
+      this.showToast('Exclusions saved');
+      overlay.remove();
+    });
+    actions.append(cancel, save);
+    panel.appendChild(actions);
+    overlay.appendChild(panel);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+
+    let collections = [];
+    try {
+      collections = await this.data.getAllCollections();
+    } catch (e) {
+      collections = [];
+    }
+    const names = [];
+    const seen = new Set();
+    for (const coll of collections || []) {
+      const name = (coll?.getName?.() || '').trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      if (key === 'journal' || key === 'journals') continue;
+      seen.add(key);
+      names.push(name);
+    }
+    names.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+
+    // Keep previously excluded names even if the collection was renamed/removed.
+    for (const kept of draft.collections || []) {
+      if (!seen.has(kept.toLowerCase())) names.push(kept);
+    }
+
+    listWrap.replaceChildren();
+    if (!names.length) {
+      const empty = document.createElement('p');
+      empty.className = 'tlr-tm-settings-help';
+      empty.textContent = 'No collections found.';
+      listWrap.appendChild(empty);
+      return;
+    }
+
+    const filter = document.createElement('input');
+    filter.type = 'search';
+    filter.className = 'tlr-tm-settings-input';
+    filter.placeholder = 'Filter collections…';
+    listWrap.appendChild(filter);
+
+    const itemsHost = document.createElement('div');
+    itemsHost.className = 'tlr-excl-items';
+    listWrap.appendChild(itemsHost);
+
+    const renderItems = () => {
+      const q = filter.value.trim().toLowerCase();
+      itemsHost.replaceChildren();
+      for (const name of names) {
+        if (q && !name.toLowerCase().includes(q)) continue;
+        const row = document.createElement('label');
+        row.className = 'tlr-excl-item tlr-tm-settings-row';
+        row.dataset.name = name;
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = selected.has(name.toLowerCase());
+        cb.addEventListener('change', () => {
+          if (cb.checked) selected.add(name.toLowerCase());
+          else selected.delete(name.toLowerCase());
+        });
+        row.append(cb, document.createTextNode(' ' + name));
+        itemsHost.appendChild(row);
+      }
+    };
+    filter.addEventListener('input', renderItems);
+    renderItems();
+  }
+
   openTimeMachineSettings() {
     const existing = document.querySelector('.tlr-tm-settings-overlay');
     if (existing) existing.remove();
@@ -12571,12 +13143,15 @@ class Plugin extends AppPlugin {
     en.append(cb, document.createTextNode(' Show Time Machine'));
     panel.appendChild(en);
 
-    const exclInput = document.createElement('input');
-    exclInput.type = 'text';
-    exclInput.className = 'tlr-tm-settings-input';
-    exclInput.placeholder = 'Excluded collections (comma-separated)';
-    exclInput.value = (draft.excludedCollections || []).join(', ');
-    panel.appendChild(exclInput);
+    const exclBtn = document.createElement('button');
+    exclBtn.type = 'button';
+    exclBtn.className = 'tlr-tm-settings-secondary';
+    exclBtn.textContent = 'Excluded collections…';
+    exclBtn.addEventListener('click', () => {
+      overlay.remove();
+      void this.openExcludedSourcesSettings();
+    });
+    panel.appendChild(exclBtn);
 
     const filtersWrap = document.createElement('div');
     filtersWrap.className = 'tlr-tm-filters';
@@ -12658,7 +13233,6 @@ class Plugin extends AppPlugin {
     save.className = 'tlr-tm-settings-primary';
     save.textContent = 'Save';
     save.addEventListener('click', () => {
-      draft.excludedCollections = exclInput.value.split(',').map((s) => s.trim()).filter(Boolean);
       this.saveTimeMachineSettings(draft);
       for (const st of this._panelStates?.values?.() || []) {
         this.resetTimeMachineState(st);
@@ -12678,6 +13252,32 @@ class Plugin extends AppPlugin {
 
   injectCss() {
     this.ui.injectCSS(`
+      /* Hide Thymer's native backlinks footer when the plugin replaces it. */
+      html.tlr-hide-native-backrefs .backrefs-footer {
+        display: none !important;
+      }
+
+      .tlr-excl-list {
+        max-height: 320px;
+        overflow: auto;
+        margin: 8px 0 4px;
+        padding: 4px 0;
+      }
+      .tlr-excl-items {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        margin-top: 8px;
+      }
+      .tlr-excl-item {
+        margin: 0;
+        padding: 4px 2px;
+        border-radius: 4px;
+      }
+      .tlr-excl-item:hover {
+        background: var(--button-normal-hover-color, var(--bg-hover, transparent));
+      }
+
       .tlr-footer {
         --tlr-child-indent: 26px;
         --tlr-context-rail-gap: 8px;
@@ -12700,13 +13300,26 @@ class Plugin extends AppPlugin {
         display: none !important;
       }
 
-      /* No card/frame — sit directly on the page like the built-in backlinks. */
-      .tlr-footer--native,
+      /*
+       * No card/frame — sit directly on the page like the built-in backlinks.
+       * The html + double-class prefix outranks theme plugins that card
+       * .tlr-footer with !important (e.g. Theme Architect "Backreferences glass").
+       */
+      html .tlr-footer.tlr-footer--native {
+        padding: 0 !important;
+        margin-top: 14px;
+      }
+
+      html .tlr-footer.tlr-footer--native,
       .tlr-footer--native .tlr-header-field,
-      .tlr-footer--native .tlr-section {
+      .tlr-footer--native .tlr-section,
+      .tlr-footer--native .tlr-section-slot {
         background: transparent !important;
         border: none !important;
+        border-radius: 0 !important;
         box-shadow: none !important;
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
       }
 
       /* Left rail runs the length of the list, like the built-in backlinks. */
@@ -12714,20 +13327,36 @@ class Plugin extends AppPlugin {
         background: transparent !important;
         border: none;
         border-left: 1px solid var(--tlr-border-color);
+        border-radius: 0 !important;
         box-shadow: none !important;
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
         margin-left: 10px;
         padding-left: 14px;
       }
 
-      /* A host wrapper that holds only our footer must not draw a card either. */
-      :where(div):has(> .tlr-footer--native:only-child) {
+      /*
+       * Host wrappers (suite shells, theme cards, orphan divs) must not re-frame us.
+       * Cover only-child and “footer among siblings” parents up to two levels.
+       */
+      :where(div):has(> .tlr-footer--native),
+      :where(div):has(> :where(div) > .tlr-footer--native) {
         background: transparent !important;
         border: none !important;
+        border-radius: 0 !important;
         box-shadow: none !important;
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
       }
 
       .tlr-footer--native {
         padding: 0;
+        background: transparent !important;
+        border: none !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
       }
 
       .tlr-summary-pill {
@@ -12745,7 +13374,7 @@ class Plugin extends AppPlugin {
         color: var(--tlr-text-default);
       }
 
-      .tlr-summary-pill .tlr-count {
+      .tlr-summary-pill .tlr-pill-label {
         flex: 0 1 auto;
         font-size: 13px;
         font-weight: 600;
@@ -12755,8 +13384,40 @@ class Plugin extends AppPlugin {
         white-space: nowrap;
       }
 
+      .tlr-summary-pill .tlr-count {
+        flex: 0 0 auto;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--tlr-text-muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
       .tlr-summary-pill .tlr-toggle-caret {
         opacity: 0.85;
+      }
+
+      .tlr-summary-pill .tlr-title-icon {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        line-height: 1;
+        opacity: 0.9;
+        color: var(--tlr-text-muted);
+      }
+
+      .tlr-inline-svg-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        line-height: 0;
+        color: inherit;
+      }
+
+      .tlr-inline-svg-icon svg {
+        display: block;
       }
 
       .tlr-header {
@@ -12784,6 +13445,66 @@ class Plugin extends AppPlugin {
         display: inline-flex;
         align-items: center;
         gap: 4px;
+      }
+
+      /* Settings cog: hover-reveal like Today's Highlights. */
+      .tlr-hover-action {
+        opacity: 0;
+        transition: opacity 0.12s;
+      }
+      .tlr-header:hover .tlr-hover-action,
+      .tlr-header:focus-within .tlr-hover-action,
+      .tlr-hover-action:focus-visible {
+        opacity: 1;
+      }
+      @media (hover: none), (pointer: coarse) {
+        .tlr-hover-action { opacity: 0.6; }
+      }
+
+      .tlr-settings-cog {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 28px;
+        min-height: 24px;
+        color: var(--tlr-text-muted);
+      }
+      .tlr-settings-cog:hover {
+        color: var(--tlr-text-default);
+      }
+
+      .tlr-menu {
+        position: fixed;
+        z-index: 100000;
+        min-width: 220px;
+        padding: 5px;
+        border-radius: 10px;
+        background: var(--cmdpal-bg-color, var(--panel-bg-color, #1d1915));
+        border: 1px solid var(--divider-color, var(--cmdpal-border-color, rgba(255,255,255,0.1)));
+        box-shadow: var(--cmdpal-box-shadow, 0 8px 32px rgba(0,0,0,0.45));
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+      .tlr-menu-item {
+        display: block;
+        width: 100%;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: transparent;
+        border: none;
+        color: var(--tlr-text-default);
+        font-size: 13px;
+        text-align: left;
+        cursor: pointer;
+      }
+      .tlr-menu-item:hover {
+        background: var(--button-normal-hover-color, rgba(255,255,255,0.07));
+      }
+      .tlr-menu-sep {
+        height: 1px;
+        margin: 4px 6px;
+        background: var(--divider-color, rgba(255,255,255,0.08));
       }
 
       .tlr-title {
@@ -14271,6 +14992,11 @@ class Plugin extends AppPlugin {
       .tlr-footer--native .tlr-expand-record-btn:focus-visible,
       .tlr-footer--native .tlr-expand-record-btn.is-expanded {
         opacity: 1;
+      }
+
+      /* Touch devices never get :hover — keep the caret visible but recessed. */
+      @media (hover: none), (pointer: coarse) {
+        .tlr-footer--native .tlr-expand-record-btn { opacity: 0.65; }
       }
 
       .tlr-footer--native .tlr-expand-record-btn .tlr-expand-caret {
